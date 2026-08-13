@@ -1,0 +1,17 @@
+[package]
+name = "hft-spsc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+loom = ["dep:loom"]
+
+[dependencies]
+loom = { version = "0.7", optional = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,119 @@
+# hft-engine-rs
+
+[![CI](https://github.com/Ninian-Lemain/hft-engine-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/Ninian-Lemain/hft-engine-rs/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE-MIT)
+[![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
+
+A deterministic, allocation-free Rust execution-gateway and matching-engine
+vertical slice: RX frame lease -> lifetime-bound binary parsing -> session
+sequencing -> fixed-capacity risk -> price-time matching/cancel -> execution
+reports -> replay digest.
+
+The design targets the same engineering concerns found in electronic trading
+infrastructure: deterministic state transitions, conservative pre-trade risk,
+bounded resources, explicit backpressure, price-time priority, session
+sequencing, replayability, cache-aware cross-core handoff, and narrow driver
+boundaries. It is a production-oriented foundation, not a claim that a public
+portfolio repository replaces venue certification, proprietary feed handlers,
+or measured kernel-bypass deployment work.
+
+## Why This Project
+
+- Honest data movement: parsing borrows the RX frame; cross-core normalized
+  orders are a bounded single-copy handoff.
+- Deterministic failure: fixed capacities reject explicitly and never silently
+  overwrite state.
+- Single-writer books: an instrument shard owns its risk state and order book.
+- Hot-path discipline: integer prices and quantities, no locks, logging,
+  syscalls, formatting, or allocation in the measured packet-to-report path.
+- Contained unsafe: only SPSC slot access, the FFI wrapper, and the benchmark
+  allocator use unsafe Rust.
+- Lifecycle integrity: strict inbound sequencing, owner-authorized cancel,
+  partial-fill reservation accounting, and fail-closed capacity behavior.
+
+## Quick Start
+
+```console
+cargo run --release -p hft-cli -- replay-demo
+cargo test --workspace --all-features
+cargo run --release -p hft-bench
+```
+
+See [QUICKSTART.md](QUICKSTART.md) for all quality gates.
+
+## Architecture
+
+| Crate | Responsibility | Hot-path allocation |
+| --- | --- | --- |
+| `hft-types` | Fixed-width domain types and reports | None |
+| `hft-wire` | Validated lifetime-bound parsing | None |
+| `hft-io` | RAII frame leases, in-memory and UDP baseline | Preallocated frame |
+| `hft-spsc` | Bounded cache-aware SPSC handoff | None after construction |
+| `hft-risk` | Fixed-capacity limits and exposure reservations | None |
+| `hft-book` | Fixed-capacity price-time matching | None |
+| `hft-gateway` | Transaction coordination and report accounting | None |
+| `hft-replay` | Ordered replay and stable final-state digest | None in engine |
+| `hft-ffi` | Optional vendor C ABI ownership wrapper | Vendor-defined |
+| `hft-bench` | Allocation assertion and timing smoke harness | Zero measured delta |
+| `hft-cli` | Cold-path operational entry point | Out of scope |
+
+Each instrument group is intended to run as a single matching shard. If a
+packet crosses cores, the supported design is normalization once into a fixed
+size SPSC slot. That is a bounded single-copy handoff, not end-to-end zero-copy.
+
+## Capability Matrix
+
+| Capability | State | Evidence / limitation |
+| --- | --- | --- |
+| Borrowed binary parser | Implemented | Boundary and malformed-input tests |
+| New/cancel wire messages | Implemented | Fixed lengths and big-endian scalar fields |
+| RAII RX lease | Implemented | In-memory and UDP buffer ownership |
+| Fixed-capacity risk | Implemented | Quantity, notional, position, open-order, collar, duplicate, kill checks |
+| Price-time book | Implemented | FIFO and price-priority tests |
+| Deterministic replay | Implemented | Stable final-state digest test |
+| Session sequence enforcement | Implemented | Duplicates/gaps fail closed without advancing |
+| Owner-authorized cancel | Implemented | FIFO-preserving removal and exact risk release |
+| Cache-aware SPSC | Implemented | Release/Acquire docs, stress test, Loom model |
+| Allocation audit | Implemented | Release executable asserts zero measured deltas |
+| UDP baseline | Implemented | Syscall path; not a latency claim |
+| AF_XDP backend | Planned | Feature-gated availability marker only |
+| Vendor SDK | Planned | Safe wrapper exists; no proprietary SDK linked |
+| Hardware perf counters | Planned | Requires Linux/perf and a dedicated runner |
+
+## Safety and Performance Limits
+
+- No external venue traffic, persistence, replace, recovery journal, sequence
+  retransmission protocol, authentication, or venue-certified session protocol
+  is implemented.
+- Order IDs are monotonically increasing per gateway session. Reuse and
+  out-of-order IDs fail closed.
+- The book rejects when report, order, per-price FIFO, or price-level capacity
+  would be exceeded; capacity is selected at compile time.
+- Timing output includes measurement overhead and is only a local smoke result.
+  See [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
+- See [docs/SAFETY.md](docs/SAFETY.md) for every unsafe boundary and
+  [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for ownership.
+
+## Review Path
+
+For a focused engineering review:
+
+1. `hft-wire`: borrowed validation and protocol boundaries.
+2. `hft-risk`: conservative exposure and deterministic rejection order.
+3. `hft-book`: price-time matching, transactional preflight, and cancel FIFO.
+4. `hft-gateway`: sequence enforcement and risk/book lifecycle coordination.
+5. `hft-spsc`: documented Release/Acquire ownership transfer.
+6. `hft-bench`: measured allocation assertion and reproducibility limitations.
+
+The protocol is specified in [docs/PROTOCOL.md](docs/PROTOCOL.md); operational
+failure behavior is in [docs/OPERATIONS.md](docs/OPERATIONS.md).
+
+## Project
+
+- [Review](docs/REVIEW.md)
+- [Roadmap](docs/ROADMAP.md)
+- [Contributing](CONTRIBUTING.md)
+- [Security](SECURITY.md)
+- [Changes](CHANGES.md)
+
+Licensed under the [MIT License](LICENSE-MIT).

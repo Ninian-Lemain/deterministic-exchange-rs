@@ -1,0 +1,23 @@
+name: Bug report
+description: Report a reproducible correctness or safety problem
+body:
+  - type: input
+    id: revision
+    attributes:
+      label: Revision
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Include platform, command, fixture, expected result, and actual result.
+    validations:
+      required: true
+  - type: dropdown
+    id: impact
+    attributes:
+      label: Impact
+      options: [Correctness, Risk controls, Unsafe or FFI, Performance, Documentation]
+    validations:
+      required: true

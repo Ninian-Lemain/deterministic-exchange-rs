@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all --check
+      - run: cargo check --workspace --all-targets --all-features
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --workspace --all-features
+      - run: cargo test --doc --workspace
+      - run: cargo test -p hft-spsc --features loom loom_models_release_acquire_publication
+      - run: cargo test -p hft-wire malformed_input_smoke_never_panics
+      - run: cargo run --release -p hft-bench
+      - run: python scripts/source_ratio.py
+      - name: Reject unexpected unsafe code
+        run: |
+          found=$(grep -R -n --include='*.rs' -E 'unsafe[[:space:]]*(\{|impl|fn)' crates | cut -d: -f1 | sort -u || true)
+          allowed=$'crates/hft-bench/src/main.rs\ncrates/hft-ffi/src/lib.rs\ncrates/hft-spsc/src/lib.rs'
+          test "$found" = "$allowed"
+
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - run: cargo miri test -p hft-wire -p hft-risk -p hft-book
+
+  ffi-asan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - run: RUSTFLAGS="-Zsanitizer=address" cargo test -Zbuild-std --target x86_64-unknown-linux-gnu -p hft-ffi

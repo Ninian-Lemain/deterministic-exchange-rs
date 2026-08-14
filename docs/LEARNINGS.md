@@ -30,6 +30,14 @@ The book calculates report and resting capacity before matching. Without this
 preflight, a capacity error could occur after makers were already mutated. The
 gateway also releases a taker reservation when the book rejects it.
 
+## Identity Lookup Should Not Scale with Book Occupancy
+
+Cancellation starts with an `OrderId`, so walking every live order makes its
+latency depend on unrelated book depth. A fixed open-addressed index makes that
+lookup expected O(1) while preserving deterministic capacity and zero hot-path
+allocation. The measured tradeoff is explicit memory: 64 KiB for the benchmark
+book shape. FIFO compaction remains a separate optimization.
+
 ## Risk and Matching State Form One Lifecycle
 
 Reservations cover the worst case for open buys and sells independently.

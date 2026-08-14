@@ -25,6 +25,35 @@ digest, and zero allocation and deallocation deltas. `Instant` resolution,
 sampling overhead, and an unisolated desktop scheduler dominate these figures;
 Windows results are intentionally not production latency claims.
 
+## v0.2.0 Indexed Cancellation
+
+The cancellation harness compares v0.1.0's linear whole-book search with
+v0.2.0's fixed-capacity open-addressed index. Each run constructs 1,024 fresh
+books. Each book contains 512 sell price levels with one order per level, then
+cancels all orders from highest to lowest price. Setup is outside the timed
+region, leaving 524,288 measured cancellations per run. The first run is
+discarded as warm-up and the table reports the median of the next seven.
+
+| Metric | v0.1.0 linear scan | v0.2.0 indexed | Difference |
+| --- | ---: | ---: | ---: |
+| Median timed duration | 696.869 ms | 13.871 ms | 98.0% lower |
+| Median latency | 1,329 ns/cancel | 26 ns/cancel | 98.0% lower |
+| Median throughput | 752,347 cancels/s | 37,796,329 cancels/s | 50.2x |
+| Allocation / deallocation delta | 0 / 0 | 0 / 0 | Unchanged |
+| `OrderBook<512, 1>` size | 65,544 bytes | 131,080 bytes | +65,536 bytes |
+
+Command: `cargo build --release -p hft-bench`, followed by eight direct runs of
+`target/release/hft-bench.exe` for each implementation. The baseline was commit
+`1b3cf4b`; the indexed result used the v0.2.0 release candidate. Environment:
+Intel N95, Windows 11 Pro build 26200, Rust 1.96.0/LLVM 22.1.2,
+`x86_64-pc-windows-msvc`, fat LTO, one codegen unit, and aborting panics.
+
+The result isolates in-memory lookup and cancellation. It excludes book setup,
+wire parsing, risk, the gateway, kernel, NIC, and network transit. The index
+removes the whole-book scan at the cost of 64 KiB for this book shape. A cancel
+can still shift later orders within its price level; v0.3.0 will address that
+separately. Desktop scheduling and frequency changes remain sources of noise.
+
 ## Dedicated Linux Protocol
 
 Record all of the following with each result:

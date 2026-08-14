@@ -15,8 +15,9 @@
    single-writer book.
 6. Execution reports are written into a caller-owned fixed report buffer. The
    gateway converts filled reservations into settled positions.
-7. Owner-authorized cancellation removes the resting remainder without
-   disturbing peer FIFO and releases exactly that remaining risk reservation.
+7. Owner-authorized cancellation uses a fixed-capacity `OrderId` index, removes
+   the resting remainder without disturbing peer FIFO, and releases exactly
+   that remaining risk reservation.
 8. Replay hashes stable logical state, independent of array slot placement.
 
 ## Ownership
@@ -24,6 +25,8 @@
 - A frame lease keeps its RX buffer borrowed; it cannot outlive the queue borrow.
 - A gateway owns one initially empty book and one corresponding risk engine.
 - An order book has one writer and no shared mutable access.
+- Each book owns its open-addressed order index. Index slots use deterministic
+  linear probing, remain at or below 50% live load, and never grow on the heap.
 - `SpscQueue::split` requires an exclusive queue borrow and yields exactly one
   producer and consumer.
 - Vendor sessions uniquely own one opaque handle and destroy it once.
@@ -34,6 +37,8 @@
 - SPSC: returns the original value when full.
 - Risk accounts and orders: explicit account/order capacity rejection.
 - Book: explicit price-level, per-level FIFO, and report capacity rejection.
+- Order index: fixed at four slots per configured per-side order capacity;
+  deletions compact probe clusters in place.
 - No structure silently overwrites unread or live data.
 
 ## Cold and Hot Cores

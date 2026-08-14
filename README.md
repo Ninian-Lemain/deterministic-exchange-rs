@@ -43,6 +43,8 @@ See [QUICKSTART.md](QUICKSTART.md) for all quality gates.
 
 ## Measured Results
 
+### Packet-to-Report Smoke
+
 The release harness warms the engine, processes 200,000 messages, and fails if
 the measured path allocates or deallocates. Five consecutive portable smoke
 runs on 2026-08-14 produced:
@@ -72,6 +74,25 @@ processing. Sampled percentiles time `process_frame`: borrowed parsing, session
 sequencing, risk, matching, report generation, and fill accounting. NIC,
 kernel, and wire transit are outside the measurement boundary.
 
+### Indexed Cancellation (v0.2.0)
+
+The release benchmark constructs 512 one-order sell levels, excludes setup,
+then cancels from the highest level down. After one discarded warm-up, the
+table reports the median of seven release runs (524,288 cancellations per run):
+
+| Metric | v0.1.0 linear scan | v0.2.0 fixed index | Change |
+| --- | ---: | ---: | ---: |
+| Median latency | 1,329 ns/cancel | 26 ns/cancel | 98.0% lower |
+| Median throughput | 752,347 cancels/s | 37,796,329 cancels/s | 50.2x |
+| Measured allocations / deallocations | 0 / 0 | 0 / 0 | Unchanged |
+| `OrderBook<512, 1>` size | 65,544 bytes | 131,080 bytes | +65,536 bytes |
+
+This is an isolated cancellation benchmark, not end-to-end network latency.
+The index removes the whole-book scan; cancellation within a populated price
+level can still shift later FIFO entries. That separate data-structure change
+is reserved for v0.3.0. Full commands, environment, and raw methodology are in
+[docs/PERFORMANCE.md](docs/PERFORMANCE.md).
+
 ## Verification Evidence
 
 | Gate | Evidence |
@@ -93,7 +114,7 @@ kernel, and wire transit are outside the measurement boundary.
 | `hft-io` | RAII frame leases, in-memory and UDP baseline | Preallocated frame |
 | `hft-spsc` | Bounded cache-aware SPSC handoff | None after construction |
 | `hft-risk` | Fixed-capacity limits and exposure reservations | None |
-| `hft-book` | Fixed-capacity price-time matching | None |
+| `hft-book` | Fixed-capacity price-time matching and `OrderId` index | None |
 | `hft-gateway` | Transaction coordination and report accounting | None |
 | `hft-replay` | Ordered replay and stable final-state digest | None in engine |
 | `hft-ffi` | Optional vendor C ABI ownership wrapper | Vendor-defined |
@@ -131,6 +152,7 @@ sources so architectural changes remain reviewable.
 | Atomic ordering needs a proof | Release publishes slots; Acquire observes publication and reclamation | Loom model and cross-thread FIFO stress test |
 | Replay determinism is cross-platform | Canonical big-endian digest lanes plus a golden final-state value | `hft-risk` digest and `hft-replay` regression test |
 | Benchmarks need scope and context | Separate zero-allocation evidence from unmeasured NIC/kernel latency | Release allocator gate and performance protocol |
+| Fast cancellation needs direct identity lookup | Trade a fixed memory budget for deterministic open-addressed `OrderId` lookup | Before/after cancellation benchmark and collision invariants |
 | Unsafe code belongs at narrow boundaries | Keep domain, risk, matching, parsing, and replay in safe Rust | CI unsafe allowlist, Miri, and FFI AddressSanitizer |
 
 The detailed design reflection is in
@@ -144,7 +166,7 @@ The detailed design reflection is in
 | New/cancel wire messages | Implemented | Fixed lengths and big-endian scalar fields |
 | RAII RX lease | Implemented | In-memory and UDP buffer ownership |
 | Fixed-capacity risk | Implemented | Quantity, notional, position, open-order, collar, duplicate, kill checks |
-| Price-time book | Implemented | FIFO and price-priority tests |
+| Price-time book | Implemented | FIFO, price priority, and fixed-capacity indexed order lookup |
 | Deterministic replay | Implemented | Stable final-state digest test |
 | Session sequence enforcement | Implemented | Duplicates/gaps fail closed without advancing |
 | Owner-authorized cancel | Implemented | FIFO-preserving removal and exact risk release |
@@ -164,6 +186,8 @@ The detailed design reflection is in
   out-of-order IDs fail closed.
 - The book rejects when report, order, per-price FIFO, or price-level capacity
   would be exceeded; capacity is selected at compile time.
+- Order lookup is expected O(1) at the index's maximum 50% live load. Removing
+  from a multi-order price level still compacts that level linearly.
 - Timing output includes measurement overhead and is only a local smoke result.
   See [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 - See [docs/SAFETY.md](docs/SAFETY.md) for every unsafe boundary and

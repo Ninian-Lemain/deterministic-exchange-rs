@@ -1,0 +1,17 @@
+name: Performance result
+description: Submit a reproducible dedicated-runner result
+body:
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: CPU, NIC, memory, kernel, governor, NUMA, affinity, compiler, flags.
+    validations:
+      required: true
+  - type: textarea
+    id: method
+    attributes:
+      label: Method and results
+      description: Warm-up, samples, load, percentiles, counters, allocation, before/after revision.
+    validations:
+      required: true

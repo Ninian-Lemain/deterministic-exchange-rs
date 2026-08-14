@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/hft-types",
+    "crates/hft-wire",
+    "crates/hft-io",
+    "crates/hft-spsc",
+    "crates/hft-risk",
+    "crates/hft-book",
+    "crates/hft-gateway",
+    "crates/hft-ffi",
+    "crates/hft-replay",
+    "crates/hft-bench",
+    "crates/hft-cli",
+]
+exclude = ["fuzz"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/Ninian-Lemain/hft-engine-rs"
+rust-version = "1.85"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"

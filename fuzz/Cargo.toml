@@ -1,0 +1,22 @@
+[package]
+name = "hft-wire-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+hft-io = { path = "../crates/hft-io" }
+hft-wire = { path = "../crates/hft-wire" }
+
+[[bin]]
+name = "parse_message"
+path = "fuzz_targets/parse_message.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

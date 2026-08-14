@@ -1,0 +1,19 @@
+[package]
+name = "hft-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+hft-book = { path = "../hft-book" }
+hft-gateway = { path = "../hft-gateway" }
+hft-io = { path = "../hft-io" }
+hft-risk = { path = "../hft-risk" }
+hft-spsc = { path = "../hft-spsc" }
+hft-types = { path = "../hft-types" }
+hft-wire = { path = "../hft-wire" }
+
+[lints]
+workspace = true

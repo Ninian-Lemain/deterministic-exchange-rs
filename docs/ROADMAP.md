@@ -54,7 +54,8 @@ large unverified feature list.
 | --- | --- | --- |
 | v0.1.0 | Deterministic execution vertical slice | Complete |
 | v0.2.0 | Fixed-capacity indexed order lookup and fast cancellation | Complete |
-| v0.3.0 | Efficient FIFO price levels | Next |
+| v0.2.1 | Safe-core and optional native-boundary policy | Next |
+| v0.3.0 | Efficient FIFO price levels | Queued |
 | v0.4.0 | IOC and FOK orders | Planned |
 | v0.5.0 | Post-only orders | Planned |
 | v0.6.0 | Replace orders and priority rules | Planned |
@@ -75,6 +76,51 @@ large unverified feature list.
 
 Only the next release is committed work. Later versions describe sequencing and
 acceptance criteria; they are not claims that the features already exist.
+
+## Immediate Next Release: v0.2.1 - Safe Core and Native Boundaries
+
+The project will keep its public engine and domain logic in safe Rust. C++ is an
+optional integration tool only when a real vendor or NIC SDK requires it; it is
+not a way to hide an otherwise reviewable unsafe Rust implementation.
+
+### Deliverables
+
+- Define the future `hft-engine` facade as safe Rust with
+  `#![forbid(unsafe_code)]`.
+- Keep matching, risk, parsing, sessions, replay, and operational coordination
+  in crates that forbid unsafe Rust.
+- Document every repository-owned unsafe site, its invariant, owner, tests, and
+  reason that safe Rust cannot express the operation directly.
+- Classify `hft-bench` allocator instrumentation as non-shipping test code.
+- Keep the lock-free Rust SPSC implementation small and audited unless a
+  measured replacement improves the actual system.
+- Define `hft-ffi` as an optional integration crate; the default library must
+  not require a C++ compiler, native SDK, or vendor runtime.
+- Specify a native adapter contract for future C++ SDK shims: stable C ABI,
+  opaque handles, fixed-width scalars, explicit ownership and error codes, no
+  exceptions or C++ standard-library types across the boundary, and no hidden
+  callbacks on matching threads.
+- Extend CI policy to verify the owned-source unsafe allowlist, Miri coverage,
+  FFI layout tests, and ASan/UBSan for native shims when one is introduced.
+- Add a dependency-safety audit that distinguishes repository-owned unsafe code
+  from audited unsafe used internally by Rust dependencies.
+
+### Acceptance Criteria
+
+- A reviewer can identify every unsafe boundary from one document.
+- All core crates continue to reject new unsafe code at compile time.
+- Default builds and tests remain Rust-only and portable.
+- Any future C++ adapter can be removed without changing matching, risk, replay,
+  or the public command/event model.
+- README wording says "safe Rust core with audited low-level boundaries" rather
+  than making an unverifiable zero-unsafe claim.
+
+### Non-Goals
+
+- Do not rewrite the SPSC queue in C++ merely to move unsafe code out of sight.
+- Do not add a placeholder C++ library before a real SDK or measured need
+  exists.
+- Do not claim that FFI makes C++ memory-safe or eliminates unsafe operations.
 
 ## Milestone 1: Matching Core - v0.2.0 to v0.8.0
 

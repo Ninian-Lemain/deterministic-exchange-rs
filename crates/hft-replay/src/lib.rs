@@ -81,7 +81,9 @@ mod tests {
 
     #[test]
     fn replay_digest_is_deterministic() {
-        assert_eq!(run(), run());
-        assert_eq!(run().reports, 1);
+        let summary = run();
+        assert_eq!(summary, run());
+        assert_eq!(summary.reports, 1);
+        assert_eq!(summary.digest, 0xa056_40aa_3330_1631);
     }
 }

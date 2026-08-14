@@ -431,7 +431,7 @@ impl<const ACCOUNTS: usize, const ORDERS: usize> RiskEngine<ACCOUNTS, ORDERS> {
             let position_bytes = account.settled_position.to_be_bytes();
             mix(
                 &mut digest,
-                u64::from_ne_bytes([
+                u64::from_be_bytes([
                     position_bytes[0],
                     position_bytes[1],
                     position_bytes[2],
@@ -446,14 +446,14 @@ impl<const ACCOUNTS: usize, const ORDERS: usize> RiskEngine<ACCOUNTS, ORDERS> {
                 let bytes = exposure.to_be_bytes();
                 mix(
                     &mut digest,
-                    u64::from_ne_bytes([
+                    u64::from_be_bytes([
                         bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
                         bytes[7],
                     ]),
                 );
                 mix(
                     &mut digest,
-                    u64::from_ne_bytes([
+                    u64::from_be_bytes([
                         bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14],
                         bytes[15],
                     ]),
@@ -461,7 +461,7 @@ impl<const ACCOUNTS: usize, const ORDERS: usize> RiskEngine<ACCOUNTS, ORDERS> {
             }
             mix(
                 &mut digest,
-                u64::from_ne_bytes([
+                u64::from_be_bytes([
                     position_bytes[8],
                     position_bytes[9],
                     position_bytes[10],

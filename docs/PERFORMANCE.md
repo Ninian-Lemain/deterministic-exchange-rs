@@ -13,15 +13,17 @@ and maximum for 2,000 sampled messages. Per-sample `Instant` overhead is
 included. This is useful for catching gross regressions, not establishing a
 service-level objective.
 
-The initial local smoke run used Windows 11 Pro build 26200, an Intel N95 (four
+The local smoke environment used Windows 11 Pro build 26200, an Intel N95 (four
 cores/four threads), about 16 GB RAM, Rust 1.96.0/LLVM 22.1.2, x86_64 MSVC,
 release fat LTO, one codegen unit, aborting panics, 100,000 order pairs, and
-2,000 per-message samples after one warm-up pair. The latest run reported
-200,000 messages, 64 ns aggregate mean, p50/p90/p99/p99.9/max of
-100/100/200/300/800 ns, queue maximum occupancy 64, one explicit
-backpressure event, and zero allocation and deallocation deltas. `Instant`
-resolution, sampling overhead, and an unisolated desktop scheduler dominate
-these figures; Windows results are intentionally not production latency claims.
+2,000 per-message samples after one warm-up pair. Five consecutive runs on
+2026-08-14 each processed 200,000 messages. Aggregate means were
+128/106/76/68/68 ns per message (76 ns median); p50 and p90 were 100 ns, median
+p99/p99.9 were 200/300 ns, and maxima ranged from 300 ns to 73.4 us. Every run
+reported queue maximum occupancy 64, one explicit backpressure event, a stable
+digest, and zero allocation and deallocation deltas. `Instant` resolution,
+sampling overhead, and an unisolated desktop scheduler dominate these figures;
+Windows results are intentionally not production latency claims.
 
 ## Dedicated Linux Protocol
 

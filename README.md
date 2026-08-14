@@ -52,6 +52,7 @@ runs on 2026-08-14 produced:
 | Messages | 200,000 |
 | Median aggregate mean | 76 ns/message |
 | Aggregate mean range | 68-128 ns/message |
+| Derived median throughput | ~13.2 million messages/second |
 | p50 / p90 | 100 ns / 100 ns |
 | Median p99 / p99.9 | 200 ns / 300 ns |
 | Maximum range | 300 ns-73.4 us |
@@ -65,6 +66,11 @@ overhead and desktop scheduler noise; the maximum range shows that jitter
 directly. These results validate the benchmark and allocation discipline; they
 are **not** a Linux/NIC production-latency claim.
 See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for the reproducibility protocol.
+
+The aggregate loop includes synthetic frame construction and gateway
+processing. Sampled percentiles time `process_frame`: borrowed parsing, session
+sequencing, risk, matching, report generation, and fill accounting. NIC,
+kernel, and wire transit are outside the measurement boundary.
 
 ## Verification Evidence
 
@@ -97,6 +103,86 @@ See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for the reproducibility protocol.
 Each instrument group is intended to run as a single matching shard. If a
 packet crosses cores, the supported design is normalization once into a fixed
 size SPSC slot. That is a bounded single-copy handoff, not end-to-end zero-copy.
+
+## Workflow Diagrams
+
+### Packet-to-Report Data Path
+
+```mermaid
+flowchart LR
+    RX["RX queue"] --> Lease["RAII frame lease"]
+    Lease --> Parse["Lifetime-bound parser"]
+    Parse --> Sequence["Session sequence gate"]
+    Sequence --> Normalize["Fixed-size NewOrder"]
+    Normalize --> Handoff{"Cross-core handoff?"}
+    Handoff -- "Yes" --> SPSC["Bounded SPSC slot"]
+    Handoff -- "No" --> Risk["Risk check and reserve"]
+    SPSC --> Risk
+    Risk --> Book["Book preflight and price-time match"]
+    Book --> Reports["Fixed ReportBuffer"]
+    Reports --> Settle["Maker and taker fill accounting"]
+    Settle --> Digest["Stable replay digest"]
+
+    Parse -- "Invalid frame" --> Reject["Deterministic rejection"]
+    Sequence -- "Gap or duplicate" --> Reject
+    SPSC -- "Full" --> Backpressure["Bounded backpressure"]
+    Risk -- "Limit or capacity" --> Reject
+    Book -- "Capacity failure" --> Rollback["Release taker reservation"]
+    Rollback --> Reject
+```
+
+The parser borrows the RX frame. Only the optional cross-core handoff copies a
+normalized fixed-size order into a preallocated queue slot.
+
+### New-Order Transaction
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant RX as RX queue
+    participant GW as Gateway
+    participant Risk as Risk engine
+    participant Book as Order book
+    participant Reports as Report buffer
+
+    RX->>GW: Borrowed frame
+    GW->>GW: Validate protocol and sequence
+    GW->>Risk: check_and_reserve(order)
+    alt Risk rejection
+        Risk-->>GW: RejectReason
+        GW-->>RX: Fail closed
+    else Reservation active
+        Risk-->>GW: Reserved exposure
+        GW->>Book: Preflight and submit
+        alt Book rejection
+            Book-->>GW: Validation or capacity error
+            GW->>Risk: settle(order_id, 0)
+            GW-->>RX: Rejection with state restored
+        else Matched or resting
+            Book->>Reports: Write fixed-capacity reports
+            loop Each execution report
+                GW->>Risk: Record maker and taker fills
+            end
+            GW-->>RX: GatewayOutcome
+        end
+    end
+```
+
+## Key Takeaways and Lessons Learned
+
+| Lesson | Design decision | Evidence |
+| --- | --- | --- |
+| Ownership is part of latency design | Frame leases bind parser borrows to RX-buffer lifetime | `hft-io`, `hft-wire`, lease and truncation tests |
+| Bounded state makes overload deterministic | Fixed arrays and SPSC slots reject instead of growing | Capacity, backpressure, and no-overwrite tests |
+| Zero-copy claims need exact boundaries | Borrow the frame; describe cross-core normalization as one bounded copy | Architecture and safety documentation |
+| Transactionality requires preflight | Check report/book capacity before mutation and roll back rejected reservations | Book preservation and gateway lifecycle tests |
+| Atomic ordering needs a proof | Release publishes slots; Acquire observes publication and reclamation | Loom model and cross-thread FIFO stress test |
+| Replay determinism is cross-platform | Canonical big-endian digest lanes plus a golden final-state value | `hft-risk` digest and `hft-replay` regression test |
+| Benchmarks need scope and context | Separate zero-allocation evidence from unmeasured NIC/kernel latency | Release allocator gate and performance protocol |
+| Unsafe code belongs at narrow boundaries | Keep domain, risk, matching, parsing, and replay in safe Rust | CI unsafe allowlist, Miri, and FFI AddressSanitizer |
+
+The detailed design reflection is in
+[Engineering Lessons Learned](docs/LEARNINGS.md).
 
 ## Capability Matrix
 

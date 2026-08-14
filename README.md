@@ -41,6 +41,43 @@ cargo run --release -p hft-bench
 
 See [QUICKSTART.md](QUICKSTART.md) for all quality gates.
 
+## Measured Results
+
+The release harness warms the engine, processes 200,000 messages, and fails if
+the measured path allocates or deallocates. Five consecutive portable smoke
+runs on 2026-08-14 produced:
+
+| Metric | Result |
+| --- | ---: |
+| Messages | 200,000 |
+| Median aggregate mean | 76 ns/message |
+| Aggregate mean range | 68-128 ns/message |
+| p50 / p90 | 100 ns / 100 ns |
+| Median p99 / p99.9 | 200 ns / 300 ns |
+| Maximum range | 300 ns-73.4 us |
+| Allocation / deallocation delta | 0 / 0 |
+| SPSC maximum occupancy | 64 / 64 |
+| Explicit backpressure events | 1 |
+
+Environment: Intel N95, Windows 11, Rust 1.96.0, `x86_64-pc-windows-msvc`,
+fat LTO, one codegen unit, and aborting panics. These figures include timer
+overhead and desktop scheduler noise; the maximum range shows that jitter
+directly. These results validate the benchmark and allocation discipline; they
+are **not** a Linux/NIC production-latency claim.
+See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for the reproducibility protocol.
+
+## Verification Evidence
+
+| Gate | Evidence |
+| --- | --- |
+| Workspace correctness | Formatting, all-target check, Clippy with warnings denied, unit/integration/doc tests |
+| Parser robustness | Boundary cases, malformed-input smoke, and a `cargo-fuzz` target |
+| Concurrency | Cross-thread FIFO stress test and Loom Release/Acquire model |
+| Memory safety | Miri on parser/risk/book and AddressSanitizer on the FFI crate |
+| Hot-path allocation | Post-warm-up counter asserts zero allocation and deallocation deltas |
+| Replay stability | Golden final-state digest with canonical byte-order encoding |
+| Language boundary | Rust source-ratio gate and an allowlist for crates containing unsafe code |
+
 ## Architecture
 
 | Crate | Responsibility | Hot-path allocation |
@@ -111,6 +148,7 @@ failure behavior is in [docs/OPERATIONS.md](docs/OPERATIONS.md).
 ## Project
 
 - [Review](docs/REVIEW.md)
+- [Engineering lessons learned](docs/LEARNINGS.md)
 - [Roadmap](docs/ROADMAP.md)
 - [Contributing](CONTRIBUTING.md)
 - [Security](SECURITY.md)

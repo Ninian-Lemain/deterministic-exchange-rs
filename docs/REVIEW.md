@@ -25,9 +25,18 @@ allocation, and unsafe boundaries.
 - Unsafe Rust is confined to `hft-spsc`, `hft-ffi`, and the isolated allocation
   executable.
 
+## Resolved Finding
+
+- **Medium - cross-architecture replay divergence:**
+  `crates/hft-risk/src/lib.rs:434` reconstructed canonical big-endian risk
+  lanes with native-endian conversion. On a big-endian target the logical state
+  could therefore produce a different digest. The four risk lanes now use
+  `u64::from_be_bytes`, and `crates/hft-replay/src/lib.rs:87` pins the complete
+  gateway result to a golden digest.
+
 ## Known Scope Gaps
 
 These are unimplemented capabilities, not disguised defects in implemented
-code: cancel/replace, disconnect recovery, persistence, sequence-gap recovery,
+code: replace, disconnect recovery, persistence, sequence-gap recovery,
 market-data publication, AF_XDP, proprietary vendor integration, NUMA setup,
 CPU affinity, prefault/mlock setup, and dedicated Linux performance gates.

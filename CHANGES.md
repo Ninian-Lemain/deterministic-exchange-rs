@@ -9,3 +9,5 @@
   documentation.
 - Added fixed-size cancel messages, owner-authorized FIFO-preserving cancel,
   exact risk-reservation release, and fail-closed session sequence enforcement.
+- Canonicalized risk-state digest encoding across CPU byte orders.
+- Added measured-result evidence and an engineering lessons review path.

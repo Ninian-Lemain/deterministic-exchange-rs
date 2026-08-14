@@ -1,0 +1,42 @@
+flowchart TB
+    subgraph Ingress["1. Ingress and ownership"]
+        direction LR
+        RX["RX queue"] --> Lease["RAII FrameLease"]
+        Lease --> Parse["Lifetime-bound zero-copy parser"]
+    end
+
+    subgraph Dispatch["2. Validation and dispatch"]
+        direction LR
+        Sequence["Session sequence gate"] --> Normalize["Fixed-size NewOrder"]
+        Normalize --> Handoff{"Cross-core handoff?"}
+        Handoff -- "Yes" --> SPSC["Bounded SPSC slot"]
+        Handoff -- "No" --> Risk["Risk check and reserve"]
+        SPSC --> Risk
+    end
+
+    subgraph Matching["3. Single-writer matching shard"]
+        direction LR
+        Risk --> Book["Book preflight and price-time match"]
+        Book --> Reports["Fixed ReportBuffer"]
+        Reports --> Settle["Maker and taker fill accounting"]
+        Settle --> Digest["Stable replay digest"]
+    end
+
+    Parse --> Sequence
+
+    Parse -. "Invalid frame" .-> Reject["Deterministic rejection"]
+    Sequence -. "Gap or duplicate" .-> Reject
+    SPSC -. "Queue full" .-> Backpressure["Bounded backpressure"]
+    Risk -. "Limit or capacity" .-> Reject
+    Book -. "Capacity failure" .-> Rollback["Release taker reservation"]
+    Rollback --> Reject
+
+    classDef ingress fill:#e8f1ff,stroke:#1d4ed8,color:#0f172a,stroke-width:2px
+    classDef hot fill:#ecfdf5,stroke:#047857,color:#064e3b,stroke-width:2px
+    classDef state fill:#f5f3ff,stroke:#6d28d9,color:#3b0764,stroke-width:2px
+    classDef failure fill:#fff7ed,stroke:#c2410c,color:#7c2d12,stroke-width:2px
+
+    class RX,Lease,Parse ingress
+    class Sequence,Normalize,Handoff,SPSC,Risk,Book hot
+    class Reports,Settle,Digest state
+    class Reject,Backpressure,Rollback failure

@@ -52,6 +52,7 @@ runs on 2026-08-14 produced:
 | Messages | 200,000 |
 | Median aggregate mean | 76 ns/message |
 | Aggregate mean range | 68-128 ns/message |
+| Derived median throughput | ~13.2 million messages/second |
 | p50 / p90 | 100 ns / 100 ns |
 | Median p99 / p99.9 | 200 ns / 300 ns |
 | Maximum range | 300 ns-73.4 us |
@@ -65,6 +66,11 @@ overhead and desktop scheduler noise; the maximum range shows that jitter
 directly. These results validate the benchmark and allocation discipline; they
 are **not** a Linux/NIC production-latency claim.
 See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for the reproducibility protocol.
+
+The aggregate loop includes synthetic frame construction and gateway
+processing. Sampled percentiles time `process_frame`: borrowed parsing, session
+sequencing, risk, matching, report generation, and fill accounting. NIC,
+kernel, and wire transit are outside the measurement boundary.
 
 ## Verification Evidence
 
@@ -97,6 +103,38 @@ See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for the reproducibility protocol.
 Each instrument group is intended to run as a single matching shard. If a
 packet crosses cores, the supported design is normalization once into a fixed
 size SPSC slot. That is a bounded single-copy handoff, not end-to-end zero-copy.
+
+## Workflow Diagrams
+
+### Packet-to-Report Data Path
+
+[![Packet-to-report workflow](docs/diagrams/packet-to-report.svg)](docs/diagrams/packet-to-report.mmd)
+
+The parser borrows the RX frame. Only the optional cross-core handoff copies a
+normalized fixed-size order into a preallocated queue slot.
+
+### New-Order Transaction
+
+[![New-order transaction](docs/diagrams/new-order-transaction.svg)](docs/diagrams/new-order-transaction.mmd)
+
+Both SVG images are generated from the linked, version-controlled Mermaid
+sources so architectural changes remain reviewable.
+
+## Key Takeaways and Lessons Learned
+
+| Lesson | Design decision | Evidence |
+| --- | --- | --- |
+| Ownership is part of latency design | Frame leases bind parser borrows to RX-buffer lifetime | `hft-io`, `hft-wire`, lease and truncation tests |
+| Bounded state makes overload deterministic | Fixed arrays and SPSC slots reject instead of growing | Capacity, backpressure, and no-overwrite tests |
+| Zero-copy claims need exact boundaries | Borrow the frame; describe cross-core normalization as one bounded copy | Architecture and safety documentation |
+| Transactionality requires preflight | Check report/book capacity before mutation and roll back rejected reservations | Book preservation and gateway lifecycle tests |
+| Atomic ordering needs a proof | Release publishes slots; Acquire observes publication and reclamation | Loom model and cross-thread FIFO stress test |
+| Replay determinism is cross-platform | Canonical big-endian digest lanes plus a golden final-state value | `hft-risk` digest and `hft-replay` regression test |
+| Benchmarks need scope and context | Separate zero-allocation evidence from unmeasured NIC/kernel latency | Release allocator gate and performance protocol |
+| Unsafe code belongs at narrow boundaries | Keep domain, risk, matching, parsing, and replay in safe Rust | CI unsafe allowlist, Miri, and FFI AddressSanitizer |
+
+The detailed design reflection is in
+[Engineering Lessons Learned](docs/LEARNINGS.md).
 
 ## Capability Matrix
 

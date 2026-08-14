@@ -1,0 +1,36 @@
+sequenceDiagram
+    autonumber
+
+    participant RX as RX Queue
+    participant GW as Gateway
+    participant Risk as Risk Engine
+    participant Book as Order Book
+    participant Reports as Report Buffer
+
+    RX->>GW: Borrowed RX frame
+    GW->>GW: Validate protocol and sequence
+    GW->>Risk: check_and_reserve(order)
+
+    alt Risk rejection
+        Risk-->>GW: RejectReason
+        GW-->>RX: Fail closed
+    else Reservation active
+        Risk-->>GW: Exposure reserved
+        GW->>Book: Preflight and submit
+
+        alt Book rejection
+            Book-->>GW: Validation or capacity error
+            GW->>Risk: settle(order_id, 0)
+            Risk-->>GW: Reservation released
+            GW-->>RX: Rejection with state restored
+        else Order matched or resting
+            Book->>Reports: Write fixed-capacity reports
+
+            loop Each execution report
+                GW->>Risk: Record maker fill
+                GW->>Risk: Record taker fill
+            end
+
+            GW-->>RX: GatewayOutcome
+        end
+    end

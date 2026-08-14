@@ -108,65 +108,17 @@ size SPSC slot. That is a bounded single-copy handoff, not end-to-end zero-copy.
 
 ### Packet-to-Report Data Path
 
-```mermaid
-flowchart LR
-    RX["RX queue"] --> Lease["RAII frame lease"]
-    Lease --> Parse["Lifetime-bound parser"]
-    Parse --> Sequence["Session sequence gate"]
-    Sequence --> Normalize["Fixed-size NewOrder"]
-    Normalize --> Handoff{"Cross-core handoff?"}
-    Handoff -- "Yes" --> SPSC["Bounded SPSC slot"]
-    Handoff -- "No" --> Risk["Risk check and reserve"]
-    SPSC --> Risk
-    Risk --> Book["Book preflight and price-time match"]
-    Book --> Reports["Fixed ReportBuffer"]
-    Reports --> Settle["Maker and taker fill accounting"]
-    Settle --> Digest["Stable replay digest"]
-
-    Parse -- "Invalid frame" --> Reject["Deterministic rejection"]
-    Sequence -- "Gap or duplicate" --> Reject
-    SPSC -- "Full" --> Backpressure["Bounded backpressure"]
-    Risk -- "Limit or capacity" --> Reject
-    Book -- "Capacity failure" --> Rollback["Release taker reservation"]
-    Rollback --> Reject
-```
+[![Packet-to-report workflow](docs/diagrams/packet-to-report.svg)](docs/diagrams/packet-to-report.mmd)
 
 The parser borrows the RX frame. Only the optional cross-core handoff copies a
 normalized fixed-size order into a preallocated queue slot.
 
 ### New-Order Transaction
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant RX as RX queue
-    participant GW as Gateway
-    participant Risk as Risk engine
-    participant Book as Order book
-    participant Reports as Report buffer
+[![New-order transaction](docs/diagrams/new-order-transaction.svg)](docs/diagrams/new-order-transaction.mmd)
 
-    RX->>GW: Borrowed frame
-    GW->>GW: Validate protocol and sequence
-    GW->>Risk: check_and_reserve(order)
-    alt Risk rejection
-        Risk-->>GW: RejectReason
-        GW-->>RX: Fail closed
-    else Reservation active
-        Risk-->>GW: Reserved exposure
-        GW->>Book: Preflight and submit
-        alt Book rejection
-            Book-->>GW: Validation or capacity error
-            GW->>Risk: settle(order_id, 0)
-            GW-->>RX: Rejection with state restored
-        else Matched or resting
-            Book->>Reports: Write fixed-capacity reports
-            loop Each execution report
-                GW->>Risk: Record maker and taker fills
-            end
-            GW-->>RX: GatewayOutcome
-        end
-    end
-```
+Both SVG images are generated from the linked, version-controlled Mermaid
+sources so architectural changes remain reviewable.
 
 ## Key Takeaways and Lessons Learned
 

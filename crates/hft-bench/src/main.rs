@@ -1,12 +1,13 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
+use hft_book::OrderBook;
 use hft_gateway::Gateway;
 use hft_io::RxFrame;
 use hft_risk::{RiskEngine, RiskLimits};
 use hft_spsc::SpscQueue;
 use hft_types::{
-    AccountId, InstrumentId, NewOrder, OrderId, PriceTicks, Quantity, ReportBuffer, SequenceNumber,
-    Side,
+    AccountId, CancelOrder, InstrumentId, NewOrder, OrderId, PriceTicks, Quantity, ReportBuffer,
+    SequenceNumber, Side,
 };
 use hft_wire::encode_new_order;
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -114,6 +115,73 @@ fn main() {
         maximum_occupancy,
         backpressure_events,
         gateway.stable_digest()
+    );
+    cancel_benchmark();
+}
+
+fn cancel_benchmark() {
+    const LEVELS: usize = 512;
+    const BATCHES: u64 = 1_024;
+    let levels = u64::try_from(LEVELS).expect("level count fits u64");
+    let operations = BATCHES * levels;
+    let allocations_before = ALLOCATIONS.load(Ordering::SeqCst);
+    let deallocations_before = DEALLOCATIONS.load(Ordering::SeqCst);
+    let mut elapsed_ns = 0_u128;
+    let mut checksum = 0_u64;
+
+    for batch in 0..BATCHES {
+        let mut book = OrderBook::<LEVELS, 1>::new(InstrumentId(1));
+        let mut reports = ReportBuffer::<1>::new();
+        let first_id = batch * levels + 1;
+        for level in 0..LEVELS {
+            let offset = u64::try_from(level).expect("level index fits u64");
+            let id = first_id + offset;
+            book.submit(
+                NewOrder {
+                    order_id: OrderId(id),
+                    account_id: AccountId(1),
+                    instrument_id: InstrumentId(1),
+                    price: PriceTicks(i64::try_from(level + 1).expect("price fits i64")),
+                    quantity: Quantity(1),
+                    sequence: SequenceNumber(id),
+                    side: Side::Sell,
+                },
+                &mut reports,
+            )
+            .expect("benchmark order rests");
+            reports.clear();
+        }
+
+        let started = Instant::now();
+        for level in (0..LEVELS).rev() {
+            let id = first_id + u64::try_from(level).expect("level index fits u64");
+            let cancelled = book
+                .cancel(CancelOrder {
+                    order_id: OrderId(id),
+                    account_id: AccountId(1),
+                    instrument_id: InstrumentId(1),
+                    sequence: SequenceNumber(id),
+                })
+                .expect("benchmark cancellation");
+            checksum ^= cancelled.order_id.0;
+        }
+        elapsed_ns += started.elapsed().as_nanos();
+        assert_eq!(book.order_count(), 0, "all benchmark orders cancelled");
+    }
+
+    let allocations_after = ALLOCATIONS.load(Ordering::SeqCst);
+    let deallocations_after = DEALLOCATIONS.load(Ordering::SeqCst);
+    assert_eq!(allocations_after, allocations_before, "cancel allocation");
+    assert_eq!(
+        deallocations_after, deallocations_before,
+        "cancel deallocation"
+    );
+    let operations_u128 = u128::from(operations);
+    let cancels_per_second = 1_000_000_000_u128 * operations_u128 / elapsed_ns;
+    let book_bytes = core::mem::size_of::<OrderBook<LEVELS, 1>>();
+    println!(
+        "cancel_bench implementation=indexed cancels={operations} elapsed_ns={elapsed_ns} ns_per_cancel={} cancels_per_second={cancels_per_second} book_bytes={book_bytes} allocations=0 deallocations=0 checksum={checksum:016x}",
+        elapsed_ns / operations_u128,
     );
 }
 

@@ -48,7 +48,9 @@ and duplicate matching traversal during preflight.
 Fixed-capacity `OrderId -> resting slot` lookup with deterministic back-shift
 deletion. Collision, relocation, fill, cancel, and slot-reuse invariants pass.
 The documented 512-level desktop workload measured 1,329 ns to 26 ns median
-cancellation latency at a 64 KiB book-size cost. Per-level FIFO shifts remain.
+cancellation latency at a 64 KiB book-size cost. See the
+[performance methodology](PERFORMANCE.md) for the workload and evidence.
+Per-level FIFO shifts remain.
 
 ## Next
 
@@ -56,9 +58,12 @@ cancellation latency at a 64 KiB book-size cost. Per-level FIFO shifts remain.
 
 - **Purpose / scope:** replace order-array shifts with a fixed-capacity linked or
   indexed FIFO containing head, tail, free-list, and stable slot handles.
-- **Invariants / tests:** exact FIFO; live and linked counts agree; live/free sets
-  are disjoint; stale handles fail closed; full levels reject atomically. Compare
-  generated command sequences with the current array model.
+- **Invariants / tests:** the order index maps IDs to stable slot handles, never
+  FIFO positions. Insert, fill, and cancel update index and level atomically;
+  unrelated level mutations preserve handles and stale handles fail closed.
+  Live/free sets stay disjoint and full levels reject atomically. Check
+  cross-module lookup after unrelated mutation and compare generated commands
+  with the current array model.
 - **Benchmarks:** head/middle/tail cancel and head fill at depths 1, 4, 16, 64,
   and maximum; report latency distribution, throughput, branches, memory, and
   allocations before/after.
@@ -105,7 +110,8 @@ cancellation latency at a 64 KiB book-size cost. Per-level FIFO shifts remain.
   report bounds, and fixed-capacity rollback metadata to avoid duplicate walks.
 - **Invariants / tests:** capacity rejection is atomic; quantity is conserved;
   each maker appears once; plan application equals the reference matcher;
-  injected mutation failures restore the initial digest.
+  failures after each report append or mutation restore the book, report buffer,
+  reservation state, and plan metadata; success commits them together.
 - **Benchmarks:** non-crossing, single/multi-fill, report-full, and deep rejection;
   record traversal count, branches, latency, allocations, and metadata size.
 - **Exit:** adopt a design only if failure atomicity holds and target workloads
@@ -187,8 +193,9 @@ cancellation latency at a 64 KiB book-size cost. Per-level FIFO shifts remain.
   Miri for relevant unsafe paths.
 - **Benchmarks:** prove testability changes do not regress SPSC latency,
   throughput, cache traffic, or allocation behavior.
-- **Exit:** actual-algorithm Loom coverage or documented blocker, updated safety
-  proof, and unchanged release results.
+- **Exit:** actual-algorithm Loom coverage; if infeasible, require a bounded model
+  of the same state machine, updated safety proof, Miri/stress evidence, and
+  independent review. A blocker alone cannot pass.
 - **Dependencies / limits:** requires v0.8; Loom explores bounded executions.
 
 ### v0.13.0 - Dedicated Linux Qualification
@@ -259,7 +266,8 @@ cancellation latency at a 64 KiB book-size cost. Per-level FIFO shifts remain.
 - **Benchmarks:** event creation, enqueue/dequeue, queue occupancy, saturation,
   and gateway overhead with/without consumers.
 - **Exit:** model tests and machine-readable mixed workload pass.
-- **Dependencies / limits:** requires v0.8/v0.12/v0.17; single instrument only.
+- **Dependencies / limits:** requires v0.8/v0.11/v0.12/v0.17; single instrument
+  only.
 
 ### v0.19.0 - Multi-Instrument Routing
 
@@ -303,8 +311,8 @@ cancellation latency at a 64 KiB book-size cost. Per-level FIFO shifts remain.
 - Zero measured post-initialization allocation on declared hot paths.
 - Explicit overload behavior for every capacity and queue.
 - Dedicated-Linux raw evidence with no network-latency overclaim.
-- Miri, actual Loom where practical, sanitizers, property/fuzz, crash, and soak
-  qualification.
+- Miri, v0.12 actual-algorithm Loom or its required compensating evidence,
+  sanitizers, property/fuzz, crash, and soak qualification.
 - Install, validate, drain, shutdown, backup/restore, upgrade/rollback, health,
   and incident runbooks for any reference service.
 - Explicit unsupported venue, regulatory, hardware, and deployment requirements.

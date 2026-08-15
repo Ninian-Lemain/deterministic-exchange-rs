@@ -54,6 +54,61 @@ removes the whole-book scan at the cost of 64 KiB for this book shape. A cancel
 can still shift later orders within its price level; v0.3.0 will address that
 separately. Desktop scheduling and frequency changes remain sources of noise.
 
+## v0.3.0 Stable-Slot FIFO Levels
+
+The FIFO harness compares v0.2.0's dense array levels (shift on removal) with
+v0.3.0's intrusive doubly linked levels (head, tail, free-list, stable slot
+handles). Each cell rebuilds a fresh single-level book of the stated depth
+2,000 times and times one operation per rebuild, keeping setup outside the
+timed region. The table reports p50 of the 2,000 samples; per-sample
+`Instant` overhead is included and quantizes readings to 100 ns on this
+desktop.
+
+| Scenario | Depth | v0.2.0 array p50 | v0.3.0 stable-slot p50 |
+| --- | ---: | ---: | ---: |
+| Head cancel | 1 | 100 ns | 100 ns |
+| Head cancel | 4 | 200 ns | 100 ns |
+| Head cancel | 16 | 300 ns | 100 ns |
+| Head cancel | 64 | 400 ns | 100 ns |
+| Head cancel | 512 | 3,300 ns | 100 ns |
+| Middle cancel | 1 | 100 ns | 100 ns |
+| Middle cancel | 4 | 100 ns | 100 ns |
+| Middle cancel | 16 | 100 ns | 100 ns |
+| Middle cancel | 64 | 400 ns | 100 ns |
+| Middle cancel | 512 | 1,400 ns | 100 ns |
+| Tail cancel | 1 | 100 ns | 100 ns |
+| Tail cancel | 4 | 100 ns | 100 ns |
+| Tail cancel | 16 | 200 ns | 100 ns |
+| Tail cancel | 64 | 100 ns | 100 ns |
+| Tail cancel | 512 | 100 ns | 100 ns |
+| Head fill | 1 | 100 ns | 100 ns |
+| Head fill | 4 | 200 ns | 100 ns |
+| Head fill | 16 | 100 ns | 100 ns |
+| Head fill | 64 | 600 ns | 100 ns |
+| Head fill | 512 | 3,100 ns | 100 ns |
+
+Allocation and deallocation deltas were zero in every cell of both
+implementations, and the standard 200,000-message gateway workload produced
+the identical logical digest `64321af91735b704` before and after. Depth-512
+throughput rose from 219,365 to 12,453,300 head cancels/s and from 229,578 to
+7,125,044 head fills/s (mean-of-samples basis).
+
+Memory cost: `OrderBook<1, 512>` grew from 114,728 to 131,160 bytes (+14%)
+and the v0.2.0 shape `OrderBook<512, 1>` from 131,080 to 172,040 bytes
+(+31%); each slot now carries `prev`/`next` links and a live/free tag. The
+v0.2.0 depth-one cancellation shape regressed from 26 ns to 41 ns mean per
+cancel (37.3M to 23.9M cancels/s): unlinking relinks two pointers where a
+one-element shift was free. Branch and cache-miss counters require the
+dedicated Linux protocol; Windows desktop timing remains non-production
+evidence.
+
+Command: `cargo build --release -p hft-bench`, direct runs of
+`target/release/hft-bench.exe`. Environment: Intel N95, Windows 11 Pro build
+26200, Rust 1.96.0/LLVM 22.1.2, `x86_64-pc-windows-msvc`, fat LTO, one
+codegen unit, aborting panics. Depths 1, 4, 16, 64, and the 512-order
+maximum; 2,000 samples per cell; p50/p90/p99/p99.9/max recorded for every
+cell.
+
 ## Dedicated Linux Protocol
 
 Record all of the following with each result:

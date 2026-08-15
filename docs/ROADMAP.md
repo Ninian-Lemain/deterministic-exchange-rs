@@ -55,27 +55,20 @@ cancellation latency at a 64 KiB book-size cost. See the
 [performance methodology](PERFORMANCE.md) for the workload and evidence.
 Per-level FIFO shifts remain.
 
-## Next
-
 ### v0.3.0 - Stable-Slot FIFO Levels
 
-- **Purpose / scope:** replace order-array shifts with a fixed-capacity linked or
-  indexed FIFO containing head, tail, free-list, and stable slot handles.
-- **Invariants / tests:** the order index maps IDs to stable slot handles, never
-  FIFO positions. Insert, fill, and cancel update index and level atomically;
-  unrelated level mutations preserve handles and stale handles fail closed.
-  Live/free sets stay disjoint and full levels reject atomically. Check
-  cross-module lookup after unrelated mutation and compare generated commands
-  with the current array model.
-- **Benchmarks:** head/middle/tail cancel and head fill at depths 1, 4, 16, 64,
-  and maximum; report latency distribution, throughput, branches, memory, and
-  allocations before/after.
-- **Exit:** no routine FIFO shift, stable handles survive unrelated mutations,
-  and release evidence is published.
-- **Dependencies / limits:** uses the v0.2 index; best-price and risk lookup stay
-  linear.
+Intrusive doubly linked per-level FIFOs with head, tail, free-list, and stable
+slot handles replaced array shifts. The order index maps IDs to stable slot
+handles, never FIFO positions. Handle stability across unrelated mutations,
+stale-handle fail-closed behavior, disjoint live/free sets, atomic full-level
+rejection, and a 600-command array-model comparison pass. The documented depth
+harness measured flat 100 ns p50 head/middle/tail cancel and head fill at
+depths 1 through 512 (down from 3,300/1,400/100/3,100 ns at depth 512) for a
++14% `OrderBook<1, 512>` memory cost. See the
+[performance methodology](PERFORMANCE.md) for the workload and evidence.
+Best-price and risk lookup stay linear.
 
-## Planned Core Work
+## Next
 
 ### v0.4.0 - Indexed Risk State
 
@@ -91,6 +84,8 @@ Per-level FIFO shifts remain.
   unchanged logical digest, and published before/after results.
 - **Dependencies / limits:** follows v0.3 stable slots; account registration may
   remain cold-path.
+
+## Planned Core Work
 
 ### v0.5.0 - Price-Level Discovery
 

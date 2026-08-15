@@ -50,7 +50,7 @@ dependencies = [
 
 [[package]]
 name = "hft-bench"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "hft-book",
  "hft-gateway",
@@ -63,14 +63,14 @@ dependencies = [
 
 [[package]]
 name = "hft-book"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "hft-types",
 ]
 
 [[package]]
 name = "hft-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "hft-book",
  "hft-gateway",
@@ -82,14 +82,14 @@ dependencies = [
 
 [[package]]
 name = "hft-ffi"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cc",
 ]
 
 [[package]]
 name = "hft-gateway"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "hft-book",
  "hft-io",
@@ -100,11 +100,11 @@ dependencies = [
 
 [[package]]
 name = "hft-io"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "hft-replay"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "hft-book",
  "hft-gateway",
@@ -116,25 +116,25 @@ dependencies = [
 
 [[package]]
 name = "hft-risk"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "hft-types",
 ]
 
 [[package]]
 name = "hft-spsc"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "loom",
 ]
 
 [[package]]
 name = "hft-types"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "hft-wire"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "hft-io",
  "hft-types",

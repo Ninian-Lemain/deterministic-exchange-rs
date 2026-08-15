@@ -2,8 +2,30 @@
 
 ## Unreleased
 
+## v0.3.0 - 2026-08-16
+
+### Changed
+
+- Replaced per-level order-array shifts with intrusive doubly linked FIFOs:
+  head, tail, free-list, and stable slot handles. Insert, fill, and cancel no
+  longer shift peer orders or rewrite their index locations. The order index
+  now maps IDs to stable slot handles, never FIFO positions. Public APIs are
+  unchanged.
+
+### Added
+
+- Added invariant coverage for handle stability across unrelated mutations,
+  stale-handle fail-closed behavior, disjoint live/free sets, and atomic
+  full-level rejection, plus a 600-command generated comparison against the
+  array reference model.
+- Added a FIFO depth benchmark covering head/middle/tail cancel and head fill
+  at depths 1, 4, 16, 64, and the 512-order maximum.
+
 ### Verification
 
+- Flat 100 ns p50 for head/middle/tail cancel and head fill at all depths
+  (down from up to 3,300 ns at depth 512), zero allocation deltas, unchanged
+  logical digest `64321af91735b704`; see `docs/PERFORMANCE.md`.
 - Added FFI error-path tests covering create failure, null-handle rejection,
   send failure with destroy-on-drop, and oversized payload rejection, plus a
   compile-fail test for session thread confinement.
@@ -12,6 +34,10 @@
 - Added a counting-allocator invariant test to the benchmark harness.
 - Documented the unsafe inventory, invariants, tests, and native boundary
   policy in `docs/SAFETY.md`.
+- `cargo fmt --all --check`
+- `cargo check --workspace --all-targets --all-features`
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- `cargo test --workspace --all-features`
 
 ## v0.2.0 - 2026-08-14
 

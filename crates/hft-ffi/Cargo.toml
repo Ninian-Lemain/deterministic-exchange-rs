@@ -8,7 +8,10 @@ rust-version.workspace = true
 
 [features]
 default = []
-vendor-sdk = []
+vendor-sdk = ["dep:cc"]
+
+[build-dependencies]
+cc = { version = "1", optional = true }
 
 [lints]
 workspace = true

@@ -83,6 +83,9 @@ dependencies = [
 [[package]]
 name = "hft-ffi"
 version = "0.2.0"
+dependencies = [
+ "cc",
+]
 
 [[package]]
 name = "hft-gateway"

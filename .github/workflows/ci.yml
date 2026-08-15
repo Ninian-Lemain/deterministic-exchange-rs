@@ -28,7 +28,7 @@ jobs:
       - name: Reject unexpected unsafe code
         run: |
           found=$(grep -R -n --include='*.rs' -E 'unsafe[[:space:]]*(\{|impl|fn)' crates | cut -d: -f1 | sort -u || true)
-          allowed=$'crates/hft-bench/src/main.rs\ncrates/hft-ffi/src/lib.rs\ncrates/hft-spsc/src/lib.rs'
+          allowed=$'crates/hft-bench/src/main.rs\ncrates/hft-ffi/src/lib.rs\ncrates/hft-ffi/tests/native_abi.rs\ncrates/hft-spsc/src/lib.rs'
           test "$found" = "$allowed"
 
   miri:
@@ -40,11 +40,22 @@ jobs:
           components: miri
       - run: cargo +nightly miri test -p hft-wire -p hft-risk -p hft-book
 
-  ffi-asan:
+  ffi-sanitizers:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rust-src
-      - run: RUSTFLAGS="-Zsanitizer=address" cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu -p hft-ffi
+      - name: ASan on the native boundary
+        env:
+          CC: clang
+          CFLAGS: -fsanitize=address -fno-omit-frame-pointer
+          RUSTFLAGS: -Zsanitizer=address
+        run: cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu -p hft-ffi --features vendor-sdk
+      - name: UBSan on the native boundary
+        env:
+          CC: clang
+          CFLAGS: -fsanitize=undefined -fno-sanitize-recover=all
+          RUSTFLAGS: -C linker=clang -C link-args=-fsanitize=undefined
+        run: cargo +nightly test -p hft-ffi --features vendor-sdk

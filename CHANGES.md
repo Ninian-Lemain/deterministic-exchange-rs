@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Verification
+
+- Added FFI error-path tests covering create failure, null-handle rejection,
+  send failure with destroy-on-drop, and oversized payload rejection, plus a
+  compile-fail test for session thread confinement.
+- Added C ABI tests for the native boundary behind `--features vendor-sdk`,
+  with ASan and UBSan coverage in CI.
+- Added a counting-allocator invariant test to the benchmark harness.
+- Documented the unsafe inventory, invariants, tests, and native boundary
+  policy in `docs/SAFETY.md`.
+
 ## v0.2.0 - 2026-08-14
 
 ### Added

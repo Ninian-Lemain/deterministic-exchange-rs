@@ -33,6 +33,9 @@ production-latency evidence.
 - Default builds stay Rust-only. Native shims require ABI tests and ASan/UBSan.
 
 This is immediate policy and verification work, not an engine feature release.
+Policy status: safe-crate forbids and the unsafe allowlist are CI-enforced;
+each unsafe site has a documented invariant and test ([safety](SAFETY.md));
+the `vendor-sdk` C ABI tests run under ASan/UBSan in CI.
 
 ## Implemented
 

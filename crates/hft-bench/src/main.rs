@@ -239,3 +239,20 @@ const fn order(id: u64, account_id: AccountId, side: Side) -> NewOrder {
         side,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counting_allocator_tracks_round_trip() {
+        let allocations_before = ALLOCATIONS.load(Ordering::SeqCst);
+        let deallocations_before = DEALLOCATIONS.load(Ordering::SeqCst);
+        let mut values = Vec::with_capacity(16);
+        values.extend(0_u64..16);
+        assert_eq!(values[15], 15);
+        drop(values);
+        assert!(ALLOCATIONS.load(Ordering::SeqCst) > allocations_before);
+        assert!(DEALLOCATIONS.load(Ordering::SeqCst) > deallocations_before);
+    }
+}

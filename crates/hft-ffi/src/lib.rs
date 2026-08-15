@@ -27,6 +27,17 @@ pub struct VendorApi {
 const _: () = assert!(core::mem::size_of::<VendorApi>() == 3 * core::mem::size_of::<usize>());
 const _: () = assert!(core::mem::align_of::<VendorApi>() == core::mem::align_of::<usize>());
 
+#[inline]
+fn checked_payload_len(len: usize) -> Result<u32, VendorError> {
+    u32::try_from(len).map_err(|_| VendorError::PayloadTooLarge)
+}
+
+/// A session is confined to the thread that opened it:
+///
+/// ```compile_fail
+/// fn require_send<T: Send>() {}
+/// require_send::<hft_ffi::VendorSession<'static>>();
+/// ```
 pub struct VendorSession<'api> {
     handle: NonNull<c_void>,
     api: &'api VendorApi,
@@ -67,7 +78,7 @@ impl<'api> VendorSession<'api> {
     /// Returns [`VendorError::PayloadTooLarge`] if the slice length does not
     /// fit the C ABI or [`VendorError::Status`] on a vendor failure.
     pub fn send(&mut self, payload: &[u8]) -> Result<(), VendorError> {
-        let length = u32::try_from(payload.len()).map_err(|_| VendorError::PayloadTooLarge)?;
+        let length = checked_payload_len(payload.len())?;
         // SAFETY: `self` uniquely owns a live handle; `payload` is readable for
         // `length` bytes for the duration of the call, and the vendor contract
         // forbids retention of that pointer and cross-boundary unwinding.
@@ -116,6 +127,81 @@ mod tests {
         }
         SENDS.fetch_add(1, Ordering::Relaxed);
         0
+    }
+
+    unsafe extern "C" fn create_failure(_output: *mut *mut c_void) -> i32 {
+        7
+    }
+
+    unsafe extern "C" fn create_null(output: *mut *mut c_void) -> i32 {
+        if output.is_null() {
+            return 1;
+        }
+        // SAFETY: the wrapper passes an aligned, writable out-pointer.
+        unsafe { output.write(core::ptr::null_mut()) };
+        0
+    }
+
+    unsafe extern "C" fn send_failure(_handle: *mut c_void, bytes: *const u8, length: u32) -> i32 {
+        if bytes.is_null() || length == 0 {
+            return 2;
+        }
+        3
+    }
+
+    static ERROR_DESTROYS: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn destroy_after_error(_handle: *mut c_void) {
+        ERROR_DESTROYS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn create_failure_propagates_status() {
+        let api = VendorApi {
+            create: create_failure,
+            destroy,
+            send,
+        };
+        // SAFETY: the test vtable follows the documented ownership and ABI.
+        let result = unsafe { VendorSession::open(&api) };
+        assert!(matches!(result, Err(VendorError::Status(7))));
+    }
+
+    #[test]
+    fn null_success_handle_is_invalid_api() {
+        let api = VendorApi {
+            create: create_null,
+            destroy,
+            send,
+        };
+        // SAFETY: the test vtable follows the documented ownership and ABI.
+        let result = unsafe { VendorSession::open(&api) };
+        assert!(matches!(result, Err(VendorError::InvalidApi)));
+    }
+
+    #[test]
+    fn send_failure_propagates_and_drop_destroys() {
+        let api = VendorApi {
+            create,
+            destroy: destroy_after_error,
+            send: send_failure,
+        };
+        {
+            // SAFETY: the test vtable follows the documented ownership and ABI.
+            let mut session = unsafe { VendorSession::open(&api) }.expect("valid test API");
+            assert_eq!(session.send(&[1]), Err(VendorError::Status(3)));
+        }
+        assert_eq!(ERROR_DESTROYS.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn oversized_payload_length_is_rejected() {
+        let too_large = u32::MAX as usize + 1;
+        assert_eq!(
+            checked_payload_len(too_large),
+            Err(VendorError::PayloadTooLarge)
+        );
+        assert_eq!(checked_payload_len(1), Ok(1));
     }
 
     #[test]

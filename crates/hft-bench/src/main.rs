@@ -117,6 +117,142 @@ fn main() {
         gateway.stable_digest()
     );
     cancel_benchmark();
+    fifo_benchmark();
+}
+
+#[derive(Clone, Copy)]
+enum FifoScenario {
+    HeadCancel,
+    MiddleCancel,
+    TailCancel,
+    HeadFill,
+}
+
+impl FifoScenario {
+    const ALL: [Self; 4] = [
+        Self::HeadCancel,
+        Self::MiddleCancel,
+        Self::TailCancel,
+        Self::HeadFill,
+    ];
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::HeadCancel => "head_cancel",
+            Self::MiddleCancel => "middle_cancel",
+            Self::TailCancel => "tail_cancel",
+            Self::HeadFill => "head_fill",
+        }
+    }
+}
+
+fn fifo_benchmark() {
+    for scenario in FifoScenario::ALL {
+        run_fifo_cell::<1>(scenario);
+        run_fifo_cell::<4>(scenario);
+        run_fifo_cell::<16>(scenario);
+        run_fifo_cell::<64>(scenario);
+        run_fifo_cell::<512>(scenario);
+    }
+}
+
+fn run_fifo_cell<const DEPTH: usize>(scenario: FifoScenario) {
+    const SAMPLES: usize = 2_000;
+    let allocations_before = ALLOCATIONS.load(Ordering::SeqCst);
+    let deallocations_before = DEALLOCATIONS.load(Ordering::SeqCst);
+    let mut samples_ns = [0_u64; SAMPLES];
+    let mut checksum = 0_u64;
+    let target = match scenario {
+        FifoScenario::HeadCancel | FifoScenario::HeadFill => 1,
+        FifoScenario::MiddleCancel => DEPTH.div_ceil(2),
+        FifoScenario::TailCancel => DEPTH,
+    };
+    let target = u64::try_from(target).expect("target id fits u64");
+    for sample in &mut samples_ns {
+        let mut book = fifo_fixture::<DEPTH>();
+        let mut reports = ReportBuffer::<1>::new();
+        let started = Instant::now();
+        match scenario {
+            FifoScenario::HeadCancel | FifoScenario::MiddleCancel | FifoScenario::TailCancel => {
+                let cancelled = book
+                    .cancel(CancelOrder {
+                        order_id: OrderId(target),
+                        account_id: AccountId(1),
+                        instrument_id: InstrumentId(1),
+                        sequence: SequenceNumber(target),
+                    })
+                    .expect("fifo cancel");
+                checksum ^= cancelled.order_id.0;
+            }
+            FifoScenario::HeadFill => {
+                let taker = u64::try_from(DEPTH).expect("depth fits u64") + 1;
+                let summary = book
+                    .submit(
+                        NewOrder {
+                            order_id: OrderId(taker),
+                            account_id: AccountId(2),
+                            instrument_id: InstrumentId(1),
+                            price: PriceTicks(100),
+                            quantity: Quantity(1),
+                            sequence: SequenceNumber(taker),
+                            side: Side::Buy,
+                        },
+                        &mut reports,
+                    )
+                    .expect("fifo head fill");
+                debug_assert_eq!(summary.filled_quantity, Quantity(1));
+                checksum ^= reports
+                    .iter()
+                    .next()
+                    .map_or(0, |report| report.maker_order_id.0);
+            }
+        }
+        *sample = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    }
+    let allocations_after = ALLOCATIONS.load(Ordering::SeqCst);
+    let deallocations_after = DEALLOCATIONS.load(Ordering::SeqCst);
+    assert_eq!(allocations_after, allocations_before, "fifo allocation");
+    assert_eq!(
+        deallocations_after, deallocations_before,
+        "fifo deallocation"
+    );
+    samples_ns.sort_unstable();
+    let total: u128 = samples_ns.iter().map(|sample| u128::from(*sample)).sum();
+    let count = u128::try_from(SAMPLES).expect("sample count fits u128");
+    let mean = total / count;
+    let ops_per_second = 1_000_000_000_u128 * count / total.max(1);
+    let book_bytes = core::mem::size_of::<OrderBook<1, DEPTH>>();
+    println!(
+        "fifo_bench scenario={} depth={DEPTH} samples={SAMPLES} p50_ns={} p90_ns={} p99_ns={} p99_9_ns={} max_ns={} mean_ns={mean} ops_per_second={ops_per_second} book_bytes={book_bytes} allocations=0 deallocations=0 checksum={checksum:016x}",
+        scenario.name(),
+        percentile(&samples_ns, 500),
+        percentile(&samples_ns, 900),
+        percentile(&samples_ns, 990),
+        percentile(&samples_ns, 999),
+        samples_ns[SAMPLES - 1],
+    );
+}
+
+fn fifo_fixture<const DEPTH: usize>() -> OrderBook<1, DEPTH> {
+    let mut book = OrderBook::<1, DEPTH>::new(InstrumentId(1));
+    let mut reports = ReportBuffer::<1>::new();
+    for id in 1..=u64::try_from(DEPTH).expect("depth fits u64") {
+        book.submit(
+            NewOrder {
+                order_id: OrderId(id),
+                account_id: AccountId(1),
+                instrument_id: InstrumentId(1),
+                price: PriceTicks(100),
+                quantity: Quantity(1),
+                sequence: SequenceNumber(id),
+                side: Side::Sell,
+            },
+            &mut reports,
+        )
+        .expect("fixture order rests");
+        reports.clear();
+    }
+    book
 }
 
 fn cancel_benchmark() {

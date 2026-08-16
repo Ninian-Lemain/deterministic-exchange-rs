@@ -34,8 +34,182 @@ struct AccountState {
 struct Reservation {
     order_id: OrderId,
     account_id: AccountId,
+    index_slot: u32,
     side: Side,
     quantity: Quantity,
+}
+
+const NIL: usize = usize::MAX;
+
+/// Two planes per index keep the load factor at or below 1/2.
+const INDEX_PLANES: usize = 2;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IndexSlot<V: Copy> {
+    Empty,
+    Occupied { key: u64, value: V },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProbeError {
+    Full,
+    Duplicate,
+}
+
+/// Fixed-capacity open-addressed `u64 -> V` index with linear probing and
+/// deterministic back-shift deletion. Values are stable storage handles;
+/// occupancy can never exceed half the slot capacity.
+#[derive(Debug)]
+struct ProbeIndex<V: Copy, const PLANE: usize, const PLANES: usize> {
+    slots: [[IndexSlot<V>; PLANE]; PLANES],
+}
+
+impl<V: Copy, const PLANE: usize, const PLANES: usize> ProbeIndex<V, PLANE, PLANES> {
+    const fn new() -> Self {
+        Self {
+            slots: [[IndexSlot::Empty; PLANE]; PLANES],
+        }
+    }
+
+    const fn capacity() -> Option<usize> {
+        PLANE.checked_mul(PLANES)
+    }
+
+    fn coordinates(flat_index: usize) -> Option<(usize, usize)> {
+        if PLANE == 0 {
+            return None;
+        }
+        Some((flat_index / PLANE, flat_index % PLANE))
+    }
+
+    fn slot(&self, flat_index: usize) -> Option<&IndexSlot<V>> {
+        let (plane, within) = Self::coordinates(flat_index)?;
+        self.slots.get(plane)?.get(within)
+    }
+
+    fn slot_mut(&mut self, flat_index: usize) -> Option<&mut IndexSlot<V>> {
+        let (plane, within) = Self::coordinates(flat_index)?;
+        self.slots.get_mut(plane)?.get_mut(within)
+    }
+
+    fn probe_start(key: u64, capacity: usize) -> usize {
+        let capacity_u64 = u64::try_from(capacity).unwrap_or(u64::MAX);
+        let mixed = key.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        usize::try_from(mixed % capacity_u64).unwrap_or(0)
+    }
+
+    fn probe_distance(home: usize, current: usize, capacity: usize) -> usize {
+        if current >= home {
+            current - home
+        } else {
+            capacity - (home - current)
+        }
+    }
+
+    fn find_slot(&self, key: u64) -> Option<usize> {
+        let capacity = Self::capacity()?;
+        if capacity == 0 {
+            return None;
+        }
+        let start = Self::probe_start(key, capacity);
+        for offset in 0..capacity {
+            let flat_index = start.wrapping_add(offset) % capacity;
+            match self.slot(flat_index)? {
+                IndexSlot::Empty => return None,
+                IndexSlot::Occupied { key: indexed, .. } if *indexed == key => {
+                    return Some(flat_index);
+                }
+                IndexSlot::Occupied { .. } => {}
+            }
+        }
+        None
+    }
+
+    fn lookup(&self, key: u64) -> Option<V> {
+        match self.slot(self.find_slot(key)?)? {
+            IndexSlot::Occupied { value, .. } => Some(*value),
+            IndexSlot::Empty => None,
+        }
+    }
+
+    fn insert(&mut self, key: u64, value: V) -> Result<u32, ProbeError> {
+        let capacity = Self::capacity().ok_or(ProbeError::Full)?;
+        if capacity == 0 {
+            return Err(ProbeError::Full);
+        }
+        let start = Self::probe_start(key, capacity);
+        for offset in 0..capacity {
+            let flat_index = start.wrapping_add(offset) % capacity;
+            match *self.slot(flat_index).ok_or(ProbeError::Full)? {
+                IndexSlot::Empty => {
+                    let flat_u32 = u32::try_from(flat_index).map_err(|_| ProbeError::Full)?;
+                    *self.slot_mut(flat_index).ok_or(ProbeError::Full)? =
+                        IndexSlot::Occupied { key, value };
+                    return Ok(flat_u32);
+                }
+                IndexSlot::Occupied { key: indexed, .. } if indexed == key => {
+                    return Err(ProbeError::Duplicate);
+                }
+                IndexSlot::Occupied { .. } => {}
+            }
+        }
+        Err(ProbeError::Full)
+    }
+
+    /// Removes `key` at `flat_index` and closes the probe hole by shifting
+    /// displaced entries back, reporting each move through `update_moved`.
+    fn remove_at(
+        &mut self,
+        flat_index: u32,
+        key: u64,
+        mut update_moved: impl FnMut(u64, V, u32) -> bool,
+    ) -> Option<V> {
+        let flat_index = usize::try_from(flat_index).ok()?;
+        let IndexSlot::Occupied {
+            key: indexed,
+            value,
+        } = *self.slot(flat_index)?
+        else {
+            return None;
+        };
+        if indexed != key {
+            return None;
+        }
+        let capacity = Self::capacity()?;
+        let mut hole = flat_index;
+        let mut candidate = hole.wrapping_add(1) % capacity;
+        loop {
+            let entry = *self.slot(candidate)?;
+            let IndexSlot::Occupied {
+                key: candidate_key,
+                value: candidate_value,
+            } = entry
+            else {
+                *self.slot_mut(hole)? = IndexSlot::Empty;
+                break;
+            };
+            let home_bucket = Self::probe_start(candidate_key, capacity);
+            if Self::probe_distance(home_bucket, hole, capacity)
+                < Self::probe_distance(home_bucket, candidate, capacity)
+            {
+                *self.slot_mut(hole)? = entry;
+                let new_flat = u32::try_from(hole).ok()?;
+                let updated = update_moved(candidate_key, candidate_value, new_flat);
+                debug_assert!(updated);
+                hole = candidate;
+            }
+            candidate = candidate.wrapping_add(1) % capacity;
+        }
+        Some(value)
+    }
+}
+
+/// Reservation storage slot: a live reservation or a free-list link. Live
+/// and free sets are disjoint and slot handles stay stable under churn.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReservationSlot {
+    Free { next_free: usize },
+    Live(Reservation),
 }
 
 /// Deterministic, fixed-capacity pre-trade risk state.
@@ -44,11 +218,16 @@ struct Reservation {
 /// so opposing open orders cannot cancel worst-case exposure. Order IDs must
 /// increase monotonically within a session, preventing reuse without an
 /// unbounded historical set. `settle` converts a reservation to its filled
-/// quantity when an order is terminal.
+/// quantity when an order is terminal. Account and reservation lookups use
+/// fixed-capacity open-addressed indices at load <= 1/2; reservations live in
+/// stable slots drawn from a bounded free-list.
 #[derive(Debug)]
 pub struct RiskEngine<const ACCOUNTS: usize, const ORDERS: usize> {
     accounts: [Option<AccountState>; ACCOUNTS],
-    reservations: [Option<Reservation>; ORDERS],
+    account_index: ProbeIndex<usize, ACCOUNTS, INDEX_PLANES>,
+    reservations: [ReservationSlot; ORDERS],
+    reservation_free_head: usize,
+    reservation_index: ProbeIndex<usize, ORDERS, INDEX_PLANES>,
     maximum_order_id: Option<OrderId>,
     killed: bool,
 }
@@ -56,12 +235,66 @@ pub struct RiskEngine<const ACCOUNTS: usize, const ORDERS: usize> {
 impl<const ACCOUNTS: usize, const ORDERS: usize> RiskEngine<ACCOUNTS, ORDERS> {
     #[must_use]
     pub const fn new() -> Self {
+        let mut reservations = [ReservationSlot::Free { next_free: NIL }; ORDERS];
+        let mut index = 0;
+        while index < ORDERS {
+            reservations[index] = ReservationSlot::Free {
+                next_free: if index + 1 < ORDERS { index + 1 } else { NIL },
+            };
+            index += 1;
+        }
         Self {
             accounts: [None; ACCOUNTS],
-            reservations: [None; ORDERS],
+            account_index: ProbeIndex::new(),
+            reservations,
+            reservation_free_head: if ORDERS == 0 { NIL } else { 0 },
+            reservation_index: ProbeIndex::new(),
             maximum_order_id: None,
             killed: false,
         }
+    }
+
+    fn account_slot(&self, id: AccountId) -> Option<usize> {
+        self.account_index.lookup(u64::from(id.0))
+    }
+
+    fn live_reservation(&self, order_id: OrderId) -> Option<(usize, Reservation)> {
+        let slot = self.reservation_index.lookup(order_id.0)?;
+        let Some(ReservationSlot::Live(reservation)) = self.reservations.get(slot).copied() else {
+            return None;
+        };
+        if reservation.order_id != order_id {
+            return None;
+        }
+        Some((slot, reservation))
+    }
+
+    /// Removes a live reservation from the index and returns its slot to the
+    /// free list.
+    fn release_reservation(&mut self, slot: usize, reservation: Reservation) -> Option<()> {
+        let reservations = &mut self.reservations;
+        let removed = self.reservation_index.remove_at(
+            reservation.index_slot,
+            reservation.order_id.0,
+            |moved_key, moved_slot, new_flat| {
+                let Some(ReservationSlot::Live(moved)) = reservations.get_mut(moved_slot) else {
+                    return false;
+                };
+                if moved.order_id.0 != moved_key {
+                    return false;
+                }
+                moved.index_slot = new_flat;
+                true
+            },
+        )?;
+        if removed != slot {
+            return None;
+        }
+        self.reservations[slot] = ReservationSlot::Free {
+            next_free: self.reservation_free_head,
+        };
+        self.reservation_free_head = slot;
+        Some(())
     }
 
     /// # Errors
@@ -78,18 +311,18 @@ impl<const ACCOUNTS: usize, const ORDERS: usize> RiskEngine<ACCOUNTS, ORDERS> {
         {
             return Err(RegistrationError::InvalidLimits);
         }
-        if self
-            .accounts
-            .iter()
-            .flatten()
-            .any(|account| account.id == id)
-        {
+        if self.account_slot(id).is_some() {
             return Err(RegistrationError::DuplicateAccount);
         }
-        let Some(slot) = self.accounts.iter_mut().find(|slot| slot.is_none()) else {
+        let Some(slot) = self.accounts.iter().position(Option::is_none) else {
             return Err(RegistrationError::AccountCapacity);
         };
-        *slot = Some(AccountState {
+        match self.account_index.insert(u64::from(id.0), slot) {
+            Ok(_) => {}
+            Err(ProbeError::Full) => return Err(RegistrationError::AccountCapacity),
+            Err(ProbeError::Duplicate) => return Err(RegistrationError::DuplicateAccount),
+        }
+        self.accounts[slot] = Some(AccountState {
             id,
             limits,
             settled_position: 0,
@@ -113,11 +346,11 @@ impl<const ACCOUNTS: usize, const ORDERS: usize> RiskEngine<ACCOUNTS, ORDERS> {
         account_id: AccountId,
         killed: bool,
     ) -> Result<(), RejectReason> {
-        let account = self
-            .accounts
-            .iter_mut()
-            .flatten()
-            .find(|account| account.id == account_id)
+        let slot = self
+            .account_slot(account_id)
+            .ok_or(RejectReason::UnknownAccount)?;
+        let account = self.accounts[slot]
+            .as_mut()
             .ok_or(RejectReason::UnknownAccount)?;
         account.killed = killed;
         Ok(())
@@ -140,90 +373,40 @@ impl<const ACCOUNTS: usize, const ORDERS: usize> RiskEngine<ACCOUNTS, ORDERS> {
         {
             return Err(RejectReason::DuplicateOrderId);
         }
-        let reservation_slot = self
-            .reservations
-            .iter()
-            .position(Option::is_none)
-            .ok_or(RejectReason::OrderCapacity)?;
-        let account_index = self
-            .accounts
-            .iter()
-            .position(|entry| entry.is_some_and(|account| account.id == order.account_id))
+        if self.reservation_free_head == NIL {
+            return Err(RejectReason::OrderCapacity);
+        }
+        let account_slot = self
+            .account_slot(order.account_id)
             .ok_or(RejectReason::UnknownAccount)?;
-        let account = self.accounts[account_index].ok_or(RejectReason::UnknownAccount)?;
-        if account.killed {
-            return Err(RejectReason::KillSwitch);
-        }
-        if order.quantity.0 > account.limits.max_quantity.0 {
-            return Err(RejectReason::QuantityLimit);
-        }
-        if order.price.0 < account.limits.minimum_price.0
-            || order.price.0 > account.limits.maximum_price.0
-        {
-            return Err(RejectReason::PriceCollar);
-        }
-        let absolute_price = order
-            .price
-            .0
-            .checked_abs()
-            .ok_or(RejectReason::ArithmeticOverflow)?;
-        let notional = u128::from(
-            u64::try_from(absolute_price).map_err(|_| RejectReason::ArithmeticOverflow)?,
-        )
-        .checked_mul(u128::from(order.quantity.0))
-        .ok_or(RejectReason::ArithmeticOverflow)?;
-        if notional > account.limits.max_notional {
-            return Err(RejectReason::NotionalLimit);
-        }
-        let (reserved_buys, reserved_sells) = match order.side {
-            Side::Buy => (
-                account
-                    .reserved_buys
-                    .checked_add(u128::from(order.quantity.0))
-                    .ok_or(RejectReason::ArithmeticOverflow)?,
-                account.reserved_sells,
-            ),
-            Side::Sell => (
-                account.reserved_buys,
-                account
-                    .reserved_sells
-                    .checked_add(u128::from(order.quantity.0))
-                    .ok_or(RejectReason::ArithmeticOverflow)?,
-            ),
-        };
-        let maximum_position = i128::from(account.limits.max_abs_position.0);
-        let worst_long = account
-            .settled_position
-            .checked_add(
-                i128::try_from(reserved_buys).map_err(|_| RejectReason::ArithmeticOverflow)?,
-            )
-            .ok_or(RejectReason::ArithmeticOverflow)?;
-        let worst_short = account
-            .settled_position
-            .checked_sub(
-                i128::try_from(reserved_sells).map_err(|_| RejectReason::ArithmeticOverflow)?,
-            )
-            .ok_or(RejectReason::ArithmeticOverflow)?;
-        if worst_long > maximum_position || worst_short < -maximum_position {
-            return Err(RejectReason::PositionLimit);
-        }
-        let open_orders = account
-            .open_orders
-            .checked_add(1)
-            .ok_or(RejectReason::ArithmeticOverflow)?;
-        if open_orders > account.limits.max_open_orders {
-            return Err(RejectReason::OpenOrderLimit);
-        }
+        let account = self.accounts[account_slot].ok_or(RejectReason::UnknownAccount)?;
+        let (reserved_buys, reserved_sells, open_orders) = evaluate_limits(&account, &order)?;
 
-        self.accounts[account_index] = Some(AccountState {
+        let reservation_slot = self.reservation_free_head;
+        let Some(ReservationSlot::Free { next_free }) =
+            self.reservations.get(reservation_slot).copied()
+        else {
+            return Err(RejectReason::ArithmeticOverflow);
+        };
+        let index_slot = match self
+            .reservation_index
+            .insert(order.order_id.0, reservation_slot)
+        {
+            Ok(index_slot) => index_slot,
+            Err(ProbeError::Full) => return Err(RejectReason::OrderCapacity),
+            Err(ProbeError::Duplicate) => return Err(RejectReason::ArithmeticOverflow),
+        };
+        self.accounts[account_slot] = Some(AccountState {
             reserved_buys,
             reserved_sells,
             open_orders,
             ..account
         });
-        self.reservations[reservation_slot] = Some(Reservation {
+        self.reservation_free_head = next_free;
+        self.reservations[reservation_slot] = ReservationSlot::Live(Reservation {
             order_id: order.order_id,
             account_id: order.account_id,
+            index_slot,
             side: order.side,
             quantity: order.quantity,
         });
@@ -242,22 +425,16 @@ impl<const ACCOUNTS: usize, const ORDERS: usize> RiskEngine<ACCOUNTS, ORDERS> {
         order_id: OrderId,
         filled_quantity: Quantity,
     ) -> Result<(), RejectReason> {
-        let reservation_index = self
-            .reservations
-            .iter()
-            .position(|entry| entry.is_some_and(|item| item.order_id == order_id))
-            .ok_or(RejectReason::UnknownOrder)?;
-        let reservation =
-            self.reservations[reservation_index].ok_or(RejectReason::ArithmeticOverflow)?;
+        let Some((reservation_slot, reservation)) = self.live_reservation(order_id) else {
+            return Err(RejectReason::UnknownOrder);
+        };
         if filled_quantity.0 > reservation.quantity.0 {
             return Err(RejectReason::InvalidQuantity);
         }
-        let account_index = self
-            .accounts
-            .iter()
-            .position(|entry| entry.is_some_and(|item| item.id == reservation.account_id))
+        let account_slot = self
+            .account_slot(reservation.account_id)
             .ok_or(RejectReason::UnknownAccount)?;
-        let account = self.accounts[account_index].ok_or(RejectReason::UnknownAccount)?;
+        let account = self.accounts[account_slot].ok_or(RejectReason::UnknownAccount)?;
         let (settled_position, reserved_buys, reserved_sells) = match reservation.side {
             Side::Buy => (
                 account
@@ -286,14 +463,15 @@ impl<const ACCOUNTS: usize, const ORDERS: usize> RiskEngine<ACCOUNTS, ORDERS> {
             .open_orders
             .checked_sub(1)
             .ok_or(RejectReason::ArithmeticOverflow)?;
-        self.accounts[account_index] = Some(AccountState {
+        self.accounts[account_slot] = Some(AccountState {
             settled_position,
             reserved_buys,
             reserved_sells,
             open_orders,
             ..account
         });
-        self.reservations[reservation_index] = None;
+        self.release_reservation(reservation_slot, reservation)
+            .ok_or(RejectReason::ArithmeticOverflow)?;
         Ok(())
     }
 
@@ -313,24 +491,18 @@ impl<const ACCOUNTS: usize, const ORDERS: usize> RiskEngine<ACCOUNTS, ORDERS> {
         if filled_quantity.0 == 0 {
             return Err(RejectReason::InvalidQuantity);
         }
-        let reservation_index = self
-            .reservations
-            .iter()
-            .position(|entry| entry.is_some_and(|item| item.order_id == order_id))
-            .ok_or(RejectReason::UnknownOrder)?;
-        let mut reservation =
-            self.reservations[reservation_index].ok_or(RejectReason::ArithmeticOverflow)?;
+        let Some((reservation_slot, mut reservation)) = self.live_reservation(order_id) else {
+            return Err(RejectReason::UnknownOrder);
+        };
         reservation.quantity.0 = reservation
             .quantity
             .0
             .checked_sub(filled_quantity.0)
             .ok_or(RejectReason::InvalidQuantity)?;
-        let account_index = self
-            .accounts
-            .iter()
-            .position(|entry| entry.is_some_and(|item| item.id == reservation.account_id))
+        let account_slot = self
+            .account_slot(reservation.account_id)
             .ok_or(RejectReason::UnknownAccount)?;
-        let account = self.accounts[account_index].ok_or(RejectReason::UnknownAccount)?;
+        let account = self.accounts[account_slot].ok_or(RejectReason::UnknownAccount)?;
         let (settled_position, reserved_buys, reserved_sells) = match reservation.side {
             Side::Buy => (
                 account
@@ -363,7 +535,7 @@ impl<const ACCOUNTS: usize, const ORDERS: usize> RiskEngine<ACCOUNTS, ORDERS> {
         } else {
             account.open_orders
         };
-        self.accounts[account_index] = Some(AccountState {
+        self.accounts[account_slot] = Some(AccountState {
             settled_position,
             reserved_buys,
             reserved_sells,
@@ -371,9 +543,10 @@ impl<const ACCOUNTS: usize, const ORDERS: usize> RiskEngine<ACCOUNTS, ORDERS> {
             ..account
         });
         if reservation.quantity.0 == 0 {
-            self.reservations[reservation_index] = None;
+            self.release_reservation(reservation_slot, reservation)
+                .ok_or(RejectReason::ArithmeticOverflow)?;
         } else {
-            self.reservations[reservation_index] = Some(reservation);
+            self.reservations[reservation_slot] = ReservationSlot::Live(reservation);
         }
         Ok(())
     }
@@ -384,12 +557,9 @@ impl<const ACCOUNTS: usize, const ORDERS: usize> RiskEngine<ACCOUNTS, ORDERS> {
     ///
     /// Returns unknown-order or ownership rejection.
     pub fn can_cancel(&self, order_id: OrderId, account_id: AccountId) -> Result<(), RejectReason> {
-        let reservation = self
-            .reservations
-            .iter()
-            .flatten()
-            .find(|reservation| reservation.order_id == order_id)
-            .ok_or(RejectReason::UnknownOrder)?;
+        let Some((_, reservation)) = self.live_reservation(order_id) else {
+            return Err(RejectReason::UnknownOrder);
+        };
         if reservation.account_id != account_id {
             return Err(RejectReason::NotOrderOwner);
         }
@@ -408,11 +578,8 @@ impl<const ACCOUNTS: usize, const ORDERS: usize> RiskEngine<ACCOUNTS, ORDERS> {
     ) -> Result<Quantity, RejectReason> {
         self.can_cancel(order_id, account_id)?;
         let remaining = self
-            .reservations
-            .iter()
-            .flatten()
-            .find(|reservation| reservation.order_id == order_id)
-            .map(|reservation| reservation.quantity)
+            .live_reservation(order_id)
+            .map(|(_, reservation)| reservation.quantity)
             .ok_or(RejectReason::UnknownOrder)?;
         self.settle(order_id, Quantity(0))?;
         Ok(remaining)
@@ -475,28 +642,27 @@ impl<const ACCOUNTS: usize, const ORDERS: usize> RiskEngine<ACCOUNTS, ORDERS> {
             mix(&mut digest, u64::from(account.open_orders));
             mix(&mut digest, u64::from(account.killed));
         }
-        for reservation in self.reservations.iter().flatten() {
-            mix(&mut digest, reservation.order_id.0);
-            mix(&mut digest, reservation.quantity.0);
+        for slot in &self.reservations {
+            if let ReservationSlot::Live(reservation) = slot {
+                mix(&mut digest, reservation.order_id.0);
+                mix(&mut digest, reservation.quantity.0);
+            }
         }
         digest
     }
 
     #[must_use]
     pub fn account_snapshot(&self, id: AccountId) -> Option<(i128, u32)> {
-        self.accounts
-            .iter()
-            .flatten()
-            .find(|account| account.id == id)
-            .and_then(|account| {
-                let buys = i128::try_from(account.reserved_buys).ok()?;
-                let sells = i128::try_from(account.reserved_sells).ok()?;
-                let projected = account
-                    .settled_position
-                    .checked_add(buys)?
-                    .checked_sub(sells)?;
-                Some((projected, account.open_orders))
-            })
+        let slot = self.account_slot(id)?;
+        self.accounts[slot].and_then(|account| {
+            let buys = i128::try_from(account.reserved_buys).ok()?;
+            let sells = i128::try_from(account.reserved_sells).ok()?;
+            let projected = account
+                .settled_position
+                .checked_add(buys)?
+                .checked_sub(sells)?;
+            Some((projected, account.open_orders))
+        })
     }
 }
 
@@ -504,6 +670,73 @@ impl<const ACCOUNTS: usize, const ORDERS: usize> Default for RiskEngine<ACCOUNTS
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Pure limit evaluation for one order against one account. Returns the
+/// post-reservation totals without mutating anything.
+fn evaluate_limits(
+    account: &AccountState,
+    order: &NewOrder,
+) -> Result<(u128, u128, u32), RejectReason> {
+    if account.killed {
+        return Err(RejectReason::KillSwitch);
+    }
+    if order.quantity.0 > account.limits.max_quantity.0 {
+        return Err(RejectReason::QuantityLimit);
+    }
+    if order.price.0 < account.limits.minimum_price.0
+        || order.price.0 > account.limits.maximum_price.0
+    {
+        return Err(RejectReason::PriceCollar);
+    }
+    let absolute_price = order
+        .price
+        .0
+        .checked_abs()
+        .ok_or(RejectReason::ArithmeticOverflow)?;
+    let notional =
+        u128::from(u64::try_from(absolute_price).map_err(|_| RejectReason::ArithmeticOverflow)?)
+            .checked_mul(u128::from(order.quantity.0))
+            .ok_or(RejectReason::ArithmeticOverflow)?;
+    if notional > account.limits.max_notional {
+        return Err(RejectReason::NotionalLimit);
+    }
+    let (reserved_buys, reserved_sells) = match order.side {
+        Side::Buy => (
+            account
+                .reserved_buys
+                .checked_add(u128::from(order.quantity.0))
+                .ok_or(RejectReason::ArithmeticOverflow)?,
+            account.reserved_sells,
+        ),
+        Side::Sell => (
+            account.reserved_buys,
+            account
+                .reserved_sells
+                .checked_add(u128::from(order.quantity.0))
+                .ok_or(RejectReason::ArithmeticOverflow)?,
+        ),
+    };
+    let maximum_position = i128::from(account.limits.max_abs_position.0);
+    let worst_long = account
+        .settled_position
+        .checked_add(i128::try_from(reserved_buys).map_err(|_| RejectReason::ArithmeticOverflow)?)
+        .ok_or(RejectReason::ArithmeticOverflow)?;
+    let worst_short = account
+        .settled_position
+        .checked_sub(i128::try_from(reserved_sells).map_err(|_| RejectReason::ArithmeticOverflow)?)
+        .ok_or(RejectReason::ArithmeticOverflow)?;
+    if worst_long > maximum_position || worst_short < -maximum_position {
+        return Err(RejectReason::PositionLimit);
+    }
+    let open_orders = account
+        .open_orders
+        .checked_add(1)
+        .ok_or(RejectReason::ArithmeticOverflow)?;
+    if open_orders > account.limits.max_open_orders {
+        return Err(RejectReason::OpenOrderLimit);
+    }
+    Ok((reserved_buys, reserved_sells, open_orders))
 }
 
 fn mix(digest: &mut u64, value: u64) {
@@ -536,6 +769,85 @@ mod tests {
             quantity: Quantity(quantity),
             sequence: SequenceNumber(id),
             side,
+        }
+    }
+
+    fn wide_limits() -> RiskLimits {
+        RiskLimits {
+            max_quantity: Quantity(1_000),
+            max_notional: 1_000_000_000,
+            max_abs_position: Quantity(1_000),
+            max_open_orders: 64,
+            minimum_price: PriceTicks(1),
+            maximum_price: PriceTicks(1_000),
+        }
+    }
+
+    /// Index and storage agree, live/free sets are disjoint, and reservation
+    /// totals equal live per-account exposure.
+    fn assert_risk_consistent<const ACCOUNTS: usize, const ORDERS: usize>(
+        risk: &RiskEngine<ACCOUNTS, ORDERS>,
+    ) {
+        let mut live_totals: std::collections::BTreeMap<u32, (u128, u128, u32)> =
+            std::collections::BTreeMap::new();
+        let mut live = 0_usize;
+        for (slot_index, slot) in risk.reservations.iter().enumerate() {
+            let ReservationSlot::Live(reservation) = slot else {
+                continue;
+            };
+            assert_eq!(
+                risk.reservation_index.lookup(reservation.order_id.0),
+                Some(slot_index),
+                "index maps the id to its stable slot"
+            );
+            let flat = usize::try_from(reservation.index_slot).expect("valid index slot");
+            assert_eq!(
+                risk.reservation_index.slot(flat),
+                Some(&IndexSlot::Occupied {
+                    key: reservation.order_id.0,
+                    value: slot_index,
+                }),
+                "index slot points back at the reservation"
+            );
+            let totals = live_totals.entry(reservation.account_id.0).or_default();
+            match reservation.side {
+                Side::Buy => totals.0 += u128::from(reservation.quantity.0),
+                Side::Sell => totals.1 += u128::from(reservation.quantity.0),
+            }
+            totals.2 += 1;
+            live += 1;
+        }
+        let mut free_seen = 0_usize;
+        let mut cursor = risk.reservation_free_head;
+        while cursor != NIL {
+            let ReservationSlot::Free { next_free } =
+                risk.reservations.get(cursor).expect("free slot in range")
+            else {
+                panic!("free chain reached a live slot");
+            };
+            cursor = *next_free;
+            free_seen += 1;
+        }
+        assert_eq!(live + free_seen, ORDERS, "live and free sets cover slots");
+        for (position, entry) in risk.accounts.iter().enumerate() {
+            let Some(account) = entry else {
+                continue;
+            };
+            assert_eq!(
+                risk.account_index.lookup(u64::from(account.id.0)),
+                Some(position),
+                "account index maps to the registration slot"
+            );
+            let (buys, sells, open) = live_totals.get(&account.id.0).copied().unwrap_or_default();
+            assert_eq!(
+                account.reserved_buys, buys,
+                "reserved buys equal live exposure"
+            );
+            assert_eq!(
+                account.reserved_sells, sells,
+                "reserved sells equal live exposure"
+            );
+            assert_eq!(account.open_orders, open, "open orders equal live count");
         }
     }
 
@@ -658,5 +970,110 @@ mod tests {
             Ok(Quantity(3))
         );
         assert_eq!(risk.account_snapshot(AccountId(7)), Some((2, 0)));
+    }
+
+    #[test]
+    fn index_handles_collisions_back_shift_and_slot_reuse() {
+        type TestIndex = ProbeIndex<usize, 4, INDEX_PLANES>;
+        let capacity = TestIndex::capacity().expect("nonzero capacity");
+        let home = TestIndex::probe_start(1, capacity);
+        let mut colliding = std::vec::Vec::new();
+        let mut candidate = 1_u64;
+        while colliding.len() < 4 {
+            if TestIndex::probe_start(candidate, capacity) == home {
+                colliding.push(candidate);
+            }
+            candidate += 1;
+        }
+        let mut risk = RiskEngine::<1, 4>::new();
+        risk.register_account(AccountId(7), wide_limits())
+            .expect("valid limits");
+        for id in &colliding[..3] {
+            risk.check_and_reserve(order(*id, Side::Buy, 2))
+                .expect("reserve colliding order");
+            assert_risk_consistent(&risk);
+        }
+        risk.settle(OrderId(colliding[1]), Quantity(0))
+            .expect("settle middle colliding order");
+        assert_risk_consistent(&risk);
+        risk.cancel_reservation(OrderId(colliding[0]), AccountId(7))
+            .expect("cancel relocated order");
+        assert_risk_consistent(&risk);
+        risk.check_and_reserve(order(colliding[3], Side::Sell, 1))
+            .expect("reuse freed slot");
+        assert_risk_consistent(&risk);
+        assert_eq!(
+            risk.can_cancel(OrderId(colliding[2]), AccountId(7)),
+            Ok(()),
+            "lookup after deletions and reuse"
+        );
+    }
+
+    #[test]
+    fn full_reservations_reject_atomically() {
+        let mut risk = RiskEngine::<1, 2>::new();
+        risk.register_account(AccountId(7), wide_limits())
+            .expect("valid limits");
+        risk.check_and_reserve(order(1, Side::Buy, 1))
+            .expect("first reservation");
+        risk.check_and_reserve(order(2, Side::Sell, 1))
+            .expect("second reservation");
+        let digest = risk.stable_digest();
+        assert_eq!(
+            risk.check_and_reserve(order(3, Side::Buy, 1)),
+            Err(RejectReason::OrderCapacity)
+        );
+        assert_eq!(risk.stable_digest(), digest);
+        assert_risk_consistent(&risk);
+    }
+
+    #[test]
+    fn duplicate_and_capacity_registration_reject() {
+        let mut risk = RiskEngine::<1, 2>::new();
+        risk.register_account(AccountId(7), wide_limits())
+            .expect("first registration");
+        assert_eq!(
+            risk.register_account(AccountId(7), wide_limits()),
+            Err(RegistrationError::DuplicateAccount)
+        );
+        assert_eq!(
+            risk.register_account(AccountId(8), wide_limits()),
+            Err(RegistrationError::AccountCapacity)
+        );
+        assert_risk_consistent(&risk);
+    }
+
+    #[test]
+    fn stable_handles_survive_reservation_churn() {
+        let mut risk = RiskEngine::<1, 8>::new();
+        risk.register_account(AccountId(7), wide_limits())
+            .expect("valid limits");
+        for id in 1..=5 {
+            risk.check_and_reserve(order(id, Side::Buy, 2))
+                .expect("reserve order");
+        }
+        let before = risk.reservation_index.lookup(4);
+        assert!(before.is_some());
+
+        risk.record_fill(OrderId(1), Quantity(2))
+            .expect("terminal fill");
+        assert_risk_consistent(&risk);
+        risk.cancel_reservation(OrderId(2), AccountId(7))
+            .expect("cancel order");
+        assert_risk_consistent(&risk);
+        risk.check_and_reserve(order(6, Side::Sell, 1))
+            .expect("reserve after frees");
+        risk.settle(OrderId(3), Quantity(1))
+            .expect("settle with partial fill");
+        assert_risk_consistent(&risk);
+
+        assert_eq!(
+            risk.reservation_index.lookup(4),
+            before,
+            "unrelated churn preserves the stable handle"
+        );
+        risk.settle(OrderId(4), Quantity(0))
+            .expect("settle through preserved handle");
+        assert_risk_consistent(&risk);
     }
 }

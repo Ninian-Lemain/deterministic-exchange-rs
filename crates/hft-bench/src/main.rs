@@ -119,6 +119,7 @@ fn main() {
     cancel_benchmark();
     fifo_benchmark();
     risk_benchmark();
+    price_benchmark();
 }
 
 #[derive(Clone, Copy)]
@@ -457,6 +458,187 @@ fn risk_benchmark() {
     let dealloc_after = DEALLOCATIONS.load(Ordering::SeqCst);
     assert_eq!(alloc_after, alloc_before, "risk bench allocation");
     assert_eq!(dealloc_after, dealloc_before, "risk bench deallocation");
+}
+
+#[allow(clippy::too_many_lines)]
+fn price_benchmark() {
+    const SAMPLES: usize = 2_000;
+    let alloc_before = ALLOCATIONS.load(Ordering::SeqCst);
+    let dealloc_before = DEALLOCATIONS.load(Ordering::SeqCst);
+    let samples_u128 = u128::try_from(SAMPLES).expect("sample count fits u128");
+
+    price_scenario::<64, 1>("dense_64_32", 32, SAMPLES, samples_u128);
+    price_scenario::<128, 1>("sparse_128_16", 16, SAMPLES, samples_u128);
+    price_scenario::<128, 1>("dense_128_64", 64, SAMPLES, samples_u128);
+    price_scenario::<128, 1>("dense_128_120", 120, SAMPLES, samples_u128);
+
+    let alloc_after = ALLOCATIONS.load(Ordering::SeqCst);
+    let dealloc_after = DEALLOCATIONS.load(Ordering::SeqCst);
+    assert_eq!(alloc_after, alloc_before, "price bench allocation");
+    assert_eq!(dealloc_after, dealloc_before, "price bench deallocation");
+}
+
+#[allow(clippy::too_many_lines)]
+fn price_scenario<const L: usize, const O: usize>(
+    name: &str,
+    active: usize,
+    samples: usize,
+    samples_u128: u128,
+) {
+    let make_book = || -> Box<hft_book::OrderBook<L, O>> {
+        Box::new(hft_book::OrderBook::<L, O>::new(InstrumentId(1)))
+    };
+
+    // --- submit_cross: populate asks then time a buy crossing all of them ---
+    {
+        let mut book = make_book();
+        let mut reports = ReportBuffer::<1>::new();
+        for i in 0..active {
+            let price = 100 + i64::try_from(i).expect("price fits i64");
+            let id = u64::try_from(i + 1).expect("id fits u64");
+            book.submit(
+                NewOrder {
+                    order_id: OrderId(id),
+                    account_id: AccountId(1),
+                    instrument_id: InstrumentId(1),
+                    price: PriceTicks(price),
+                    quantity: Quantity(1),
+                    sequence: SequenceNumber(id),
+                    side: Side::Sell,
+                },
+                &mut reports,
+            )
+            .expect("rest sell level");
+            reports.clear();
+        }
+        let mut total_ns = 0_u128;
+        let mut worst_ns = 0_u64;
+        for i in 0..samples {
+            let id = u64::try_from(active + i + 1).expect("id fits u64");
+            let start = Instant::now();
+            let _ = book.submit(
+                NewOrder {
+                    order_id: OrderId(id),
+                    account_id: AccountId(2),
+                    instrument_id: InstrumentId(1),
+                    price: PriceTicks(1000),
+                    quantity: Quantity(1),
+                    sequence: SequenceNumber(id),
+                    side: Side::Buy,
+                },
+                &mut reports,
+            );
+            let ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            total_ns += u128::from(ns);
+            worst_ns = worst_ns.max(ns);
+            reports.clear();
+        }
+        let mean = total_ns / samples_u128;
+        println!(
+            "price_bench op=submit_cross scenario={name} samples={samples} mean_ns={mean} max_ns={worst_ns}",
+        );
+    }
+
+    // --- discovery: populate asks with high qty, time a single-unit buy ---
+    {
+        let mut book = make_book();
+        let mut reports = ReportBuffer::<1>::new();
+        for i in 0..active {
+            let price = 100 + i64::try_from(i).expect("price fits i64");
+            let id = u64::try_from(i + 1).expect("id fits u64");
+            book.submit(
+                NewOrder {
+                    order_id: OrderId(id),
+                    account_id: AccountId(1),
+                    instrument_id: InstrumentId(1),
+                    price: PriceTicks(price),
+                    quantity: Quantity(100_000),
+                    sequence: SequenceNumber(id),
+                    side: Side::Sell,
+                },
+                &mut reports,
+            )
+            .expect("rest sell");
+            reports.clear();
+        }
+        let mut total_ns = 0_u128;
+        let mut worst_ns = 0_u64;
+        for i in 0..samples {
+            let id = u64::try_from(active + i + 10_000).expect("id fits u64");
+            let start = Instant::now();
+            let _ = book.submit(
+                NewOrder {
+                    order_id: OrderId(id),
+                    account_id: AccountId(2),
+                    instrument_id: InstrumentId(1),
+                    price: PriceTicks(100),
+                    quantity: Quantity(1),
+                    sequence: SequenceNumber(id),
+                    side: Side::Buy,
+                },
+                &mut reports,
+            );
+            let ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            total_ns += u128::from(ns);
+            worst_ns = worst_ns.max(ns);
+            reports.clear();
+        }
+        let mean = total_ns / samples_u128;
+        println!(
+            "price_bench op=discovery scenario={name} samples={samples} mean_ns={mean} max_ns={worst_ns}",
+        );
+    }
+
+    // --- level_create: time resting into new levels ---
+    {
+        let mut book = make_book();
+        let mut reports = ReportBuffer::<1>::new();
+        for i in 0..active.min(8) {
+            let price = 200 + i64::try_from(i).expect("price fits i64");
+            let id = u64::try_from(i + 1).expect("id fits u64");
+            book.submit(
+                NewOrder {
+                    order_id: OrderId(id),
+                    account_id: AccountId(1),
+                    instrument_id: InstrumentId(1),
+                    price: PriceTicks(price),
+                    quantity: Quantity(1),
+                    sequence: SequenceNumber(id),
+                    side: Side::Sell,
+                },
+                &mut reports,
+            )
+            .expect("pre-populate");
+            reports.clear();
+        }
+        let mut total_ns = 0_u128;
+        let mut worst_ns = 0_u64;
+        for i in 0..samples {
+            let price = 500 + i64::try_from(i).expect("price fits i64");
+            let id = u64::try_from(active + i + 100).expect("id fits u64");
+            let start = Instant::now();
+            let _ = book.submit(
+                NewOrder {
+                    order_id: OrderId(id),
+                    account_id: AccountId(1),
+                    instrument_id: InstrumentId(1),
+                    price: PriceTicks(price),
+                    quantity: Quantity(1),
+                    sequence: SequenceNumber(id),
+                    side: Side::Sell,
+                },
+                &mut reports,
+            );
+            let ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            total_ns += u128::from(ns);
+            worst_ns = worst_ns.max(ns);
+            reports.clear();
+        }
+        let mean = total_ns / samples_u128;
+        println!(
+            "price_bench op=level_create scenario={name} samples={samples} mean_ns={mean} max_ns={worst_ns}",
+        );
+    }
 }
 
 fn cancel_benchmark() {

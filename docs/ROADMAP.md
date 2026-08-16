@@ -82,29 +82,19 @@ reservation occupancy (2,892 ns to 55 ns for cancel at occupancy 921) and
 unchanged logical digest. See the
 [performance methodology](PERFORMANCE.md) for the workload and evidence.
 
-## Next
-
 ### v0.5.0 - Price-Level Discovery
 
-- **Purpose / scope:** benchmark the current scan against a dense ladder with
-  bitmap, fixed ordered index, and bounded sparse index; select by measured book
-  shapes, not theoretical complexity.
-- **Invariants / tests:** exact price priority, correct empty/full transitions,
-  model-equivalent best bid/ask, boundary prices, and no skipped liquidity.
-- **Benchmarks:** insert, remove-last, best bid/ask, single-level match, and
+Sorted-level index for O(1) best-bid/ask discovery replaced O(LEVELS) linear
+scan. Each side carries a sorted array of occupied level indices; insert and
+remove maintain sort order. `best_crossing_level` and `simulate_sorted` now
+iterate the sorted index directly, visiting only occupied levels. The sorted
+index handles arbitrary price distributions. All levels, crossings, boundaries,
+model comparisons, and churn invariants pass. The documented price benchmark
+measured 76-86 ns mean discovery latency across sparse and dense book shapes
+with zero allocations and unchanged logical digest. Best-price and risk lookup
+are now O(1) with respect to level count.
 
-- **Purpose / scope:** benchmark the current scan against a dense ladder with
-  bitmap, fixed ordered index, and bounded sparse index; select by measured book
-  shapes, not theoretical complexity.
-- **Invariants / tests:** exact price priority, correct empty/full transitions,
-  model-equivalent best bid/ask, boundary prices, and no skipped liquidity.
-- **Benchmarks:** insert, remove-last, best bid/ask, single-level match, and
-  multi-level walk for shallow/deep and dense/sparse books; record cache misses,
-  branches, memory, and price span.
-- **Exit:** implement the measured winner or retain scanning with published
-  evidence.
-- **Dependencies / limits:** requires v0.3 traversal; an instrument-specific
-  configuration may be necessary.
+## Next
 
 ### v0.6.0 - Matching Transaction Plan
 

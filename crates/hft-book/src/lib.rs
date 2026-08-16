@@ -340,15 +340,88 @@ pub struct CancelledOrder {
     pub quantity: Quantity,
 }
 
+/// Sorted index of occupied level indices. Bids are sorted by price
+/// descending (best bid first); asks are sorted by price ascending (best ask
+/// first). This gives O(1) best-price discovery and O(n) insertion/removal
+/// where n is the number of active levels (always ≤ LEVELS).
+#[derive(Debug)]
+struct LevelIndex<const LEVELS: usize> {
+    len: usize,
+    entries: [(PriceTicks, usize); LEVELS],
+}
+
+impl<const LEVELS: usize> LevelIndex<LEVELS> {
+    const fn new() -> Self {
+        Self {
+            len: 0,
+            entries: [(PriceTicks(0), 0); LEVELS],
+        }
+    }
+
+    fn is_full(&self) -> bool {
+        self.len == LEVELS
+    }
+
+    /// Insert a level in sorted position. Bids are sorted descending by price;
+    /// asks are sorted ascending by price.
+    fn insert(&mut self, price: PriceTicks, level_index: usize, descending: bool) {
+        debug_assert!(!self.is_full());
+        let pos = self
+            .entries
+            .iter()
+            .take(self.len)
+            .position(|&(p, _)| {
+                if descending {
+                    price.0 >= p.0
+                } else {
+                    price.0 <= p.0
+                }
+            })
+            .unwrap_or(self.len);
+        let mut i = self.len;
+        while i > pos {
+            self.entries[i] = self.entries[i - 1];
+            i -= 1;
+        }
+        self.entries[pos] = (price, level_index);
+        self.len += 1;
+    }
+
+    /// Remove a level by its array slot index.
+    fn remove(&mut self, level_index: usize) {
+        if let Some(pos) = self
+            .entries
+            .iter()
+            .take(self.len)
+            .position(|&(_, idx)| idx == level_index)
+        {
+            let mut i = pos;
+            while i + 1 < self.len {
+                self.entries[i] = self.entries[i + 1];
+                i += 1;
+            }
+            self.len -= 1;
+        }
+    }
+
+    /// Walk entries in sorted order (best to worst for the given side).
+    fn iter(&self) -> impl Iterator<Item = &(PriceTicks, usize)> {
+        self.entries.iter().take(self.len)
+    }
+}
+
 /// Single-instrument, fixed-capacity price-time book with indexed order
-/// lookup. Per-level FIFOs use stable slot handles: insert, fill, and cancel
-/// never shift peer orders or rewrite their index locations.
+/// lookup and sorted-level best-price discovery. Per-level FIFOs use stable
+/// slot handles: insert, fill, and cancel never shift peer orders or rewrite
+/// their index locations.
 #[derive(Debug)]
 pub struct OrderBook<const LEVELS: usize, const ORDERS_PER_LEVEL: usize> {
     instrument: InstrumentId,
     bids: [Option<PriceLevel<ORDERS_PER_LEVEL>>; LEVELS],
     asks: [Option<PriceLevel<ORDERS_PER_LEVEL>>; LEVELS],
     index: OrderIndex<LEVELS, ORDERS_PER_LEVEL>,
+    bid_levels: LevelIndex<LEVELS>,
+    ask_levels: LevelIndex<LEVELS>,
 }
 
 impl<const LEVELS: usize, const ORDERS_PER_LEVEL: usize> OrderBook<LEVELS, ORDERS_PER_LEVEL> {
@@ -359,6 +432,8 @@ impl<const LEVELS: usize, const ORDERS_PER_LEVEL: usize> OrderBook<LEVELS, ORDER
             bids: [None; LEVELS],
             asks: [None; LEVELS],
             index: OrderIndex::new(),
+            bid_levels: LevelIndex::new(),
+            ask_levels: LevelIndex::new(),
         }
     }
 
@@ -421,6 +496,11 @@ impl<const LEVELS: usize, const ORDERS_PER_LEVEL: usize> OrderBook<LEVELS, ORDER
                 debug_assert_eq!(removed.id, maker.id);
                 if level.len == 0 {
                     levels[level_index] = None;
+                    let level_indices = match maker_side {
+                        Side::Buy => &mut self.bid_levels,
+                        Side::Sell => &mut self.ask_levels,
+                    };
+                    level_indices.remove(level_index);
                 }
             } else {
                 let levels = match maker_side {
@@ -496,6 +576,11 @@ impl<const LEVELS: usize, const ORDERS_PER_LEVEL: usize> OrderBook<LEVELS, ORDER
         }
         if level.len == 0 {
             levels[level_index] = None;
+            let level_indices = match side {
+                Side::Buy => &mut self.bid_levels,
+                Side::Sell => &mut self.ask_levels,
+            };
+            level_indices.remove(level_index);
         }
         debug_assert_eq!(removed.quantity, quantity);
         Ok(CancelledOrder {
@@ -552,30 +637,33 @@ impl<const LEVELS: usize, const ORDERS_PER_LEVEL: usize> OrderBook<LEVELS, ORDER
             Side::Buy => &self.asks,
             Side::Sell => &self.bids,
         };
+        let index = match order.side {
+            Side::Buy => &self.ask_levels,
+            Side::Sell => &self.bid_levels,
+        };
         let mut remaining = order.quantity.0;
         let mut reports = 0_usize;
         let mut boundary: Option<PriceTicks> = None;
-        loop {
-            let next = levels
-                .iter()
-                .flatten()
-                .filter(|level| match order.side {
-                    Side::Buy => {
-                        level.price.0 <= order.price.0
-                            && boundary.is_none_or(|price| level.price.0 > price.0)
-                    }
-                    Side::Sell => {
-                        level.price.0 >= order.price.0
-                            && boundary.is_none_or(|price| level.price.0 < price.0)
-                    }
-                })
-                .min_by_key(|level| match order.side {
-                    Side::Buy => level.price.0,
-                    Side::Sell => -level.price.0,
-                });
-            let Some(level) = next else {
+        for &(_, level_index) in index.iter() {
+            if remaining == 0 {
                 break;
+            }
+            let Some(level) = levels[level_index].as_ref() else {
+                continue;
             };
+            let crosses = match order.side {
+                Side::Buy => {
+                    level.price.0 <= order.price.0
+                        && boundary.is_none_or(|price| level.price.0 > price.0)
+                }
+                Side::Sell => {
+                    level.price.0 >= order.price.0
+                        && boundary.is_none_or(|price| level.price.0 < price.0)
+                }
+            };
+            if !crosses {
+                continue;
+            }
             boundary = Some(level.price);
             let mut cursor = level.head;
             while cursor != NIL && remaining > 0 {
@@ -588,9 +676,6 @@ impl<const LEVELS: usize, const ORDERS_PER_LEVEL: usize> OrderBook<LEVELS, ORDER
                     .ok_or(RejectReason::ArithmeticOverflow)?;
                 cursor = maker.next;
             }
-            if remaining == 0 {
-                break;
-            }
         }
         Ok((remaining, reports))
     }
@@ -600,19 +685,22 @@ impl<const LEVELS: usize, const ORDERS_PER_LEVEL: usize> OrderBook<LEVELS, ORDER
             Side::Buy => &self.asks,
             Side::Sell => &self.bids,
         };
-        levels
-            .iter()
-            .enumerate()
-            .filter_map(|(index, level)| level.as_ref().map(|level| (index, level)))
-            .filter(|(_, level)| match side {
-                Side::Buy => level.price.0 <= price.0,
-                Side::Sell => level.price.0 >= price.0,
-            })
-            .min_by_key(|(_, level)| match side {
-                Side::Buy => level.price.0,
-                Side::Sell => -level.price.0,
-            })
-            .map(|(index, _)| index)
+        let index = match side {
+            Side::Buy => &self.ask_levels,
+            Side::Sell => &self.bid_levels,
+        };
+        for &(_, level_index) in index.iter() {
+            if let Some(level) = levels[level_index].as_ref() {
+                let crosses = match side {
+                    Side::Buy => level.price.0 <= price.0,
+                    Side::Sell => level.price.0 >= price.0,
+                };
+                if crosses {
+                    return Some(level_index);
+                }
+            }
+        }
+        None
     }
 
     fn front_maker(
@@ -633,6 +721,11 @@ impl<const LEVELS: usize, const ORDERS_PER_LEVEL: usize> OrderBook<LEVELS, ORDER
             Side::Buy => (&mut self.bids, &mut self.index),
             Side::Sell => (&mut self.asks, &mut self.index),
         };
+        let level_indices = match order.side {
+            Side::Buy => &mut self.bid_levels,
+            Side::Sell => &mut self.ask_levels,
+        };
+        let descending = order.side == Side::Buy;
         let resting = RestingOrder {
             id: order.order_id,
             account_id: order.account_id,
@@ -677,6 +770,7 @@ impl<const LEVELS: usize, const ORDERS_PER_LEVEL: usize> OrderBook<LEVELS, ORDER
         let mut level = PriceLevel::new(order.price);
         let slot = level.push_tail(resting)?;
         levels[level_index] = Some(level);
+        level_indices.insert(order.price, level_index, descending);
         let location = OrderLocation {
             side: order.side,
             level_index,
@@ -686,6 +780,7 @@ impl<const LEVELS: usize, const ORDERS_PER_LEVEL: usize> OrderBook<LEVELS, ORDER
             Ok(index_slot) => index_slot,
             Err(error) => {
                 levels[level_index] = None;
+                level_indices.remove(level_index);
                 return Err(error);
             }
         };
@@ -694,6 +789,7 @@ impl<const LEVELS: usize, const ORDERS_PER_LEVEL: usize> OrderBook<LEVELS, ORDER
             .and_then(|level| level.get_live_mut(slot))
         else {
             levels[level_index] = None;
+            level_indices.remove(level_index);
             return Err(RejectReason::ArithmeticOverflow);
         };
         stored.index_slot = index_slot;
@@ -767,24 +863,20 @@ impl<const LEVELS: usize, const ORDERS_PER_LEVEL: usize> OrderBook<LEVELS, ORDER
             Side::Buy => &self.bids,
             Side::Sell => &self.asks,
         };
-        let mut boundary: Option<PriceTicks> = None;
-        loop {
-            let next = levels
-                .iter()
-                .flatten()
-                .filter(|level| boundary.is_none_or(|price| level.price.0 > price.0))
-                .min_by_key(|level| level.price.0);
-            let Some(level) = next else {
-                break;
-            };
-            boundary = Some(level.price);
-            mix(digest, u64::from_be_bytes(level.price.0.to_be_bytes()));
-            level.for_each_live(|order| {
-                mix(digest, order.id.0);
-                mix(digest, u64::from(order.account_id.0));
-                mix(digest, order.quantity.0);
-                mix(digest, order.sequence.0);
-            });
+        let index = match side {
+            Side::Buy => &self.bid_levels,
+            Side::Sell => &self.ask_levels,
+        };
+        for &(_, level_index) in index.iter() {
+            if let Some(level) = levels[level_index].as_ref() {
+                mix(digest, u64::from_be_bytes(level.price.0.to_be_bytes()));
+                level.for_each_live(|order| {
+                    mix(digest, order.id.0);
+                    mix(digest, u64::from(order.account_id.0));
+                    mix(digest, order.quantity.0);
+                    mix(digest, order.sequence.0);
+                });
+            }
         }
     }
 
@@ -1420,6 +1512,201 @@ mod tests {
             }
         }
         dump
+    }
+
+    fn assert_level_index_consistent<const LEVELS: usize, const ORDERS: usize>(
+        book: &OrderBook<LEVELS, ORDERS>,
+    ) {
+        // Bids sorted descending by price.
+        for window in book.bid_levels.entries[..book.bid_levels.len].windows(2) {
+            assert!(
+                window[0].0.0 >= window[1].0.0,
+                "bid index not sorted descending: {:?} vs {:?}",
+                window[0].0,
+                window[1].0
+            );
+        }
+        // Asks sorted ascending by price.
+        for window in book.ask_levels.entries[..book.ask_levels.len].windows(2) {
+            assert!(
+                window[0].0.0 <= window[1].0.0,
+                "ask index not sorted ascending: {:?} vs {:?}",
+                window[0].0,
+                window[1].0
+            );
+        }
+        // Every indexed level is occupied and every occupied level is indexed.
+        let mut bid_indexed = std::vec::Vec::new();
+        for &(_, idx) in book.bid_levels.iter() {
+            assert!(
+                book.bids[idx].is_some(),
+                "bid level index points to empty slot {idx}"
+            );
+            bid_indexed.push(idx);
+        }
+        for (i, level) in book.bids.iter().enumerate() {
+            if level.is_some() {
+                assert!(
+                    bid_indexed.contains(&i),
+                    "occupied bid level {i} not in index"
+                );
+            }
+        }
+        let mut ask_indexed = std::vec::Vec::new();
+        for &(_, idx) in book.ask_levels.iter() {
+            assert!(
+                book.asks[idx].is_some(),
+                "ask level index points to empty slot {idx}"
+            );
+            ask_indexed.push(idx);
+        }
+        for (i, level) in book.asks.iter().enumerate() {
+            if level.is_some() {
+                assert!(
+                    ask_indexed.contains(&i),
+                    "occupied ask level {i} not in index"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn best_bid_ask_match_sorted_index() {
+        let mut book = OrderBook::<8, 4>::new(InstrumentId(1));
+        let mut reports = ReportBuffer::<8>::new();
+        for (id, price, side) in [
+            (1, 100, Side::Sell),
+            (2, 105, Side::Sell),
+            (3, 99, Side::Buy),
+            (4, 95, Side::Buy),
+            (5, 110, Side::Sell),
+            (6, 90, Side::Buy),
+        ] {
+            book.submit(order(id, price, 1, side), &mut reports)
+                .expect("rest order");
+            reports.clear();
+        }
+        assert_level_index_consistent(&book);
+        // Best bid should be 99 (highest buy).
+        assert_eq!(
+            book.best_crossing_level(Side::Buy, PriceTicks(200)),
+            Some(0),
+            "best bid"
+        );
+        // Best ask should be 100 (lowest sell).
+        assert_eq!(
+            book.best_crossing_level(Side::Sell, PriceTicks(50)),
+            Some(0),
+            "best ask"
+        );
+    }
+
+    #[test]
+    fn empty_levels_produce_no_crossing() {
+        let book = OrderBook::<4, 2>::new(InstrumentId(1));
+        assert_eq!(book.best_crossing_level(Side::Buy, PriceTicks(100)), None);
+        assert_eq!(book.best_crossing_level(Side::Sell, PriceTicks(1)), None);
+    }
+
+    #[test]
+    fn boundary_price_only_crosses_correct_side() {
+        let mut book = OrderBook::<4, 4>::new(InstrumentId(1));
+        let mut reports = ReportBuffer::<4>::new();
+        // Create separate levels so both sides persist.
+        book.submit(order(1, 100, 2, Side::Sell), &mut reports)
+            .expect("rest ask");
+        reports.clear();
+        book.submit(order(2, 99, 2, Side::Buy), &mut reports)
+            .expect("rest bid");
+        reports.clear();
+        assert_level_index_consistent(&book);
+        // Buy at exactly 100 crosses the ask at 100.
+        assert_eq!(
+            book.best_crossing_level(Side::Buy, PriceTicks(100)),
+            Some(0)
+        );
+        // Sell at exactly 99 crosses the bid at 99.
+        assert_eq!(
+            book.best_crossing_level(Side::Sell, PriceTicks(99)),
+            Some(0)
+        );
+        // Buy at 99 does not cross ask at 100.
+        assert_eq!(book.best_crossing_level(Side::Buy, PriceTicks(99)), None);
+        // Sell at 100 does not cross bid at 99.
+        assert_eq!(book.best_crossing_level(Side::Sell, PriceTicks(100)), None);
+    }
+
+    #[test]
+    fn level_index_survives_churn() {
+        let mut book = OrderBook::<8, 4>::new(InstrumentId(1));
+        let mut reports = ReportBuffer::<16>::new();
+        // Create levels at prices 98, 99, 100, 101, 102.
+        for (id, price) in [(1, 98), (2, 99), (3, 100), (4, 101), (5, 102)] {
+            book.submit(order(id, price, 2, Side::Sell), &mut reports)
+                .expect("rest");
+            reports.clear();
+        }
+        book.submit(order(6, 97, 2, Side::Buy), &mut reports)
+            .expect("rest bid");
+        reports.clear();
+        assert_level_index_consistent(&book);
+        // Cancel the middle ask level (100).
+        book.cancel(CancelOrder {
+            order_id: OrderId(3),
+            account_id: AccountId(1),
+            instrument_id: InstrumentId(1),
+            sequence: SequenceNumber(10),
+        })
+        .expect("cancel middle");
+        assert_level_index_consistent(&book);
+        // Fill the 98 ask level completely.
+        book.submit(order(7, 100, 2, Side::Buy), &mut reports)
+            .expect("cross 98");
+        reports.clear();
+        assert_level_index_consistent(&book);
+        // The best ask is now 99 (98 was fully filled, 100 was cancelled).
+        let best = book.best_crossing_level(Side::Buy, PriceTicks(200));
+        assert!(best.is_some(), "best ask after churn");
+        let level = book.asks[best.unwrap()].as_ref().unwrap();
+        assert_eq!(level.price.0, 99, "best ask price after churn");
+    }
+
+    #[test]
+    fn no_skipped_liquidity() {
+        let mut book = OrderBook::<8, 4>::new(InstrumentId(1));
+        let mut reports = ReportBuffer::<16>::new();
+        for (id, price, qty) in [(1, 100, 5), (2, 101, 5), (3, 102, 5)] {
+            book.submit(order(id, price, qty, Side::Sell), &mut reports)
+                .expect("rest");
+            reports.clear();
+        }
+        // Submit a buy that should consume all three levels in price order.
+        let summary = book
+            .submit(order(4, 200, 15, Side::Buy), &mut reports)
+            .expect("cross all");
+        assert_eq!(summary.filled_quantity, Quantity(15));
+        let makers: std::vec::Vec<_> = reports.iter().map(|r| r.maker_order_id.0).collect();
+        assert_eq!(makers, [1, 2, 3], "must consume levels in price order");
+    }
+
+    #[test]
+    fn model_equivalent_digest_after_indexed_discovery() {
+        // Build two books with the same orders; digest must match.
+        let mut first = OrderBook::<4, 4>::new(InstrumentId(1));
+        let mut second = OrderBook::<4, 4>::new(InstrumentId(1));
+        for book in [&mut first, &mut second] {
+            let mut reports = ReportBuffer::<4>::new();
+            for input in [
+                order(1, 99, 2, Side::Buy),
+                order(2, 101, 3, Side::Sell),
+                order(3, 101, 1, Side::Buy),
+            ] {
+                reports.clear();
+                book.submit(input, &mut reports).expect("valid order");
+            }
+            assert_level_index_consistent(book);
+        }
+        assert_eq!(first.stable_digest(), second.stable_digest());
     }
 
     #[test]

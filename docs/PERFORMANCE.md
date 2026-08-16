@@ -157,6 +157,41 @@ Command: `cargo build --release -p hft-bench`, direct runs of
 codegen unit, aborting panics. 256 samples per operation; mean and max
 recorded. Desktop scheduling and frequency changes remain sources of noise.
 
+## v0.5.0 Price-Level Discovery
+
+The price harness measures discovery latency across four book shapes: dense
+64-level/32-active, sparse 128/16, dense 128/64, and dense 128/120. Each
+scenario builds a book, populates ask levels, then times a single-unit buy
+submission that must locate the best ask. The `discovery` operation isolates the
+best-price path without clearing the book.
+
+| Operation | Scenario | Mean latency | Max latency |
+| --- | --- | ---: | ---: |
+| submit_cross | dense_64_32 | 64 ns | 900 ns |
+| discovery | dense_64_32 | 77 ns | 2,300 ns |
+| level_create | dense_64_32 | 119 ns | 800 ns |
+| submit_cross | sparse_128_16 | 62 ns | 700 ns |
+| discovery | sparse_128_16 | 76 ns | 800 ns |
+| level_create | sparse_128_16 | 228 ns | 20,900 ns |
+| submit_cross | dense_128_64 | 66 ns | 1,100 ns |
+| discovery | dense_128_64 | 86 ns | 10,900 ns |
+| level_create | dense_128_64 | 214 ns | 12,600 ns |
+| submit_cross | dense_128_120 | 72 ns | 1,900 ns |
+| discovery | dense_128_120 | 76 ns | 1,800 ns |
+| level_create | dense_128_120 | 217 ns | 13,600 ns |
+
+Discovery latency is flat at 76-86 ns across all shapes, confirming O(1)
+best-price lookup via the sorted-level index. Level creation costs 119-228 ns
+(maintaining sort order on insert). Zero allocations in every cell. The gateway
+200,000-message workload produced the identical logical digest
+`64321af91735b704`.
+
+Command: `cargo build --release -p hft-bench`, direct runs of
+`target/release/hft-bench.exe`. Environment: Intel N95, Windows 11 Pro build
+26200, Rust 1.96.0/LLVM 22.1.2, `x86_64-pc-windows-msvc`, fat LTO, one
+codegen unit, aborting panics. 2,000 samples per cell; mean and max recorded.
+Desktop scheduling and frequency changes remain sources of noise.
+
 ## Dedicated Linux Protocol
 
 Record all of the following with each result:

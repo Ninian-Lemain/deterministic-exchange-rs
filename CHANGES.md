@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+## v0.5.0 - 2026-08-16
+
+### Changed
+
+- Replaced O(LEVELS) linear best-price scan with a sorted-level index for
+  O(1) best-bid/ask discovery. `best_crossing_level` and `simulate_sorted`
+  iterate only occupied levels. Insert and remove maintain sort order in the
+  index. The order index, FIFO, and risk state are unchanged.
+
+### Added
+
+- Added `LevelIndex` for per-side sorted-level tracking with insert, remove,
+  and iteration.
+- Added invariant coverage for boundary-price crossing, empty-level rejection,
+  model-equivalent digest, churn-survival consistency, and no-skipped-liquidity
+  properties.
+- Added a price discovery benchmark measuring submit_cross, discovery, and
+  level_create across dense and sparse book shapes.
+
+### Performance
+
+- Discovery latency is flat 76-86 ns mean across all measured book shapes
+  (64-120 active levels). Zero measured allocations and unchanged logical
+  digest `64321af91735b704`. See `docs/PERFORMANCE.md`.
+
+### Verification
+
+- `cargo fmt --all --check`
+- `cargo check --workspace --all-targets --all-features`
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- `cargo test --workspace --all-features`
+
 ## v0.4.0 - 2026-08-16
 
 ### Changed

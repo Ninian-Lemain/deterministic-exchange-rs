@@ -68,26 +68,30 @@ depths 1 through 512 (down from 3,300/1,400/100/3,100 ns at depth 512) for a
 [performance methodology](PERFORMANCE.md) for the workload and evidence.
 Best-price and risk lookup stay linear.
 
-## Next
-
 ### v0.4.0 - Indexed Risk State
 
-- **Purpose / scope:** add fixed-capacity `AccountId -> AccountState` and
-  `OrderId -> Reservation` indices plus a bounded reservation free-list. Define
-  index load; do not use `HashMap`.
-- **Invariants / tests:** collisions/deletion, duplicate/full rejection, stable
-  handles, and reservation totals equal live exposure after fill/cancel/settle.
-- **Benchmarks:** risk check, both lookups, reservation insert, fill, cancel,
-  settle, and reject at 10%, 50%, and 90% configured occupancy versus linear
-  lookup; record memory cost.
-- **Exit:** expected O(1) lookup at the defined load, zero measured allocation,
-  unchanged logical digest, and published before/after results.
-- **Dependencies / limits:** follows v0.3 stable slots; account registration may
-  remain cold-path.
+Fixed-capacity `AccountId -> AccountState` and `OrderId -> Reservation` open
+addressed indices with deterministic collision/back-shift deletion replaced
+linear scans. Reservations live in a stable-slot free-list. Account and
+reservation lookups are now O(1) at load ≤ 1/2. Handle stability across
+unrelated churn, stale-handle fail-closed, disjoint live/free sets, duplicate
+and full rejection, and reservation-totals-equal-exposure invariant all pass.
+The documented risk harness measured up to 53x latency reduction at 90%
+reservation occupancy (2,892 ns to 55 ns for cancel at occupancy 921) and
+2.8x for account lookups at 90% account occupancy, with zero allocations and
+unchanged logical digest. See the
+[performance methodology](PERFORMANCE.md) for the workload and evidence.
 
-## Planned Core Work
+## Next
 
 ### v0.5.0 - Price-Level Discovery
+
+- **Purpose / scope:** benchmark the current scan against a dense ladder with
+  bitmap, fixed ordered index, and bounded sparse index; select by measured book
+  shapes, not theoretical complexity.
+- **Invariants / tests:** exact price priority, correct empty/full transitions,
+  model-equivalent best bid/ask, boundary prices, and no skipped liquidity.
+- **Benchmarks:** insert, remove-last, best bid/ask, single-level match, and
 
 - **Purpose / scope:** benchmark the current scan against a dense ladder with
   bitmap, fixed ordered index, and bounded sparse index; select by measured book

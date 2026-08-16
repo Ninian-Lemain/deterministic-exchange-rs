@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+## v0.4.0 - 2026-08-16
+
+### Changed
+
+- Replaced linear-scan risk lookups with fixed-capacity open-addressed indices
+  for `AccountId -> AccountState` and `OrderId -> Reservation`. Reservations
+  now live in a stable-slot free-list with deterministic collision/back-shift
+  deletion. The order index maps IDs to stable slot handles. Public APIs are
+  unchanged.
+
+### Added
+
+- Added invariant coverage for collisions, relocation, slot reuse, duplicate
+  and full rejection, handle stability across unrelated churn, stale-handle
+  fail-closed, and reservation-totals-equal-exposure after fill/cancel/settle.
+- Added a risk occupancy benchmark harness measuring risk_check,
+  reservation_lookup, fill, cancel, settle, reject, and account_lookup at
+  10%, 50%, and 90% configured occupancy.
+
+### Performance
+
+- Up to 53x latency reduction at 90% reservation occupancy (2,892 ns to 55 ns
+  for cancel), 25x for risk check (1,631 ns to 65 ns), and 2.8x for account
+  lookups at 90% account occupancy. Zero measured allocations and unchanged
+  logical digest `64321af91735b704`. See `docs/PERFORMANCE.md`.
+
+### Verification
+
+- `cargo fmt --all --check`
+- `cargo check --workspace --all-targets --all-features`
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- `cargo test --workspace --all-features`
+
 ## v0.3.0 - 2026-08-16
 
 ### Changed

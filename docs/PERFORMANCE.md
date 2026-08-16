@@ -109,6 +109,54 @@ codegen unit, aborting panics. Depths 1, 4, 16, 64, and the 512-order
 maximum; 2,000 samples per cell; p50/p90/p99/p99.9/max recorded for every
 cell.
 
+## v0.4.0 Indexed Risk State
+
+The risk harness compares v0.3.0's linear-scan risk state with v0.4.0's
+fixed-capacity open-addressed indices for accounts and reservations. Each
+operation runs 256 timed samples against a `RiskEngine::<64, 1024>` at
+stated occupancy. Reservation occupancy sweeps are 102, 512, and 921 (≈10%,
+50%, 90% of capacity). Account occupancy sweeps are 6, 32, and 57 (≈10%,
+50%, 90% of capacity). All samples are timed with `Instant`; per-sample
+overhead is included.
+
+| Operation | Occupancy | v0.3.0 linear mean | v0.4.0 indexed mean | Change |
+| --- | ---: | ---: | ---: | ---: |
+| risk_check | 102 | 190 ns | 79 ns | 2.4x |
+| risk_check | 512 | 1,196 ns | 79 ns | 15.1x |
+| risk_check | 921 | 1,631 ns | 65 ns | 25.1x |
+| reservation_lookup | 102 | 166 ns | 137 ns | 1.2x |
+| reservation_lookup | 512 | 635 ns | 52 ns | 12.2x |
+| reservation_lookup | 921 | 1,081 ns | 50 ns | 21.6x |
+| fill | 102 | 160 ns | 182 ns | ~same |
+| fill | 512 | 644 ns | 71 ns | 9.1x |
+| fill | 921 | 2,033 ns | 71 ns | 28.6x |
+| cancel | 102 | 322 ns | 61 ns | 5.3x |
+| cancel | 512 | 1,367 ns | 54 ns | 25.3x |
+| cancel | 921 | 2,892 ns | 55 ns | 52.6x |
+| settle | 102 | 171 ns | 95 ns | 1.8x |
+| settle | 512 | 617 ns | 255 ns | 2.4x |
+| settle | 921 | 1,017 ns | 55 ns | 18.5x |
+| reject | 102 | 164 ns | 67 ns | 2.4x |
+| reject | 512 | 644 ns | 63 ns | 10.2x |
+| reject | 921 | 1,323 ns | 61 ns | 21.7x |
+| account_lookup | 6 | 94 ns | 56 ns | 1.7x |
+| account_lookup | 32 | 121 ns | 54 ns | 2.2x |
+| account_lookup | 57 | 150 ns | 54 ns | 2.8x |
+
+The indexed implementation adds no measurable allocation at any occupancy.
+The gateway 200,000-message workload produced the identical logical digest
+`64321af91735b704`. Memory cost: `RiskEngine::<64, 1024>` grew from 25,632
+bytes (linear arrays + no index overhead) to 93,216 bytes (doubled probe
+planes + `ReservationSlot` enum + free-list). The 67 KiB increase is
+preallocated and fixed; the O(1) lookup removes the occupancy-proportional
+scan at 90% reservation occupancy.
+
+Command: `cargo build --release -p hft-bench`, direct runs of
+`target/release/hft-bench.exe`. Environment: Intel N95, Windows 11 Pro build
+26200, Rust 1.96.0/LLVM 22.1.2, `x86_64-pc-windows-msvc`, fat LTO, one
+codegen unit, aborting panics. 256 samples per operation; mean and max
+recorded. Desktop scheduling and frequency changes remain sources of noise.
+
 ## Dedicated Linux Protocol
 
 Record all of the following with each result:

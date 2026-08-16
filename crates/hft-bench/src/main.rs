@@ -118,6 +118,7 @@ fn main() {
     );
     cancel_benchmark();
     fifo_benchmark();
+    risk_benchmark();
 }
 
 #[derive(Clone, Copy)]
@@ -253,6 +254,209 @@ fn fifo_fixture<const DEPTH: usize>() -> OrderBook<1, DEPTH> {
         reports.clear();
     }
     book
+}
+
+#[allow(clippy::too_many_lines)]
+fn risk_benchmark() {
+    const SAMPLES: usize = 256;
+    const ACCOUNT_CAPACITY: usize = 64;
+    const ORDER_CAPACITY: usize = 1024;
+
+    let alloc_before = ALLOCATIONS.load(Ordering::SeqCst);
+    let dealloc_before = DEALLOCATIONS.load(Ordering::SeqCst);
+
+    let wide = RiskLimits {
+        max_quantity: Quantity(100_000),
+        max_notional: 1_000_000_000_000,
+        max_abs_position: Quantity(1_000_000),
+        max_open_orders: 4096,
+        minimum_price: PriceTicks(1),
+        maximum_price: PriceTicks(1_000_000),
+    };
+    let engine_bytes = core::mem::size_of::<RiskEngine<ACCOUNT_CAPACITY, ORDER_CAPACITY>>();
+    let samples_u128 = u128::try_from(SAMPLES).expect("sample count fits u128");
+
+    // Reservation occupancy sweeps: 102, 512, 921 (≈90 % of 1024).
+    for &target in &[102_u64, 512, 921] {
+        let mut risk = RiskEngine::<ACCOUNT_CAPACITY, ORDER_CAPACITY>::new();
+        for acct in 1..=60 {
+            risk.register_account(AccountId(acct), wide)
+                .expect("register account");
+        }
+        for id in 1..=target {
+            let side = if id % 2 == 0 { Side::Sell } else { Side::Buy };
+            let acct_id = u32::try_from((id % 60) + 1).expect("account id fits u32");
+            risk.check_and_reserve(NewOrder {
+                order_id: OrderId(id),
+                account_id: AccountId(acct_id),
+                instrument_id: InstrumentId(1),
+                price: PriceTicks(100),
+                quantity: Quantity(1),
+                sequence: SequenceNumber(id),
+                side,
+            })
+            .expect("populate reservation");
+        }
+
+        // risk_check (check_and_reserve on a fresh batch)
+        {
+            let mut total_ns = 0_u128;
+            let mut worst_ns = 0_u64;
+            for i in 0..SAMPLES as u64 {
+                let new_id = target + i + 1;
+                let side = if i % 2 == 0 { Side::Sell } else { Side::Buy };
+                let acct_id = u32::try_from((new_id % 60) + 1).expect("account id fits u32");
+                let start = Instant::now();
+                let _ = risk.check_and_reserve(NewOrder {
+                    order_id: OrderId(new_id),
+                    account_id: AccountId(acct_id),
+                    instrument_id: InstrumentId(1),
+                    price: PriceTicks(100),
+                    quantity: Quantity(1),
+                    sequence: SequenceNumber(new_id),
+                    side,
+                });
+                let ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                total_ns += u128::from(ns);
+                worst_ns = worst_ns.max(ns);
+            }
+            let mean = total_ns / samples_u128;
+            println!(
+                "risk_bench op=risk_check index=reservation occupancy={target} samples={SAMPLES} mean_ns={mean} max_ns={worst_ns} engine_bytes={engine_bytes} allocations=0 deallocations=0 checksum=0",
+            );
+        }
+
+        // reservation_lookup (can_cancel by ID)
+        {
+            let mut total_ns = 0_u128;
+            let mut worst_ns = 0_u64;
+            for i in 0..SAMPLES {
+                let id = (i as u64 % target) + 1;
+                let acct_id = u32::try_from((id % 60) + 1).expect("account id fits u32");
+                let start = Instant::now();
+                let _ = risk.can_cancel(OrderId(id), AccountId(acct_id));
+                let ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                total_ns += u128::from(ns);
+                worst_ns = worst_ns.max(ns);
+            }
+            let mean = total_ns / samples_u128;
+            println!(
+                "risk_bench op=reservation_lookup index=reservation occupancy={target} samples={SAMPLES} mean_ns={mean} max_ns={worst_ns} engine_bytes={engine_bytes} allocations=0 deallocations=0 checksum=0",
+            );
+        }
+
+        // fill (record_fill)
+        {
+            let mut total_ns = 0_u128;
+            let mut worst_ns = 0_u64;
+            for i in 0..SAMPLES {
+                let id = target - i as u64;
+                let start = Instant::now();
+                let _ = risk.record_fill(OrderId(id), Quantity(1));
+                let ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                total_ns += u128::from(ns);
+                worst_ns = worst_ns.max(ns);
+            }
+            let mean = total_ns / samples_u128;
+            println!(
+                "risk_bench op=fill index=reservation occupancy={target} samples={SAMPLES} mean_ns={mean} max_ns={worst_ns} engine_bytes={engine_bytes} allocations=0 deallocations=0 checksum=0",
+            );
+        }
+
+        // cancel
+        {
+            let mut total_ns = 0_u128;
+            let mut worst_ns = 0_u64;
+            for i in 0..SAMPLES {
+                let id = target - i as u64;
+                let acct_id = u32::try_from((id % 60) + 1).expect("account id fits u32");
+                let start = Instant::now();
+                let _ = risk.cancel_reservation(OrderId(id), AccountId(acct_id));
+                let ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                total_ns += u128::from(ns);
+                worst_ns = worst_ns.max(ns);
+            }
+            let mean = total_ns / samples_u128;
+            println!(
+                "risk_bench op=cancel index=reservation occupancy={target} samples={SAMPLES} mean_ns={mean} max_ns={worst_ns} engine_bytes={engine_bytes} allocations=0 deallocations=0 checksum=0",
+            );
+        }
+
+        // settle (settle remaining)
+        {
+            let mut total_ns = 0_u128;
+            let mut worst_ns = 0_u64;
+            for i in 0..SAMPLES {
+                let id = target - i as u64;
+                let start = Instant::now();
+                let _ = risk.settle(OrderId(id), Quantity(1));
+                let ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                total_ns += u128::from(ns);
+                worst_ns = worst_ns.max(ns);
+            }
+            let mean = total_ns / samples_u128;
+            println!(
+                "risk_bench op=settle index=reservation occupancy={target} samples={SAMPLES} mean_ns={mean} max_ns={worst_ns} engine_bytes={engine_bytes} allocations=0 deallocations=0 checksum=0",
+            );
+        }
+
+        // reject (check_and_reserve with oversized quantity)
+        {
+            let mut total_ns = 0_u128;
+            let mut worst_ns = 0_u64;
+            for i in 0..SAMPLES {
+                let new_id = target + i as u64 + 10_000;
+                let acct_id = u32::try_from((new_id % 60) + 1).expect("account id fits u32");
+                let start = Instant::now();
+                let _ = risk.check_and_reserve(NewOrder {
+                    order_id: OrderId(new_id),
+                    account_id: AccountId(acct_id),
+                    instrument_id: InstrumentId(1),
+                    price: PriceTicks(100),
+                    quantity: Quantity(100_001),
+                    sequence: SequenceNumber(new_id),
+                    side: Side::Buy,
+                });
+                let ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                total_ns += u128::from(ns);
+                worst_ns = worst_ns.max(ns);
+            }
+            let mean = total_ns / samples_u128;
+            println!(
+                "risk_bench op=reject index=reservation occupancy={target} samples={SAMPLES} mean_ns={mean} max_ns={worst_ns} engine_bytes={engine_bytes} allocations=0 deallocations=0 checksum=0",
+            );
+        }
+    }
+
+    // Account index occupancy sweeps: 6, 32, 57 (≈90 % of 64).
+    for &target in &[6_u32, 32, 57] {
+        let mut risk = RiskEngine::<ACCOUNT_CAPACITY, ORDER_CAPACITY>::new();
+        for acct in 1..=target {
+            risk.register_account(AccountId(acct), wide)
+                .expect("register account");
+        }
+        {
+            let mut total_ns = 0_u128;
+            let mut worst_ns = 0_u64;
+            for i in 0..SAMPLES {
+                let acct = (u32::try_from(i).expect("i fits u32") % target) + 1;
+                let start = Instant::now();
+                let _ = risk.account_snapshot(AccountId(acct));
+                let ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                total_ns += u128::from(ns);
+                worst_ns = worst_ns.max(ns);
+            }
+            let mean = total_ns / samples_u128;
+            println!(
+                "risk_bench op=account_lookup index=account occupancy={target} samples={SAMPLES} mean_ns={mean} max_ns={worst_ns} engine_bytes={engine_bytes} allocations=0 deallocations=0 checksum=0",
+            );
+        }
+    }
+
+    let alloc_after = ALLOCATIONS.load(Ordering::SeqCst);
+    let dealloc_after = DEALLOCATIONS.load(Ordering::SeqCst);
+    assert_eq!(alloc_after, alloc_before, "risk bench allocation");
+    assert_eq!(dealloc_after, dealloc_before, "risk bench deallocation");
 }
 
 fn cancel_benchmark() {

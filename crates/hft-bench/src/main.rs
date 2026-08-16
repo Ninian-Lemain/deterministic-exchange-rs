@@ -485,13 +485,9 @@ fn price_scenario<const L: usize, const O: usize>(
     samples: usize,
     samples_u128: u128,
 ) {
-    let make_book = || -> Box<hft_book::OrderBook<L, O>> {
-        Box::new(hft_book::OrderBook::<L, O>::new(InstrumentId(1)))
-    };
-
     // --- submit_cross: populate asks then time a buy crossing all of them ---
     {
-        let mut book = make_book();
+        let mut book = hft_book::OrderBook::<L, O>::new(InstrumentId(1));
         let mut reports = ReportBuffer::<1>::new();
         for i in 0..active {
             let price = 100 + i64::try_from(i).expect("price fits i64");
@@ -541,7 +537,7 @@ fn price_scenario<const L: usize, const O: usize>(
 
     // --- discovery: populate asks with high qty, time a single-unit buy ---
     {
-        let mut book = make_book();
+        let mut book = hft_book::OrderBook::<L, O>::new(InstrumentId(1));
         let mut reports = ReportBuffer::<1>::new();
         for i in 0..active {
             let price = 100 + i64::try_from(i).expect("price fits i64");
@@ -591,7 +587,7 @@ fn price_scenario<const L: usize, const O: usize>(
 
     // --- level_create: time resting into new levels ---
     {
-        let mut book = make_book();
+        let mut book = hft_book::OrderBook::<L, O>::new(InstrumentId(1));
         let mut reports = ReportBuffer::<1>::new();
         for i in 0..active.min(8) {
             let price = 200 + i64::try_from(i).expect("price fits i64");

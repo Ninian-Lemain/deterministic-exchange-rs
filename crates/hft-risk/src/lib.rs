@@ -58,63 +58,62 @@ enum ProbeError {
 
 /// Fixed-capacity open-addressed `u64 -> V` index with linear probing and
 /// deterministic back-shift deletion. Values are stable storage handles;
-/// occupancy can never exceed half the slot capacity.
+/// occupancy can never exceed half the slot capacity. The planes exist as a
+/// nested array because stable Rust cannot express `PLANE * PLANES` as one
+/// array length over const generics.
 #[derive(Debug)]
 struct ProbeIndex<V: Copy, const PLANE: usize, const PLANES: usize> {
     slots: [[IndexSlot<V>; PLANE]; PLANES],
 }
 
 impl<V: Copy, const PLANE: usize, const PLANES: usize> ProbeIndex<V, PLANE, PLANES> {
+    const CAPACITY: usize = PLANE * PLANES;
+
     const fn new() -> Self {
         Self {
             slots: [[IndexSlot::Empty; PLANE]; PLANES],
         }
     }
 
-    const fn capacity() -> Option<usize> {
-        PLANE.checked_mul(PLANES)
+    /// Flat-index coordinates. Callers only pass indices below `CAPACITY`.
+    fn coordinates(flat_index: usize) -> (usize, usize) {
+        debug_assert!(flat_index < Self::CAPACITY);
+        (flat_index / PLANE, flat_index % PLANE)
     }
 
-    fn coordinates(flat_index: usize) -> Option<(usize, usize)> {
-        if PLANE == 0 {
-            return None;
-        }
-        Some((flat_index / PLANE, flat_index % PLANE))
+    fn slot(&self, flat_index: usize) -> &IndexSlot<V> {
+        let (plane, within) = Self::coordinates(flat_index);
+        &self.slots[plane][within]
     }
 
-    fn slot(&self, flat_index: usize) -> Option<&IndexSlot<V>> {
-        let (plane, within) = Self::coordinates(flat_index)?;
-        self.slots.get(plane)?.get(within)
+    fn slot_mut(&mut self, flat_index: usize) -> &mut IndexSlot<V> {
+        let (plane, within) = Self::coordinates(flat_index);
+        &mut self.slots[plane][within]
     }
 
-    fn slot_mut(&mut self, flat_index: usize) -> Option<&mut IndexSlot<V>> {
-        let (plane, within) = Self::coordinates(flat_index)?;
-        self.slots.get_mut(plane)?.get_mut(within)
-    }
-
-    fn probe_start(key: u64, capacity: usize) -> usize {
-        let capacity_u64 = u64::try_from(capacity).unwrap_or(u64::MAX);
+    /// Probing requires a non-zero capacity; callers guard `CAPACITY == 0`.
+    fn probe_start(key: u64) -> usize {
+        let capacity = u64::try_from(Self::CAPACITY).unwrap_or(u64::MAX);
         let mixed = key.wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        usize::try_from(mixed % capacity_u64).unwrap_or(0)
+        usize::try_from(mixed % capacity).unwrap_or(0)
     }
 
-    fn probe_distance(home: usize, current: usize, capacity: usize) -> usize {
+    fn probe_distance(home: usize, current: usize) -> usize {
         if current >= home {
             current - home
         } else {
-            capacity - (home - current)
+            Self::CAPACITY - (home - current)
         }
     }
 
     fn find_slot(&self, key: u64) -> Option<usize> {
-        let capacity = Self::capacity()?;
-        if capacity == 0 {
+        if Self::CAPACITY == 0 {
             return None;
         }
-        let start = Self::probe_start(key, capacity);
-        for offset in 0..capacity {
-            let flat_index = start.wrapping_add(offset) % capacity;
-            match self.slot(flat_index)? {
+        let start = Self::probe_start(key);
+        for offset in 0..Self::CAPACITY {
+            let flat_index = start.wrapping_add(offset) % Self::CAPACITY;
+            match self.slot(flat_index) {
                 IndexSlot::Empty => return None,
                 IndexSlot::Occupied { key: indexed, .. } if *indexed == key => {
                     return Some(flat_index);
@@ -126,28 +125,26 @@ impl<V: Copy, const PLANE: usize, const PLANES: usize> ProbeIndex<V, PLANE, PLAN
     }
 
     fn lookup(&self, key: u64) -> Option<V> {
-        match self.slot(self.find_slot(key)?)? {
+        match self.slot(self.find_slot(key)?) {
             IndexSlot::Occupied { value, .. } => Some(*value),
             IndexSlot::Empty => None,
         }
     }
 
     fn insert(&mut self, key: u64, value: V) -> Result<u32, ProbeError> {
-        let capacity = Self::capacity().ok_or(ProbeError::Full)?;
-        if capacity == 0 {
+        if Self::CAPACITY == 0 {
             return Err(ProbeError::Full);
         }
-        let start = Self::probe_start(key, capacity);
-        for offset in 0..capacity {
-            let flat_index = start.wrapping_add(offset) % capacity;
-            match *self.slot(flat_index).ok_or(ProbeError::Full)? {
+        let start = Self::probe_start(key);
+        for offset in 0..Self::CAPACITY {
+            let flat_index = start.wrapping_add(offset) % Self::CAPACITY;
+            match self.slot(flat_index) {
                 IndexSlot::Empty => {
                     let flat_u32 = u32::try_from(flat_index).map_err(|_| ProbeError::Full)?;
-                    *self.slot_mut(flat_index).ok_or(ProbeError::Full)? =
-                        IndexSlot::Occupied { key, value };
+                    *self.slot_mut(flat_index) = IndexSlot::Occupied { key, value };
                     return Ok(flat_u32);
                 }
-                IndexSlot::Occupied { key: indexed, .. } if indexed == key => {
+                IndexSlot::Occupied { key: indexed, .. } if *indexed == key => {
                     return Err(ProbeError::Duplicate);
                 }
                 IndexSlot::Occupied { .. } => {}
@@ -158,6 +155,7 @@ impl<V: Copy, const PLANE: usize, const PLANES: usize> ProbeIndex<V, PLANE, PLAN
 
     /// Removes `key` at `flat_index` and closes the probe hole by shifting
     /// displaced entries back, reporting each move through `update_moved`.
+    /// Fails closed on a stale handle.
     fn remove_at(
         &mut self,
         flat_index: u32,
@@ -165,40 +163,41 @@ impl<V: Copy, const PLANE: usize, const PLANES: usize> ProbeIndex<V, PLANE, PLAN
         mut update_moved: impl FnMut(u64, V, u32) -> bool,
     ) -> Option<V> {
         let flat_index = usize::try_from(flat_index).ok()?;
+        if flat_index >= Self::CAPACITY {
+            return None;
+        }
         let IndexSlot::Occupied {
             key: indexed,
             value,
-        } = *self.slot(flat_index)?
+        } = *self.slot(flat_index)
         else {
             return None;
         };
         if indexed != key {
             return None;
         }
-        let capacity = Self::capacity()?;
         let mut hole = flat_index;
-        let mut candidate = hole.wrapping_add(1) % capacity;
+        let mut candidate = hole.wrapping_add(1) % Self::CAPACITY;
         loop {
-            let entry = *self.slot(candidate)?;
+            let entry = *self.slot(candidate);
             let IndexSlot::Occupied {
                 key: candidate_key,
                 value: candidate_value,
             } = entry
             else {
-                *self.slot_mut(hole)? = IndexSlot::Empty;
+                *self.slot_mut(hole) = IndexSlot::Empty;
                 break;
             };
-            let home_bucket = Self::probe_start(candidate_key, capacity);
-            if Self::probe_distance(home_bucket, hole, capacity)
-                < Self::probe_distance(home_bucket, candidate, capacity)
+            let home_bucket = Self::probe_start(candidate_key);
+            if Self::probe_distance(home_bucket, hole)
+                < Self::probe_distance(home_bucket, candidate)
             {
-                *self.slot_mut(hole)? = entry;
-                let new_flat = u32::try_from(hole).ok()?;
-                let updated = update_moved(candidate_key, candidate_value, new_flat);
-                debug_assert!(updated);
+                *self.slot_mut(hole) = entry;
+                let new_flat = u32::try_from(hole).expect("occupied slots fit u32");
+                debug_assert!(update_moved(candidate_key, candidate_value, new_flat));
                 hole = candidate;
             }
-            candidate = candidate.wrapping_add(1) % capacity;
+            candidate = candidate.wrapping_add(1) % Self::CAPACITY;
         }
         Some(value)
     }
@@ -270,8 +269,8 @@ impl<const ACCOUNTS: usize, const ORDERS: usize> RiskEngine<ACCOUNTS, ORDERS> {
     }
 
     /// Removes a live reservation from the index and returns its slot to the
-    /// free list.
-    fn release_reservation(&mut self, slot: usize, reservation: Reservation) -> Option<()> {
+    /// free list. Infallible for a reservation resolved by `live_reservation`.
+    fn release_reservation(&mut self, slot: usize, reservation: Reservation) {
         let reservations = &mut self.reservations;
         let removed = self.reservation_index.remove_at(
             reservation.index_slot,
@@ -286,15 +285,12 @@ impl<const ACCOUNTS: usize, const ORDERS: usize> RiskEngine<ACCOUNTS, ORDERS> {
                 moved.index_slot = new_flat;
                 true
             },
-        )?;
-        if removed != slot {
-            return None;
-        }
+        );
+        debug_assert_eq!(removed, Some(slot));
         self.reservations[slot] = ReservationSlot::Free {
             next_free: self.reservation_free_head,
         };
         self.reservation_free_head = slot;
-        Some(())
     }
 
     /// # Errors
@@ -431,34 +427,27 @@ impl<const ACCOUNTS: usize, const ORDERS: usize> RiskEngine<ACCOUNTS, ORDERS> {
         if filled_quantity.0 > reservation.quantity.0 {
             return Err(RejectReason::InvalidQuantity);
         }
+        self.settle_reservation(reservation_slot, reservation, filled_quantity)
+    }
+
+    /// Settles a located reservation: the filled quantity becomes settled
+    /// position and the full remaining reservation is released.
+    fn settle_reservation(
+        &mut self,
+        reservation_slot: usize,
+        reservation: Reservation,
+        filled_quantity: Quantity,
+    ) -> Result<(), RejectReason> {
         let account_slot = self
             .account_slot(reservation.account_id)
             .ok_or(RejectReason::UnknownAccount)?;
         let account = self.accounts[account_slot].ok_or(RejectReason::UnknownAccount)?;
-        let (settled_position, reserved_buys, reserved_sells) = match reservation.side {
-            Side::Buy => (
-                account
-                    .settled_position
-                    .checked_add(i128::from(filled_quantity.0))
-                    .ok_or(RejectReason::ArithmeticOverflow)?,
-                account
-                    .reserved_buys
-                    .checked_sub(u128::from(reservation.quantity.0))
-                    .ok_or(RejectReason::ArithmeticOverflow)?,
-                account.reserved_sells,
-            ),
-            Side::Sell => (
-                account
-                    .settled_position
-                    .checked_sub(i128::from(filled_quantity.0))
-                    .ok_or(RejectReason::ArithmeticOverflow)?,
-                account.reserved_buys,
-                account
-                    .reserved_sells
-                    .checked_sub(u128::from(reservation.quantity.0))
-                    .ok_or(RejectReason::ArithmeticOverflow)?,
-            ),
-        };
+        let (settled_position, reserved_buys, reserved_sells) = exposure_after_fill(
+            &account,
+            reservation.side,
+            filled_quantity.0,
+            reservation.quantity.0,
+        )?;
         let open_orders = account
             .open_orders
             .checked_sub(1)
@@ -470,8 +459,7 @@ impl<const ACCOUNTS: usize, const ORDERS: usize> RiskEngine<ACCOUNTS, ORDERS> {
             open_orders,
             ..account
         });
-        self.release_reservation(reservation_slot, reservation)
-            .ok_or(RejectReason::ArithmeticOverflow)?;
+        self.release_reservation(reservation_slot, reservation);
         Ok(())
     }
 
@@ -503,30 +491,12 @@ impl<const ACCOUNTS: usize, const ORDERS: usize> RiskEngine<ACCOUNTS, ORDERS> {
             .account_slot(reservation.account_id)
             .ok_or(RejectReason::UnknownAccount)?;
         let account = self.accounts[account_slot].ok_or(RejectReason::UnknownAccount)?;
-        let (settled_position, reserved_buys, reserved_sells) = match reservation.side {
-            Side::Buy => (
-                account
-                    .settled_position
-                    .checked_add(i128::from(filled_quantity.0))
-                    .ok_or(RejectReason::ArithmeticOverflow)?,
-                account
-                    .reserved_buys
-                    .checked_sub(u128::from(filled_quantity.0))
-                    .ok_or(RejectReason::ArithmeticOverflow)?,
-                account.reserved_sells,
-            ),
-            Side::Sell => (
-                account
-                    .settled_position
-                    .checked_sub(i128::from(filled_quantity.0))
-                    .ok_or(RejectReason::ArithmeticOverflow)?,
-                account.reserved_buys,
-                account
-                    .reserved_sells
-                    .checked_sub(u128::from(filled_quantity.0))
-                    .ok_or(RejectReason::ArithmeticOverflow)?,
-            ),
-        };
+        let (settled_position, reserved_buys, reserved_sells) = exposure_after_fill(
+            &account,
+            reservation.side,
+            filled_quantity.0,
+            filled_quantity.0,
+        )?;
         let open_orders = if reservation.quantity.0 == 0 {
             account
                 .open_orders
@@ -543,8 +513,7 @@ impl<const ACCOUNTS: usize, const ORDERS: usize> RiskEngine<ACCOUNTS, ORDERS> {
             ..account
         });
         if reservation.quantity.0 == 0 {
-            self.release_reservation(reservation_slot, reservation)
-                .ok_or(RejectReason::ArithmeticOverflow)?;
+            self.release_reservation(reservation_slot, reservation);
         } else {
             self.reservations[reservation_slot] = ReservationSlot::Live(reservation);
         }
@@ -576,12 +545,14 @@ impl<const ACCOUNTS: usize, const ORDERS: usize> RiskEngine<ACCOUNTS, ORDERS> {
         order_id: OrderId,
         account_id: AccountId,
     ) -> Result<Quantity, RejectReason> {
-        self.can_cancel(order_id, account_id)?;
-        let remaining = self
-            .live_reservation(order_id)
-            .map(|(_, reservation)| reservation.quantity)
-            .ok_or(RejectReason::UnknownOrder)?;
-        self.settle(order_id, Quantity(0))?;
+        let Some((reservation_slot, reservation)) = self.live_reservation(order_id) else {
+            return Err(RejectReason::UnknownOrder);
+        };
+        if reservation.account_id != account_id {
+            return Err(RejectReason::NotOrderOwner);
+        }
+        let remaining = reservation.quantity;
+        self.settle_reservation(reservation_slot, reservation, Quantity(0))?;
         Ok(remaining)
     }
 
@@ -595,50 +566,16 @@ impl<const ACCOUNTS: usize, const ORDERS: usize> RiskEngine<ACCOUNTS, ORDERS> {
         );
         for account in self.accounts.iter().flatten() {
             mix(&mut digest, u64::from(account.id.0));
-            let position_bytes = account.settled_position.to_be_bytes();
-            mix(
-                &mut digest,
-                u64::from_be_bytes([
-                    position_bytes[0],
-                    position_bytes[1],
-                    position_bytes[2],
-                    position_bytes[3],
-                    position_bytes[4],
-                    position_bytes[5],
-                    position_bytes[6],
-                    position_bytes[7],
-                ]),
-            );
+            // 128-bit values mix as canonical big-endian high/low lanes so the
+            // digest is identical across CPU byte orders.
+            let position = account.settled_position.to_be_bytes();
+            mix(&mut digest, be_high(&position));
             for exposure in [account.reserved_buys, account.reserved_sells] {
                 let bytes = exposure.to_be_bytes();
-                mix(
-                    &mut digest,
-                    u64::from_be_bytes([
-                        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
-                        bytes[7],
-                    ]),
-                );
-                mix(
-                    &mut digest,
-                    u64::from_be_bytes([
-                        bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14],
-                        bytes[15],
-                    ]),
-                );
+                mix(&mut digest, be_high(&bytes));
+                mix(&mut digest, be_low(&bytes));
             }
-            mix(
-                &mut digest,
-                u64::from_be_bytes([
-                    position_bytes[8],
-                    position_bytes[9],
-                    position_bytes[10],
-                    position_bytes[11],
-                    position_bytes[12],
-                    position_bytes[13],
-                    position_bytes[14],
-                    position_bytes[15],
-                ]),
-            );
+            mix(&mut digest, be_low(&position));
             mix(&mut digest, u64::from(account.open_orders));
             mix(&mut digest, u64::from(account.killed));
         }
@@ -670,6 +607,38 @@ impl<const ACCOUNTS: usize, const ORDERS: usize> Default for RiskEngine<ACCOUNTS
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Post-fill account totals for one reservation side: `filled` becomes
+/// settled position and `released` leaves the reserved total.
+fn exposure_after_fill(
+    account: &AccountState,
+    side: Side,
+    filled: u64,
+    released: u64,
+) -> Result<(i128, u128, u128), RejectReason> {
+    let settled_position = match side {
+        Side::Buy => account.settled_position.checked_add(i128::from(filled)),
+        Side::Sell => account.settled_position.checked_sub(i128::from(filled)),
+    }
+    .ok_or(RejectReason::ArithmeticOverflow)?;
+    let (reserved_buys, reserved_sells) = match side {
+        Side::Buy => (
+            account
+                .reserved_buys
+                .checked_sub(u128::from(released))
+                .ok_or(RejectReason::ArithmeticOverflow)?,
+            account.reserved_sells,
+        ),
+        Side::Sell => (
+            account.reserved_buys,
+            account
+                .reserved_sells
+                .checked_sub(u128::from(released))
+                .ok_or(RejectReason::ArithmeticOverflow)?,
+        ),
+    };
+    Ok((settled_position, reserved_buys, reserved_sells))
 }
 
 /// Pure limit evaluation for one order against one account. Returns the
@@ -744,6 +713,14 @@ fn mix(digest: &mut u64, value: u64) {
     *digest = digest.wrapping_mul(0x0000_0100_0000_01b3);
 }
 
+fn be_high(bytes: &[u8; 16]) -> u64 {
+    u64::from_be_bytes(bytes[..8].try_into().expect("eight high bytes"))
+}
+
+fn be_low(bytes: &[u8; 16]) -> u64 {
+    u64::from_be_bytes(bytes[8..].try_into().expect("eight low bytes"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -803,10 +780,10 @@ mod tests {
             let flat = usize::try_from(reservation.index_slot).expect("valid index slot");
             assert_eq!(
                 risk.reservation_index.slot(flat),
-                Some(&IndexSlot::Occupied {
+                &IndexSlot::Occupied {
                     key: reservation.order_id.0,
                     value: slot_index,
-                }),
+                },
                 "index slot points back at the reservation"
             );
             let totals = live_totals.entry(reservation.account_id.0).or_default();
@@ -975,12 +952,11 @@ mod tests {
     #[test]
     fn index_handles_collisions_back_shift_and_slot_reuse() {
         type TestIndex = ProbeIndex<usize, 4, INDEX_PLANES>;
-        let capacity = TestIndex::capacity().expect("nonzero capacity");
-        let home = TestIndex::probe_start(1, capacity);
+        let home = TestIndex::probe_start(1);
         let mut colliding = std::vec::Vec::new();
         let mut candidate = 1_u64;
         while colliding.len() < 4 {
-            if TestIndex::probe_start(candidate, capacity) == home {
+            if TestIndex::probe_start(candidate) == home {
                 colliding.push(candidate);
             }
             candidate += 1;

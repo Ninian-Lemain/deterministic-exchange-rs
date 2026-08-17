@@ -2,6 +2,60 @@
 
 ## Unreleased
 
+## v0.6.0 - 2026-08-17
+
+### Changed
+
+- Replaced the duplicate simulation walk with a compact `MatchPlan`:
+  `build_plan` preflights validation, duplicates, report capacity, level
+  capacity, and liquidity in a single traversal of the sorted-level index, and
+  `apply_plan` performs the mutation walk. Because every fallible condition is
+  decided during preflight against an unchanged book, plan application is
+  infallible; there is no rollback path to test or to get wrong.
+- The crossing walk now stops at the taker's price limit instead of scanning
+  every occupied level, and the resting path finds or allocates price levels
+  through the sorted-level index (binary search plus a free-slot pool) instead
+  of linear scans over the level array.
+- Level removal from the sorted index is a binary search instead of a linear
+  scan, and order-index and risk-index slot math no longer re-derives
+  coordinates through fallible helpers.
+- `RiskEngine::cancel_reservation` resolves a reservation once instead of
+  three times, and fill/settle exposure accounting shares one helper.
+- Fixed the risk benchmark: fill, cancel, and settle now measure live
+  reservations on freshly populated engines. The previous harness closed the
+  reservations in its fill loop and then measured `UnknownOrder` rejections
+  for the cancel and settle cells.
+- Removed the dead `ReportBuffer::pop` (only the removed rollback path used
+  it). Public APIs are unchanged.
+
+### Added
+
+- Book invariant coverage for duplicate-ID rejection atomicity, crossing stops
+  at the price limit, partial-cross-then-rest price-time order, exact report
+  capacity fit, emptied-level slot reuse, and full-book rest rejection.
+- The level-index consistency check now verifies that occupied and free level
+  slots partition the level array exactly once.
+- Added a match-plan benchmark measuring non-crossing, single/multi-fill,
+  report-full rejection, and deep rejection across 2,000 samples each.
+
+### Performance
+
+- Cancel benchmark: 546 ns to 56-89 ns per cancel (binary-search level
+  removal).
+- Price benchmark: level creation 418 ns to 75-147 ns mean and discovery
+  145 ns to 73-157 ns mean on the 128-level/120-active shape (early crossing
+  stop, indexed level allocation).
+- Match-plan submit latency is 72-146 ns mean across non-crossing,
+  single/multi-fill, and both rejection scenarios. Zero measured allocations
+  and unchanged logical digest `64321af91735b704`. See `docs/PERFORMANCE.md`.
+
+### Verification
+
+- `cargo fmt --all --check`
+- `cargo check --workspace --all-targets --all-features`
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- `cargo test --workspace --all-features`
+
 ## v0.5.0 - 2026-08-16
 
 ### Changed

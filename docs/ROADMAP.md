@@ -94,22 +94,24 @@ measured 76-86 ns mean discovery latency across sparse and dense book shapes
 with zero allocations and unchanged logical digest. Best-price and risk lookup
 are now O(1) with respect to level count.
 
-## Next
-
 ### v0.6.0 - Matching Transaction Plan
 
-- **Purpose / scope:** compare full simulation with compact match plans, precise
-  report bounds, and fixed-capacity rollback metadata to avoid duplicate walks.
-- **Invariants / tests:** capacity rejection is atomic; quantity is conserved;
-  each maker appears once; plan application equals the reference matcher;
-  failures after each report append or mutation restore the book, report buffer,
-  reservation state, and plan metadata; success commits them together.
-- **Benchmarks:** non-crossing, single/multi-fill, report-full, and deep rejection;
-  record traversal count, branches, latency, allocations, and metadata size.
-- **Exit:** adopt a design only if failure atomicity holds and target workloads
-  improve.
-- **Dependencies / limits:** requires v0.3 and v0.5; FOK still needs complete
-  liquidity proof.
+A `MatchPlan` of bounded fills and resting quantity replaces the second
+simulation walk: `build_plan` preflights validation, duplicates, report
+capacity, level capacity, and liquidity with a single traversal of the
+sorted-level index that stops at the taker's price limit; `apply_plan`
+performs the mutation walk. Because preflight decides every fallible condition
+against an unchanged book, plan application is infallible and there is no
+rollback path. The resting path finds or allocates price levels through the
+sorted-level index (binary search plus a free-slot pool); level removal from
+the index is also a binary search. Capacity rejection is atomic; quantity is
+conserved; each maker appears once; plan application equals the reference
+matcher. A match-plan benchmark measures non-crossing, single/multi-fill,
+report-full rejection, and deep rejection at 72-115 ns mean with zero
+allocations and unchanged logical digest. See the
+[performance methodology](PERFORMANCE.md) for the workload and evidence.
+
+## Next
 
 ### v0.7.0 - Property and Reference Models
 

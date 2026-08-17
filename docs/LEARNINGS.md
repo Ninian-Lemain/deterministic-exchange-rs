@@ -24,11 +24,47 @@ jitter. They also require explicit behavior for exhaustion. Every full
 condition therefore rejects or returns backpressure without overwriting live
 state.
 
-## Preflight Protects Transactionality
+## Complete Preflight Beats Rollback
 
-The book calculates report and resting capacity before matching. Without this
-preflight, a capacity error could occur after makers were already mutated. The
-gateway also releases a taker reservation when the book rejects it.
+The book originally paired its preflight with a fixed-capacity undo log so a
+late failure could roll a match back. Auditing the failure set showed the log
+was dead code: validation, duplicates, report capacity, and level capacity are
+all decidable before the first mutation, and nothing else runs between the
+plan and the apply. Deleting the rollback removed an entire class of
+restore-the-world bugs (the undo path itself contained silent-failure spots)
+and replaced it with one reviewable rule: preflight is complete, application
+is infallible. The gateway still releases a taker reservation when the book
+rejects it, because that rejection crosses a crate boundary.
+
+## Sorted Indices Need Their Own Slot Pool
+
+Adding a sorted-level index made best-price discovery O(1), but the resting
+path still scanned the level array linearly to find a price or a free slot,
+which quietly kept order insertion O(levels). The fix was to make the index
+own the whole lifecycle: binary search for prices, and a free-slot pool so
+allocation and removal never scan. A data structure that only speeds up reads
+while writes keep scanning is half an index.
+
+## Defensive Code Must Fail Closed or Not Exist
+
+Several index helpers returned `Option` for conditions that were impossible by
+construction, and two removal paths returned an error *after* mutating state,
+which would have corrupted the book had they ever fired. Unreachable branches
+that corrupt on the way out are worse than assertions: they look like error
+handling but protect nothing. The rule now is that internal invariants get
+`debug_assert`/`expect` with the invariant named, stale external handles fail
+closed before any mutation, and there is no third category.
+
+## Benchmarks Must Measure Live Work
+
+The risk occupancy harness populated reservations, ran a fill loop that
+closed them, and then "measured" cancel and settle against the same IDs. Those
+cells measured `UnknownOrder` rejections, not live work, and the smallest
+occupancy underflowed the ID arithmetic entirely. Destructive operations now
+run against freshly populated engines, one live reservation per sample. A
+benchmark that compiles and prints plausible numbers can still be measuring
+the wrong path; every measured operation needs an assertion that it did the
+intended work.
 
 ## Identity Lookup Should Not Scale with Book Occupancy
 

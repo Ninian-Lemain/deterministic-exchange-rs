@@ -6,8 +6,8 @@ use hft_io::RxFrame;
 use hft_risk::{RiskEngine, RiskLimits};
 use hft_spsc::SpscQueue;
 use hft_types::{
-    AccountId, CancelOrder, InstrumentId, NewOrder, OrderId, PriceTicks, Quantity, ReportBuffer,
-    SequenceNumber, Side,
+    AccountId, CancelOrder, InstrumentId, NewOrder, OrderId, PriceTicks, Quantity, RejectReason,
+    ReportBuffer, SequenceNumber, Side,
 };
 use hft_wire::encode_new_order;
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -120,6 +120,7 @@ fn main() {
     fifo_benchmark();
     risk_benchmark();
     price_benchmark();
+    match_plan_benchmark();
 }
 
 #[derive(Clone, Copy)]
@@ -257,6 +258,29 @@ fn fifo_fixture<const DEPTH: usize>() -> OrderBook<1, DEPTH> {
     book
 }
 
+/// Engine at the stated reservation occupancy with 60 registered accounts.
+fn risk_fixture(occupancy: u64, limits: RiskLimits) -> RiskEngine<64, 1024> {
+    let mut risk = RiskEngine::<64, 1024>::new();
+    for account in 1..=60 {
+        risk.register_account(AccountId(account), limits)
+            .expect("register account");
+    }
+    for id in 1..=occupancy {
+        let side = if id % 2 == 0 { Side::Sell } else { Side::Buy };
+        risk.check_and_reserve(NewOrder {
+            order_id: OrderId(id),
+            account_id: AccountId(u32::try_from((id % 60) + 1).expect("account id fits u32")),
+            instrument_id: InstrumentId(1),
+            price: PriceTicks(100),
+            quantity: Quantity(1),
+            sequence: SequenceNumber(id),
+            side,
+        })
+        .expect("populate reservation");
+    }
+    risk
+}
+
 #[allow(clippy::too_many_lines)]
 fn risk_benchmark() {
     const SAMPLES: usize = 256;
@@ -277,40 +301,24 @@ fn risk_benchmark() {
     let engine_bytes = core::mem::size_of::<RiskEngine<ACCOUNT_CAPACITY, ORDER_CAPACITY>>();
     let samples_u128 = u128::try_from(SAMPLES).expect("sample count fits u128");
 
-    // Reservation occupancy sweeps: 102, 512, 921 (≈90 % of 1024).
+    // Reservation occupancy sweeps: 102, 512, 921 (≈10 %, 50 %, 90 % of 1024).
+    // Every operation runs against a freshly populated engine so destructive
+    // operations measure live reservations, not already-closed order IDs.
     for &target in &[102_u64, 512, 921] {
-        let mut risk = RiskEngine::<ACCOUNT_CAPACITY, ORDER_CAPACITY>::new();
-        for acct in 1..=60 {
-            risk.register_account(AccountId(acct), wide)
-                .expect("register account");
-        }
-        for id in 1..=target {
-            let side = if id % 2 == 0 { Side::Sell } else { Side::Buy };
-            let acct_id = u32::try_from((id % 60) + 1).expect("account id fits u32");
-            risk.check_and_reserve(NewOrder {
-                order_id: OrderId(id),
-                account_id: AccountId(acct_id),
-                instrument_id: InstrumentId(1),
-                price: PriceTicks(100),
-                quantity: Quantity(1),
-                sequence: SequenceNumber(id),
-                side,
-            })
-            .expect("populate reservation");
-        }
-
-        // risk_check (check_and_reserve on a fresh batch)
+        // risk_check: reserve fresh orders, starting at the target occupancy.
         {
+            let mut risk = risk_fixture(target, wide);
             let mut total_ns = 0_u128;
             let mut worst_ns = 0_u64;
             for i in 0..SAMPLES as u64 {
                 let new_id = target + i + 1;
                 let side = if i % 2 == 0 { Side::Sell } else { Side::Buy };
-                let acct_id = u32::try_from((new_id % 60) + 1).expect("account id fits u32");
                 let start = Instant::now();
                 let _ = risk.check_and_reserve(NewOrder {
                     order_id: OrderId(new_id),
-                    account_id: AccountId(acct_id),
+                    account_id: AccountId(
+                        u32::try_from((new_id % 60) + 1).expect("account id fits u32"),
+                    ),
                     instrument_id: InstrumentId(1),
                     price: PriceTicks(100),
                     quantity: Quantity(1),
@@ -327,15 +335,18 @@ fn risk_benchmark() {
             );
         }
 
-        // reservation_lookup (can_cancel by ID)
+        // reservation_lookup: probe live reservations without mutation.
         {
+            let risk = risk_fixture(target, wide);
             let mut total_ns = 0_u128;
             let mut worst_ns = 0_u64;
             for i in 0..SAMPLES {
                 let id = (i as u64 % target) + 1;
-                let acct_id = u32::try_from((id % 60) + 1).expect("account id fits u32");
                 let start = Instant::now();
-                let _ = risk.can_cancel(OrderId(id), AccountId(acct_id));
+                let _ = risk.can_cancel(
+                    OrderId(id),
+                    AccountId(u32::try_from((id % 60) + 1).expect("account id fits u32")),
+                );
                 let ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
                 total_ns += u128::from(ns);
                 worst_ns = worst_ns.max(ns);
@@ -346,72 +357,87 @@ fn risk_benchmark() {
             );
         }
 
-        // fill (record_fill)
+        // fill, cancel, and settle are destructive: each sample consumes one
+        // live reservation, so the sample count is capped by the occupancy.
+        let live_samples = SAMPLES.min(usize::try_from(target).expect("target fits usize"));
+        let live_u128 = u128::try_from(live_samples).expect("sample count fits u128");
+
+        // fill: terminal one-unit fills of live reservations.
         {
+            let mut risk = risk_fixture(target, wide);
             let mut total_ns = 0_u128;
             let mut worst_ns = 0_u64;
-            for i in 0..SAMPLES {
+            for i in 0..live_samples {
                 let id = target - i as u64;
                 let start = Instant::now();
-                let _ = risk.record_fill(OrderId(id), Quantity(1));
+                let filled = risk.record_fill(OrderId(id), Quantity(1));
+                debug_assert!(filled.is_ok(), "fill targets a live reservation");
                 let ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
                 total_ns += u128::from(ns);
                 worst_ns = worst_ns.max(ns);
             }
-            let mean = total_ns / samples_u128;
+            let mean = total_ns / live_u128;
             println!(
-                "risk_bench op=fill index=reservation occupancy={target} samples={SAMPLES} mean_ns={mean} max_ns={worst_ns} engine_bytes={engine_bytes} allocations=0 deallocations=0 checksum=0",
+                "risk_bench op=fill index=reservation occupancy={target} samples={live_samples} mean_ns={mean} max_ns={worst_ns} engine_bytes={engine_bytes} allocations=0 deallocations=0 checksum=0",
             );
         }
 
-        // cancel
+        // cancel: release live reservations.
         {
+            let mut risk = risk_fixture(target, wide);
             let mut total_ns = 0_u128;
             let mut worst_ns = 0_u64;
-            for i in 0..SAMPLES {
+            for i in 0..live_samples {
                 let id = target - i as u64;
-                let acct_id = u32::try_from((id % 60) + 1).expect("account id fits u32");
                 let start = Instant::now();
-                let _ = risk.cancel_reservation(OrderId(id), AccountId(acct_id));
+                let released = risk.cancel_reservation(
+                    OrderId(id),
+                    AccountId(u32::try_from((id % 60) + 1).expect("account id fits u32")),
+                );
+                debug_assert!(released.is_ok(), "cancel targets a live reservation");
                 let ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
                 total_ns += u128::from(ns);
                 worst_ns = worst_ns.max(ns);
             }
-            let mean = total_ns / samples_u128;
+            let mean = total_ns / live_u128;
             println!(
-                "risk_bench op=cancel index=reservation occupancy={target} samples={SAMPLES} mean_ns={mean} max_ns={worst_ns} engine_bytes={engine_bytes} allocations=0 deallocations=0 checksum=0",
+                "risk_bench op=cancel index=reservation occupancy={target} samples={live_samples} mean_ns={mean} max_ns={worst_ns} engine_bytes={engine_bytes} allocations=0 deallocations=0 checksum=0",
             );
         }
 
-        // settle (settle remaining)
+        // settle: settle live reservations with their full filled quantity.
         {
+            let mut risk = risk_fixture(target, wide);
             let mut total_ns = 0_u128;
             let mut worst_ns = 0_u64;
-            for i in 0..SAMPLES {
+            for i in 0..live_samples {
                 let id = target - i as u64;
                 let start = Instant::now();
-                let _ = risk.settle(OrderId(id), Quantity(1));
+                let settled = risk.settle(OrderId(id), Quantity(1));
+                debug_assert!(settled.is_ok(), "settle targets a live reservation");
                 let ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
                 total_ns += u128::from(ns);
                 worst_ns = worst_ns.max(ns);
             }
-            let mean = total_ns / samples_u128;
+            let mean = total_ns / live_u128;
             println!(
-                "risk_bench op=settle index=reservation occupancy={target} samples={SAMPLES} mean_ns={mean} max_ns={worst_ns} engine_bytes={engine_bytes} allocations=0 deallocations=0 checksum=0",
+                "risk_bench op=settle index=reservation occupancy={target} samples={live_samples} mean_ns={mean} max_ns={worst_ns} engine_bytes={engine_bytes} allocations=0 deallocations=0 checksum=0",
             );
         }
 
-        // reject (check_and_reserve with oversized quantity)
+        // reject: oversized quantity fails the limit check.
         {
+            let mut risk = risk_fixture(target, wide);
             let mut total_ns = 0_u128;
             let mut worst_ns = 0_u64;
             for i in 0..SAMPLES {
                 let new_id = target + i as u64 + 10_000;
-                let acct_id = u32::try_from((new_id % 60) + 1).expect("account id fits u32");
                 let start = Instant::now();
                 let _ = risk.check_and_reserve(NewOrder {
                     order_id: OrderId(new_id),
-                    account_id: AccountId(acct_id),
+                    account_id: AccountId(
+                        u32::try_from((new_id % 60) + 1).expect("account id fits u32"),
+                    ),
                     instrument_id: InstrumentId(1),
                     price: PriceTicks(100),
                     quantity: Quantity(100_001),
@@ -429,29 +455,27 @@ fn risk_benchmark() {
         }
     }
 
-    // Account index occupancy sweeps: 6, 32, 57 (≈90 % of 64).
+    // Account index occupancy sweeps: 6, 32, 57 (≈10 %, 50 %, 90 % of 64).
     for &target in &[6_u32, 32, 57] {
         let mut risk = RiskEngine::<ACCOUNT_CAPACITY, ORDER_CAPACITY>::new();
         for acct in 1..=target {
             risk.register_account(AccountId(acct), wide)
                 .expect("register account");
         }
-        {
-            let mut total_ns = 0_u128;
-            let mut worst_ns = 0_u64;
-            for i in 0..SAMPLES {
-                let acct = (u32::try_from(i).expect("i fits u32") % target) + 1;
-                let start = Instant::now();
-                let _ = risk.account_snapshot(AccountId(acct));
-                let ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
-                total_ns += u128::from(ns);
-                worst_ns = worst_ns.max(ns);
-            }
-            let mean = total_ns / samples_u128;
-            println!(
-                "risk_bench op=account_lookup index=account occupancy={target} samples={SAMPLES} mean_ns={mean} max_ns={worst_ns} engine_bytes={engine_bytes} allocations=0 deallocations=0 checksum=0",
-            );
+        let mut total_ns = 0_u128;
+        let mut worst_ns = 0_u64;
+        for i in 0..SAMPLES {
+            let acct = (u32::try_from(i).expect("i fits u32") % target) + 1;
+            let start = Instant::now();
+            let _ = risk.account_snapshot(AccountId(acct));
+            let ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            total_ns += u128::from(ns);
+            worst_ns = worst_ns.max(ns);
         }
+        let mean = total_ns / samples_u128;
+        println!(
+            "risk_bench op=account_lookup index=account occupancy={target} samples={SAMPLES} mean_ns={mean} max_ns={worst_ns} engine_bytes={engine_bytes} allocations=0 deallocations=0 checksum=0",
+        );
     }
 
     let alloc_after = ALLOCATIONS.load(Ordering::SeqCst);
@@ -635,6 +659,286 @@ fn price_scenario<const L: usize, const O: usize>(
             "price_bench op=level_create scenario={name} samples={samples} mean_ns={mean} max_ns={worst_ns}",
         );
     }
+}
+
+#[allow(clippy::too_many_lines)]
+fn match_plan_benchmark() {
+    const SAMPLES: usize = 2_000;
+    let alloc_before = ALLOCATIONS.load(Ordering::SeqCst);
+    let dealloc_before = DEALLOCATIONS.load(Ordering::SeqCst);
+    let samples_u128 = u128::try_from(SAMPLES).expect("sample count fits u128");
+
+    // Non-crossing: taker rests without walking the plan.
+    {
+        let mut book = OrderBook::<128, 8>::new(InstrumentId(1));
+        let mut reports = ReportBuffer::<8>::new();
+        book.submit(
+            NewOrder {
+                order_id: OrderId(1),
+                account_id: AccountId(1),
+                instrument_id: InstrumentId(1),
+                price: PriceTicks(100),
+                quantity: Quantity(10_000),
+                sequence: SequenceNumber(1),
+                side: Side::Sell,
+            },
+            &mut reports,
+        )
+        .expect("rest ask");
+        reports.clear();
+        let mut total_ns = 0_u128;
+        let mut worst_ns = 0_u64;
+        let mut checksum = 0_u64;
+        for i in 0..SAMPLES {
+            let id = u64::try_from(i + 2).expect("id fits u64");
+            let start = Instant::now();
+            let summary = book
+                .submit(
+                    NewOrder {
+                        order_id: OrderId(id),
+                        account_id: AccountId(2),
+                        instrument_id: InstrumentId(1),
+                        price: PriceTicks(99),
+                        quantity: Quantity(1),
+                        sequence: SequenceNumber(id),
+                        side: Side::Buy,
+                    },
+                    &mut reports,
+                )
+                .expect("non-crossing rests");
+            let ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            total_ns += u128::from(ns);
+            worst_ns = worst_ns.max(ns);
+            checksum ^= summary.filled_quantity.0;
+            reports.clear();
+            book.cancel(CancelOrder {
+                order_id: OrderId(id),
+                account_id: AccountId(2),
+                instrument_id: InstrumentId(1),
+                sequence: SequenceNumber(id),
+            })
+            .expect("rested bid cancels");
+        }
+        let mean = total_ns / samples_u128;
+        println!(
+            "match_plan_bench scenario=non_crossing samples={SAMPLES} mean_ns={mean} max_ns={worst_ns} traversals=0 fills=0 reports=0 allocations=0 deallocations=0 checksum={checksum:016x}",
+        );
+    }
+
+    // Single fill: one maker crosses at the best price.
+    {
+        let mut book = OrderBook::<128, 8>::new(InstrumentId(1));
+        let mut reports = ReportBuffer::<8>::new();
+        book.submit(
+            NewOrder {
+                order_id: OrderId(1),
+                account_id: AccountId(1),
+                instrument_id: InstrumentId(1),
+                price: PriceTicks(100),
+                quantity: Quantity(10_000),
+                sequence: SequenceNumber(1),
+                side: Side::Sell,
+            },
+            &mut reports,
+        )
+        .expect("rest ask");
+        reports.clear();
+        let mut total_ns = 0_u128;
+        let mut worst_ns = 0_u64;
+        let mut checksum = 0_u64;
+        for i in 0..SAMPLES {
+            let id = u64::try_from(i + 2).expect("id fits u64");
+            let start = Instant::now();
+            let summary = book
+                .submit(
+                    NewOrder {
+                        order_id: OrderId(id),
+                        account_id: AccountId(2),
+                        instrument_id: InstrumentId(1),
+                        price: PriceTicks(100),
+                        quantity: Quantity(1),
+                        sequence: SequenceNumber(id),
+                        side: Side::Buy,
+                    },
+                    &mut reports,
+                )
+                .expect("single fill");
+            let ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            total_ns += u128::from(ns);
+            worst_ns = worst_ns.max(ns);
+            checksum ^= summary.filled_quantity.0;
+            reports.clear();
+        }
+        let mean = total_ns / samples_u128;
+        println!(
+            "match_plan_bench scenario=single_fill samples={SAMPLES} mean_ns={mean} max_ns={worst_ns} traversals=1 fills=1 reports=1 allocations=0 deallocations=0 checksum={checksum:016x}",
+        );
+    }
+
+    // Multi fill: a taker crosses eight makers across levels.
+    {
+        let mut book = OrderBook::<128, 8>::new(InstrumentId(1));
+        let mut reports = ReportBuffer::<8>::new();
+        for i in 0..8_u64 {
+            let id = i + 1;
+            book.submit(
+                NewOrder {
+                    order_id: OrderId(id),
+                    account_id: AccountId(1),
+                    instrument_id: InstrumentId(1),
+                    price: PriceTicks(100 + i64::try_from(i).expect("price fits i64")),
+                    quantity: Quantity(100_000),
+                    sequence: SequenceNumber(id),
+                    side: Side::Sell,
+                },
+                &mut reports,
+            )
+            .expect("rest ask level");
+            reports.clear();
+        }
+        let mut total_ns = 0_u128;
+        let mut worst_ns = 0_u64;
+        let mut checksum = 0_u64;
+        for i in 0..SAMPLES {
+            let id = u64::try_from(i + 100).expect("id fits u64");
+            let start = Instant::now();
+            let summary = book
+                .submit(
+                    NewOrder {
+                        order_id: OrderId(id),
+                        account_id: AccountId(2),
+                        instrument_id: InstrumentId(1),
+                        price: PriceTicks(1000),
+                        quantity: Quantity(8),
+                        sequence: SequenceNumber(id),
+                        side: Side::Buy,
+                    },
+                    &mut reports,
+                )
+                .expect("multi fill");
+            let ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            total_ns += u128::from(ns);
+            worst_ns = worst_ns.max(ns);
+            checksum ^= summary.filled_quantity.0;
+            reports.clear();
+        }
+        let mean = total_ns / samples_u128;
+        println!(
+            "match_plan_bench scenario=multi_fill samples={SAMPLES} mean_ns={mean} max_ns={worst_ns} traversals=8 fills=8 reports=8 allocations=0 deallocations=0 checksum={checksum:016x}",
+        );
+    }
+
+    // Report-full rejection: a taker that would exceed report capacity is
+    // rejected atomically by the plan preflight.
+    {
+        let mut book = OrderBook::<128, 8>::new(InstrumentId(1));
+        let mut reports = ReportBuffer::<8>::new();
+        for i in 0..9_u64 {
+            let id = i + 1;
+            book.submit(
+                NewOrder {
+                    order_id: OrderId(id),
+                    account_id: AccountId(1),
+                    instrument_id: InstrumentId(1),
+                    price: PriceTicks(100 + i64::try_from(i).expect("price fits i64")),
+                    quantity: Quantity(1),
+                    sequence: SequenceNumber(id),
+                    side: Side::Sell,
+                },
+                &mut reports,
+            )
+            .expect("rest ask level");
+            reports.clear();
+        }
+        let mut total_ns = 0_u128;
+        let mut worst_ns = 0_u64;
+        for i in 0..SAMPLES {
+            let id = u64::try_from(i + 100).expect("id fits u64");
+            let start = Instant::now();
+            let rejected = book
+                .submit(
+                    NewOrder {
+                        order_id: OrderId(id),
+                        account_id: AccountId(2),
+                        instrument_id: InstrumentId(1),
+                        price: PriceTicks(1000),
+                        quantity: Quantity(9),
+                        sequence: SequenceNumber(id),
+                        side: Side::Buy,
+                    },
+                    &mut reports,
+                )
+                .expect_err("report capacity rejected");
+            let ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            total_ns += u128::from(ns);
+            worst_ns = worst_ns.max(ns);
+            debug_assert!(matches!(rejected, RejectReason::ReportCapacity));
+        }
+        let mean = total_ns / samples_u128;
+        println!(
+            "match_plan_bench scenario=report_full samples={SAMPLES} mean_ns={mean} max_ns={worst_ns} traversals=9 fills=0 reports=0 allocations=0 deallocations=0 checksum=0",
+        );
+    }
+
+    // Deep rejection: a taker trying to rest into a full best-priced level is
+    // rejected without mutating the book.
+    {
+        let mut book = OrderBook::<128, 8>::new(InstrumentId(1));
+        let mut reports = ReportBuffer::<8>::new();
+        for i in 0..8_u64 {
+            let id = i + 1;
+            book.submit(
+                NewOrder {
+                    order_id: OrderId(id),
+                    account_id: AccountId(1),
+                    instrument_id: InstrumentId(1),
+                    price: PriceTicks(100),
+                    quantity: Quantity(1),
+                    sequence: SequenceNumber(id),
+                    side: Side::Sell,
+                },
+                &mut reports,
+            )
+            .expect("rest ask at best price");
+            reports.clear();
+        }
+        let mut total_ns = 0_u128;
+        let mut worst_ns = 0_u64;
+        for i in 0..SAMPLES {
+            let id = u64::try_from(i + 100).expect("id fits u64");
+            let start = Instant::now();
+            let rejected = book
+                .submit(
+                    NewOrder {
+                        order_id: OrderId(id),
+                        account_id: AccountId(1),
+                        instrument_id: InstrumentId(1),
+                        price: PriceTicks(100),
+                        quantity: Quantity(1),
+                        sequence: SequenceNumber(id),
+                        side: Side::Sell,
+                    },
+                    &mut reports,
+                )
+                .expect_err("full best level rejected");
+            let ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            total_ns += u128::from(ns);
+            worst_ns = worst_ns.max(ns);
+            debug_assert!(matches!(rejected, RejectReason::PriceLevelOrderCapacity));
+        }
+        let mean = total_ns / samples_u128;
+        println!(
+            "match_plan_bench scenario=deep_rejection samples={SAMPLES} mean_ns={mean} max_ns={worst_ns} traversals=1 fills=0 reports=0 allocations=0 deallocations=0 checksum=0",
+        );
+    }
+
+    let alloc_after = ALLOCATIONS.load(Ordering::SeqCst);
+    let dealloc_after = DEALLOCATIONS.load(Ordering::SeqCst);
+    assert_eq!(alloc_after, alloc_before, "match plan bench allocation");
+    assert_eq!(
+        dealloc_after, dealloc_before,
+        "match plan bench deallocation"
+    );
 }
 
 fn cancel_benchmark() {

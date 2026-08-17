@@ -12,11 +12,11 @@ indexed pre-trade risk -> price-time matching/cancel -> execution reports ->
 replay digest.
 
 Current version: **v0.6.2**, under active development and not production
-ready. The project implements exchange-infrastructure mechanics by hand —
+ready. The project implements exchange-infrastructure mechanics by hand:
 deterministic state transitions, fixed memory layouts, conservative
 pre-trade risk, explicit backpressure, price-time priority, session
-sequencing, replayability, cache-aware cross-core handoff — and holds every
-piece to testable ownership, capacity, and failure invariants. The
+sequencing, replayability, and cache-aware cross-core handoff. Every piece
+is held to testable ownership, capacity, and failure invariants. The
 [roadmap](docs/ROADMAP.md) tracks the remaining correctness, verification,
 and operational milestones toward v1. Nothing here replaces venue
 certification, proprietary feed handlers, or measured kernel-bypass
@@ -63,7 +63,7 @@ never production-latency claims.
 
 ## Memory Layout and Cache Behavior
 
-The latency numbers come from data layout, not algorithmic cleverness:
+The latency numbers below are mostly a product of data layout:
 
 - Every hot-path structure is a fixed-capacity flat array sized at compile
   time: accounts, reservations, orders, price levels, reports, queue slots.
@@ -76,7 +76,7 @@ The latency numbers come from data layout, not algorithmic cleverness:
   O(1) best-price discovery and O(log n) level maintenance without scanning
   the level array.
 - An open-addressed `OrderId -> slot` index at bounded load makes cancel
-  lookup expected O(1) — 64 KiB for the benchmark book shape.
+  lookup expected O(1). It costs 64 KiB for the benchmark book shape.
 - The SPSC handoff pads head and tail positions onto separate cache lines so
   producer and consumer never false-share. A slot is published with Release
   and observed with Acquire; thread-private cached positions need no atomics
@@ -105,7 +105,7 @@ the headline numbers:
 | Workload | p50 | p99.9 | Mean |
 | --- | ---: | ---: | ---: |
 | Gateway packet-to-report, 200,000 messages | 300 ns | 400 ns | 194 ns/msg |
-| Indexed cancel, 512-level book | — | — | 63-90 ns/cancel |
+| Indexed cancel, 512-level book | n/a | n/a | 63-90 ns/cancel |
 | Risk check / fill / cancel / settle, 90% occupancy | 100-200 ns | 200-300 ns | 125-144 ns |
 | Best-price discovery, 120 active levels | 100 ns | 200 ns | 110 ns |
 | Match-plan submit (non-crossing to 8-fill) | 200 ns | 300-900 ns | 206-314 ns |
@@ -201,7 +201,7 @@ Building the whole path end to end taught more about systems Rust than any
 single subsystem did. The full write-up is in
 [What I Learned](docs/LEARNINGS.md); the short version:
 
-- **Zero allocation is a layout decision, not a discipline.** The hot path
+- **Zero allocation is a layout decision.** The hot path
   stays allocation-free because every structure it touches was sized at
   compile time and allocated at init. Once the arenas exist there is no
   `Vec::push` left to slip in, and the release-mode counting allocator turns
@@ -209,17 +209,17 @@ single subsystem did. The full write-up is in
 - **Lifetimes can replace runtime coordination.** `FrameLease` ties parser
   borrows to the RX buffer's lifetime, so "don't recycle a frame while it is
   borrowed" is a compile error instead of a protocol comment.
-- **Cache locality comes from layout, not hope.** Padding SPSC head/tail
+- **Cache locality is decided by layout.** Padding SPSC head/tail
   onto separate cache lines, keeping orders in flat arrays with stable slot
   handles, and routing best-price through a sorted index are what make the
   measured latencies flat. The algorithms themselves are ordinary.
 - **Preflight everything, then apply infallibly.** Every fallible condition
-  of a match — validation, duplicates, report capacity, level capacity — is
+  of a match (validation, duplicates, report capacity, level capacity) is
   decidable before the first mutation. That deleted the entire rollback path
   and the class of restore-the-world bugs that came with it.
 - **A deterministic event loop is mostly about what you exclude.** One
   writer per book, no wall-clock reads, no hash-map iteration order, seeded
-  generators. Determinism fell out of subtraction, not machinery.
+  generators. Most of determinism came from removing sources of variation.
 - **Release/Acquire pairs are ownership proofs.** The SPSC queue publishes a
   slot with Release and observes it with Acquire; the same pairing protects
   reclamation in the other direction. A Loom model checks the publication

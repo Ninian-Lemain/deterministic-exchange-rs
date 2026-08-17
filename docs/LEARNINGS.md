@@ -1,17 +1,17 @@
 # What I Learned
 
 `deterministic-exchange-rs` is a learning project: a high-speed backend
-server for an electronic financial exchange — a deterministic,
+server for an electronic financial exchange, built as a deterministic,
 allocation-free matching engine and execution gateway in Rust. I built it to
 turn exchange-infrastructure concepts into code with testable ownership,
 capacity, determinism, and failure invariants. These are the lessons that
 actually cost me something.
 
-## Zero Allocation Is a Layout Decision, Not a Discipline
+## Zero Allocation Is a Layout Decision
 
 The hot path does not stay allocation-free because I was careful while
-writing it. It stays allocation-free because every structure it touches —
-accounts, reservations, orders, price levels, reports, queue slots — is a
+writing it. It stays allocation-free because every structure it touches
+(accounts, reservations, orders, price levels, reports, queue slots) is a
 fixed-capacity flat array sized at compile time and allocated once at init.
 After that there is no `Vec::push` left to slip in. The release benchmark
 runs under a counting allocator and exits nonzero if the measured path
@@ -35,11 +35,11 @@ happens made the design reviewable and killed the marketing adjective.
 
 ## Bounded State Turns Overload into a Specification
 
-Fixed capacities remove allocator jitter, but their real value is that they
-force an explicit answer to "what happens when this is full." Every full
-condition — book, risk table, report buffer, queue — rejects or returns
-backpressure without touching live state. Overload behavior became something
-I could write tests against instead of something I hoped about.
+Fixed capacities remove allocator jitter, and they also force an explicit
+answer to "what happens when this is full." Every full condition (book,
+risk table, report buffer, queue) rejects or returns backpressure without
+touching live state. Overload behavior became something I could write tests
+against instead of leaving it unspecified.
 
 ## Preflight Everything, Then Apply Infallibly
 
@@ -48,8 +48,8 @@ log so a late failure could roll back. Auditing the failure set showed the
 log was dead code: validation, duplicates, report capacity, and level
 capacity are all decidable before the first mutation, and nothing runs
 between plan and apply. Deleting the rollback removed a class of
-restore-the-world bugs — the undo path itself had silent-failure spots —
-and left one rule: preflight is complete, application is infallible. The
+restore-the-world bugs (the undo path itself had silent-failure spots) and
+left one rule: preflight is complete, application is infallible. The
 gateway still releases a taker reservation when the book rejects, because
 that rejection crosses a crate boundary.
 
@@ -62,7 +62,7 @@ lifecycle: binary search for prices, and a free-slot pool so allocation and
 removal never scan. A data structure that speeds up reads while writes keep
 scanning is half an index.
 
-## Cache Locality Comes from Layout, Not Hope
+## Cache Locality Is Decided by Layout
 
 The measured latencies are flat because of where bytes sit:
 
@@ -88,7 +88,7 @@ book shape, traded for probe chains that stay short at bounded load.
 ## Fail Closed or Don't Check at All
 
 Several index helpers returned `Option` for states that were impossible by
-construction, and two removal paths returned an error *after* mutating —
+construction, and two removal paths returned an error *after* mutating,
 which would have corrupted the book if they had ever fired. Unreachable
 branches that corrupt on the way out are worse than assertions: they look
 like error handling and protect nothing. The rule now: internal invariants
@@ -97,10 +97,10 @@ fail closed before any mutation, and there is no third category.
 
 ## A Deterministic Event Loop Is Mostly About What You Exclude
 
-Determinism fell out of subtraction. One writer per book, no locks, no
-wall-clock reads, no thread-timing dependence in any state transition, no
-hash maps with random iteration order, seeded generators in the
-generated-command tests. The one thing I had to add was canonical encoding:
+Most of determinism came from removing things. One writer per book, no
+locks, no wall-clock reads, no thread-timing dependence in any state
+transition, no hash maps with random iteration order, seeded generators in
+the generated-command tests. The one thing I had to add was canonical encoding:
 risk state is split into big-endian lanes before hashing, so identical
 logical state produces one digest on any architecture and the golden replay
 digest stays stable across platforms.
@@ -117,7 +117,7 @@ the correctness argument does not rest on my code review alone.
 Reservations cover the worst case for open buys and sells independently.
 Partial fills convert only the executed quantity into signed position;
 cancels release exactly the remainder. Getting this wrong does not show up
-as a crash — it shows up as slow account drift — so the tests exercise the
+as a crash; it shows up as slow account drift, so the tests exercise the
 maker and taker paths symmetrically and check the accounting after every
 transition.
 
@@ -150,14 +150,14 @@ and the percentiles carry the shape of the data.
 The allocation harness proves the measured steady-state path has zero
 allocation deltas. Desktop timing is retained as a smoke result only. Real
 latency qualification needs pinned Linux cores, controlled frequency, NUMA
-placement, a real NIC path, hardware counters, and reproducible load — none
-of which a Windows desktop provides, so the README says so.
+placement, a real NIC path, hardware counters, and reproducible load. A
+Windows desktop provides none of those, and the README says so.
 
 ## Unsafe Marks the Integration Boundaries
 
 Unsafe is confined to three sites: initialized SPSC slot access, the
-opaque-handle C ABI wrapper, and the counting allocator. Everything else —
-domain logic, parsing, risk, matching, gateway, replay — is
+opaque-handle C ABI wrapper, and the counting allocator. Everything else
+(domain logic, parsing, risk, matching, gateway, replay) is
 `#![forbid(unsafe_code)]`. Keeping the list short is what makes Miri, the
 CI allowlist, and the FFI sanitizers cheap to run.
 
@@ -165,6 +165,6 @@ CI allowlist, and the FFI sanitizers cheap to run.
 
 The slice demonstrates deterministic execution mechanics. It does not
 include venue certification, durable recovery, AF_XDP UMEM ownership, or
-proprietary vendor integration, and saying that out loud — as roadmap items
-with their own operational and hardware requirements — is what keeps the
-implemented part verifiable.
+proprietary vendor integration. Naming those gaps as roadmap items, with
+their own operational and hardware requirements, keeps the implemented part
+verifiable.

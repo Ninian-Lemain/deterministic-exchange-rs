@@ -20,7 +20,7 @@ All benches report p50, p90, p99, p99.9, max, and mean from sorted per-sample
 arrays. The mean is outlier-sensitive and reported only for continuity; the
 percentiles are the robust shape. On a shared desktop the maximum still
 captures occasional scheduler preemptions (tens of microseconds to ~1 ms); no
-harness change can remove those without core isolation, and none should try —
+harness change can remove those without core isolation, and none should try;
 the max is kept visible rather than trimmed. Per-sample `Instant` overhead is
 included throughout. This is useful for catching gross regressions, not
 establishing a service-level objective.
@@ -244,7 +244,7 @@ Representative run (Intel N95, Windows 11 Pro build 26200, Rust 1.96.0/LLVM
 | Workload | p50 | p90 | p99 | p99.9 | Mean |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | Gateway packet-to-report (200,000 messages) | 300 ns | 400 ns | 400 ns | 400 ns | 194 ns/msg |
-| Indexed cancel, 512-level book | — | — | — | — | 63-90 ns/cancel |
+| Indexed cancel, 512-level book | n/a | n/a | n/a | n/a | 63-90 ns/cancel |
 | risk_check / fill / cancel / settle, 90% reservation occupancy | 100-200 ns | 200 ns | 200 ns | 200-300 ns | 125-144 ns |
 | Account lookup, 90% account occupancy | 100 ns | 100 ns | 200 ns | 200 ns | 101 ns |
 | Best-price discovery, 120 active levels | 100 ns | 200 ns | 200 ns | 200 ns | 110 ns |

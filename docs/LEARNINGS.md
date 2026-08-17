@@ -1,131 +1,170 @@
-# Engineering Lessons Learned
+# What I Learned
 
-`deterministic-exchange-rs` is a learning project: a deterministic,
-allocation-free matching engine and execution gateway — the backend core of an
-electronic financial exchange — built to turn exchange-infrastructure concepts
-into code with testable ownership, capacity, determinism, and failure
-invariants. These are the main engineering lessons demonstrated by the
-implementation.
+`deterministic-exchange-rs` is a learning project: a high-speed backend
+server for an electronic financial exchange — a deterministic,
+allocation-free matching engine and execution gateway in Rust. I built it to
+turn exchange-infrastructure concepts into code with testable ownership,
+capacity, determinism, and failure invariants. These are the lessons that
+actually cost me something.
 
-## Ownership Is Part of the Latency Design
+## Zero Allocation Is a Layout Decision, Not a Discipline
 
-An RX frame cannot be recycled while parsing code still borrows it. Modeling
-that rule with `FrameLease` and lifetimes removes a runtime coordination problem
-and prevents use-after-recycle at compile time.
+The hot path does not stay allocation-free because I was careful while
+writing it. It stays allocation-free because every structure it touches —
+accounts, reservations, orders, price levels, reports, queue slots — is a
+fixed-capacity flat array sized at compile time and allocated once at init.
+After that there is no `Vec::push` left to slip in. The release benchmark
+runs under a counting allocator and exits nonzero if the measured path
+allocates or deallocates after warm-up, so a regression fails the process
+instead of showing up as a slower percentile.
+
+## Lifetimes Can Replace Runtime Coordination
+
+An RX frame cannot be recycled while the parser still borrows it. Modeling
+that with `FrameLease` and lifetimes makes use-after-recycle a compile
+error and deletes a class of runtime bookkeeping. The borrow checker ended
+up doing coordination work I would otherwise have done with reference counts
+or protocol comments.
 
 ## Zero-Copy Claims Need Exact Boundaries
 
-The parser reads directly from a borrowed frame. A cross-core handoff uses one
-fixed-size copy into a preallocated SPSC slot. Calling the whole pipeline
-zero-copy would be misleading; documenting the copy boundary makes the design
-reviewable.
+The parser reads straight out of the borrowed frame. The cross-core handoff
+is one fixed-size copy into a preallocated SPSC slot. Calling the pipeline
+zero-copy would be wrong; writing down exactly where the single bounded copy
+happens made the design reviewable and killed the marketing adjective.
 
 ## Bounded State Turns Overload into a Specification
 
-Fixed account, order, price-level, report, and queue capacities avoid allocator
-jitter. They also require explicit behavior for exhaustion. Every full
-condition therefore rejects or returns backpressure without overwriting live
-state.
+Fixed capacities remove allocator jitter, but their real value is that they
+force an explicit answer to "what happens when this is full." Every full
+condition — book, risk table, report buffer, queue — rejects or returns
+backpressure without touching live state. Overload behavior became something
+I could write tests against instead of something I hoped about.
 
-## Complete Preflight Beats Rollback
+## Preflight Everything, Then Apply Infallibly
 
-The book originally paired its preflight with a fixed-capacity undo log so a
-late failure could roll a match back. Auditing the failure set showed the log
-was dead code: validation, duplicates, report capacity, and level capacity are
-all decidable before the first mutation, and nothing else runs between the
-plan and the apply. Deleting the rollback removed an entire class of
-restore-the-world bugs (the undo path itself contained silent-failure spots)
-and replaced it with one reviewable rule: preflight is complete, application
-is infallible. The gateway still releases a taker reservation when the book
-rejects it, because that rejection crosses a crate boundary.
+The book originally paired its match preflight with a fixed-capacity undo
+log so a late failure could roll back. Auditing the failure set showed the
+log was dead code: validation, duplicates, report capacity, and level
+capacity are all decidable before the first mutation, and nothing runs
+between plan and apply. Deleting the rollback removed a class of
+restore-the-world bugs — the undo path itself had silent-failure spots —
+and left one rule: preflight is complete, application is infallible. The
+gateway still releases a taker reservation when the book rejects, because
+that rejection crosses a crate boundary.
 
-## Sorted Indices Need Their Own Slot Pool
+## A Sorted Index Needs Its Own Slot Pool
 
-Adding a sorted-level index made best-price discovery O(1), but the resting
+Adding a sorted-level index made best-price discovery O(1), but the insert
 path still scanned the level array linearly to find a price or a free slot,
-which quietly kept order insertion O(levels). The fix was to make the index
-own the whole lifecycle: binary search for prices, and a free-slot pool so
-allocation and removal never scan. A data structure that only speeds up reads
-while writes keep scanning is half an index.
+so insertion stayed O(levels). The fix was to make the index own the whole
+lifecycle: binary search for prices, and a free-slot pool so allocation and
+removal never scan. A data structure that speeds up reads while writes keep
+scanning is half an index.
 
-## Defensive Code Must Fail Closed or Not Exist
+## Cache Locality Comes from Layout, Not Hope
 
-Several index helpers returned `Option` for conditions that were impossible by
-construction, and two removal paths returned an error *after* mutating state,
-which would have corrupted the book had they ever fired. Unreachable branches
-that corrupt on the way out are worse than assertions: they look like error
-handling but protect nothing. The rule now is that internal invariants get
-`debug_assert`/`expect` with the invariant named, stale external handles fail
-closed before any mutation, and there is no third category.
+The measured latencies are flat because of where bytes sit:
 
-## Benchmarks Must Measure Live Work
+- SPSC head and tail positions are padded onto separate cache lines, so the
+  producer and consumer never false-share a line.
+- Orders live in flat arrays behind stable slot handles; a fill or cancel
+  rewrites two links and moves nothing else, so no peer order ever gets
+  copied across a cache line.
+- Best-price goes through the sorted index instead of a scan, so the common
+  read touches one cache-resident structure.
 
-The risk occupancy harness populated reservations, ran a fill loop that
-closed them, and then "measured" cancel and settle against the same IDs. Those
-cells measured `UnknownOrder` rejections, not live work, and the smallest
-occupancy underflowed the ID arithmetic entirely. Destructive operations now
-run against freshly populated engines, one live reservation per sample. A
-benchmark that compiles and prints plausible numbers can still be measuring
-the wrong path; every measured operation needs an assertion that it did the
-intended work.
+None of the algorithms are exotic. The wins came from deciding the layout
+first and letting the algorithms stay ordinary.
 
-## Steady State and Percentiles Beat Raw Means
+## Identity Lookup Should Not Scale with Occupancy
 
-Two more harness defects hid behind plausible output. The gateway loop sampled
-its first (coldest) iterations, so frequency ramp-up and first-touch stack
-pages landed in the reported distribution. And the crossing scenarios were not
-in steady state: `submit_cross` depleted its makers after a few dozen samples
-and then measured rejections, while `level_create` filled the book and then
-measured capacity errors. The fixes were mechanical — warm up before sampling,
-pair every timed operation with an untimed teardown that restores the fixture,
-and report sorted percentiles instead of a bare mean and max. On a shared
-desktop the maximum remains a scheduler-preemption artifact and is kept visible
-rather than trimmed; the percentiles are what make the shape of the data
-trustworthy anyway.
+Cancellation starts with an `OrderId`, so walking live orders makes cancel
+latency depend on unrelated book depth. A fixed open-addressed index makes
+the lookup expected O(1) while keeping deterministic capacity and zero
+hot-path allocation. The cost is explicit memory: 64 KiB for the benchmark
+book shape, traded for probe chains that stay short at bounded load.
 
-## Identity Lookup Should Not Scale with Book Occupancy
+## Fail Closed or Don't Check at All
 
-Cancellation starts with an `OrderId`, so walking every live order makes its
-latency depend on unrelated book depth. A fixed open-addressed index makes that
-lookup expected O(1) while preserving deterministic capacity and zero hot-path
-allocation. The measured tradeoff is explicit memory: 64 KiB for the benchmark
-book shape. FIFO compaction remains a separate optimization.
+Several index helpers returned `Option` for states that were impossible by
+construction, and two removal paths returned an error *after* mutating —
+which would have corrupted the book if they had ever fired. Unreachable
+branches that corrupt on the way out are worse than assertions: they look
+like error handling and protect nothing. The rule now: internal invariants
+get `debug_assert`/`expect` with the invariant named, stale external handles
+fail closed before any mutation, and there is no third category.
+
+## A Deterministic Event Loop Is Mostly About What You Exclude
+
+Determinism fell out of subtraction. One writer per book, no locks, no
+wall-clock reads, no thread-timing dependence in any state transition, no
+hash maps with random iteration order, seeded generators in the
+generated-command tests. The one thing I had to add was canonical encoding:
+risk state is split into big-endian lanes before hashing, so identical
+logical state produces one digest on any architecture and the golden replay
+digest stays stable across platforms.
+
+## Release/Acquire Is an Ownership Proof
+
+The SPSC queue publishes a slot with Release and observes it with Acquire;
+the same pairing in reverse protects slot reclamation. Thread-private cached
+positions need no atomics. A Loom model checks the publication invariant, so
+the correctness argument does not rest on my code review alone.
 
 ## Risk and Matching State Form One Lifecycle
 
 Reservations cover the worst case for open buys and sells independently.
-Partial fills convert only the executed quantity into signed position; cancels
-release exactly the remainder. Tests check this across maker and taker paths.
+Partial fills convert only the executed quantity into signed position;
+cancels release exactly the remainder. Getting this wrong does not show up
+as a crash — it shows up as slow account drift — so the tests exercise the
+maker and taker paths symmetrically and check the accounting after every
+transition.
 
-## Atomic Ordering Is an Ownership Proof
+## Benchmarks Must Measure Live Work
 
-The SPSC queue uses Release to publish initialized slots and Acquire to observe
-them. The same pairing protects slot reclamation in the other direction.
-Thread-private cached positions need no atomics. A Loom model checks the core
-publication invariant.
+The risk occupancy harness populated reservations, ran a fill loop that
+closed them, then "measured" cancel and settle against the same IDs. Those
+cells measured `UnknownOrder` rejections, not live work, and the smallest
+occupancy underflowed the ID arithmetic entirely. Destructive operations now
+run against freshly populated engines, one live reservation per sample, and
+every timed operation carries an assertion that it did the intended work. A
+benchmark that compiles and prints plausible numbers can still measure the
+wrong path.
 
-## Determinism Requires Canonical Encoding
+## Steady State and Percentiles Beat Raw Means
 
-Stable replay is more than processing inputs in order. Digest inputs must also
-use architecture-independent byte order. Risk state is split into canonical
-big-endian lanes before hashing so identical logical state has one digest.
+Two more harness defects hid behind plausible output. The gateway loop
+sampled its first, coldest iterations, so frequency ramp-up and first-touch
+stack pages landed in the reported distribution. The crossing scenarios were
+not in steady state: `submit_cross` depleted its makers within a few dozen
+samples and then measured rejections, while `level_create` filled the book
+and then measured capacity errors. The fixes were mechanical: warm up before
+sampling, pair every timed operation with an untimed teardown that restores
+the fixture, report sorted percentiles. On a shared desktop the max is still
+a scheduler-preemption artifact; it stays visible instead of being trimmed,
+and the percentiles carry the shape of the data.
 
-## Benchmarks Must Separate Evidence from Claims
+## Benchmarks Separate Evidence from Claims
 
-The allocation harness proves that the measured steady-state path has zero
-allocation deltas. Desktop timing is retained as a smoke result only. Credible
-latency qualification still requires pinned Linux cores, controlled frequency,
-NUMA placement, a real NIC path, hardware counters, and reproducible load.
+The allocation harness proves the measured steady-state path has zero
+allocation deltas. Desktop timing is retained as a smoke result only. Real
+latency qualification needs pinned Linux cores, controlled frequency, NUMA
+placement, a real NIC path, hardware counters, and reproducible load — none
+of which a Windows desktop provides, so the README says so.
 
-## Unsafe Code Should Mark Integration Boundaries
+## Unsafe Marks the Integration Boundaries
 
-Unsafe Rust is confined to initialized SPSC slot access, a narrow opaque-handle
-C ABI wrapper, and the isolated counting allocator. Domain logic, parsing,
-risk, matching, gateway coordination, and replay forbid unsafe code.
+Unsafe is confined to three sites: initialized SPSC slot access, the
+opaque-handle C ABI wrapper, and the counting allocator. Everything else —
+domain logic, parsing, risk, matching, gateway, replay — is
+`#![forbid(unsafe_code)]`. Keeping the list short is what makes Miri, the
+CI allowlist, and the FFI sanitizers cheap to run.
 
 ## Scope Honesty Improves the Project
 
-The portable vertical slice demonstrates deterministic execution mechanics. It
-does not pretend to include venue certification, durable recovery, AF_XDP UMEM
-ownership, or proprietary vendor integration. Those are named roadmap items
-with separate operational and hardware requirements.
+The slice demonstrates deterministic execution mechanics. It does not
+include venue certification, durable recovery, AF_XDP UMEM ownership, or
+proprietary vendor integration, and saying that out loud — as roadmap items
+with their own operational and hardware requirements — is what keeps the
+implemented part verifiable.

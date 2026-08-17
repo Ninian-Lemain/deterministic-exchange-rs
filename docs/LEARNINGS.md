@@ -66,6 +66,20 @@ benchmark that compiles and prints plausible numbers can still be measuring
 the wrong path; every measured operation needs an assertion that it did the
 intended work.
 
+## Steady State and Percentiles Beat Raw Means
+
+Two more harness defects hid behind plausible output. The gateway loop sampled
+its first (coldest) iterations, so frequency ramp-up and first-touch stack
+pages landed in the reported distribution. And the crossing scenarios were not
+in steady state: `submit_cross` depleted its makers after a few dozen samples
+and then measured rejections, while `level_create` filled the book and then
+measured capacity errors. The fixes were mechanical — warm up before sampling,
+pair every timed operation with an untimed teardown that restores the fixture,
+and report sorted percentiles instead of a bare mean and max. On a shared
+desktop the maximum remains a scheduler-preemption artifact and is kept visible
+rather than trimmed; the percentiles are what make the shape of the data
+trustworthy anyway.
+
 ## Identity Lookup Should Not Scale with Book Occupancy
 
 Cancellation starts with an `OrderId`, so walking every live order makes its

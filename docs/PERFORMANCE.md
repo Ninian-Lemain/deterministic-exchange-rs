@@ -8,10 +8,22 @@ zero. Input frames and report storage are stack/preallocated values.
 
 ## Timing Smoke Harness
 
-The executable records aggregate throughput timing and p50, p90, p99, p99.9,
-and maximum for 2,000 sampled messages. Per-sample `Instant` overhead is
-included. This is useful for catching gross regressions, not establishing a
-service-level objective.
+Every scenario runs a fixed warm-up (64 iterations, or the first 1,000 gateway
+messages) before any sample is recorded, so frequency ramp-up, first-touch
+stack pages, and branch training stay out of the reported distribution. Each
+scenario keeps its fixture in a steady state: every timed operation is balanced
+by an untimed operation that restores the starting book/risk shape, so sample
+1,900 measures the same workload as sample 1. Teardown (a replenishing rest or
+a cancel) is never inside the timed region.
+
+All benches report p50, p90, p99, p99.9, max, and mean from sorted per-sample
+arrays. The mean is outlier-sensitive and reported only for continuity; the
+percentiles are the robust shape. On a shared desktop the maximum still
+captures occasional scheduler preemptions (tens of microseconds to ~1 ms); no
+harness change can remove those without core isolation, and none should try —
+the max is kept visible rather than trimmed. Per-sample `Instant` overhead is
+included throughout. This is useful for catching gross regressions, not
+establishing a service-level objective.
 
 The local smoke environment used Windows 11 Pro build 26200, an Intel N95 (four
 cores/four threads), about 16 GB RAM, Rust 1.96.0/LLVM 22.1.2, x86_64 MSVC,
@@ -200,6 +212,54 @@ Command: `cargo build --release -p hft-bench`, direct runs of
 26200, Rust 1.96.0/LLVM 22.1.2, `x86_64-pc-windows-msvc`, fat LTO, one
 codegen unit, aborting panics. 2,000 samples per cell; mean and max recorded.
 Desktop scheduling and frequency changes remain sources of noise.
+
+## v0.6.1 Benchmark Harness Hardening
+
+The harness itself was audited and reworked; the engine is unchanged.
+
+- Every scenario runs a fixed warm-up (64 iterations; the gateway loop skips
+  sampling its first 1,000 messages) so frequency ramp-up, first-touch stack
+  pages, and branch training stay out of the reported distribution. The gateway
+  message sequence is unchanged, so the final digest stays comparable.
+- Every scenario now holds its fixture in a steady state: each timed operation
+  is balanced by an untimed teardown (a replenishing rest or a cancel) that
+  restores the starting shape. Previously `submit_cross` depleted all makers
+  after `active` samples and then measured resting rejections, `level_create`
+  filled the book after ~120 samples and then measured
+  `PriceLevelCapacity` rejections, and the gateway loop sampled its coldest
+  first iterations.
+- `risk_check` at 921 occupancy now budgets samples against the remaining
+  order capacity (78 samples; the monotonic-ID rule forbids reuse), instead of
+  silently measuring `OrderCapacity` rejections past slot 1,024.
+- All benches report p50/p90/p99/p99.9/max alongside the mean. The mean is
+  outlier-sensitive; the percentiles are the robust shape. The maximum is kept
+  visible: on this shared desktop it captures occasional scheduler preemptions
+  (single samples of 10 us-1 ms) that no harness change can remove without core
+  isolation.
+
+Representative run (Intel N95, Windows 11 Pro build 26200, Rust 1.96.0/LLVM
+22.1.2, `x86_64-pc-windows-msvc`, fat LTO, one codegen unit, aborting panics;
+2,000 samples per book cell, 256 per risk cell):
+
+| Workload | p50 | p90 | p99 | p99.9 | Mean |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Gateway packet-to-report (200,000 messages) | 300 ns | 400 ns | 400 ns | 400 ns | 194 ns/msg |
+| Indexed cancel, 512-level book | — | — | — | — | 63-90 ns/cancel |
+| risk_check / fill / cancel / settle, 90% reservation occupancy | 100-200 ns | 200 ns | 200 ns | 200-300 ns | 125-144 ns |
+| Account lookup, 90% account occupancy | 100 ns | 100 ns | 200 ns | 200 ns | 101 ns |
+| Best-price discovery, 120 active levels | 100 ns | 200 ns | 200 ns | 200 ns | 110 ns |
+| Level create + remove steady state, 120 active levels | 100 ns | 200 ns | 200 ns | 200 ns | 135 ns |
+| Submit crossing one level, 120 active levels | 200 ns | 300 ns | 300 ns | 300 ns | 248 ns |
+| Match plan: non-crossing rest | 200 ns | 200 ns | 300 ns | 900 ns | 314 ns |
+| Match plan: single fill | 200 ns | 200 ns | 300 ns | 400 ns | 215 ns |
+| Match plan: 8-level multi-fill | 200 ns | 200 ns | 300 ns | 300 ns | 206 ns |
+| Match plan: report-capacity rejection | 200 ns | 200 ns | 300 ns | 300 ns | 273 ns |
+| Match plan: full-level rejection | 100 ns | 200 ns | 200 ns | 200 ns | 125 ns |
+
+All cells measured zero allocation and deallocation deltas, and the gateway
+workload produced the unchanged logical digest `64321af91735b704`. Where a
+range is shown, it spans consecutive runs on the noisy desktop; percentile
+shapes were stable across runs.
 
 ## v0.6.0 Match-Plan Benchmark
 

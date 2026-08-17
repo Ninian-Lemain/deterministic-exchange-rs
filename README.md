@@ -9,7 +9,7 @@ vertical slice: RX frame lease -> lifetime-bound binary parsing -> session
 sequencing -> indexed pre-trade risk -> price-time matching/cancel ->
 execution reports -> replay digest.
 
-Current version: **v0.6.0**. The project is actively in development and is
+Current version: **v0.6.1**. The project is actively in development and is
 also a learning project: it exists to turn low-latency systems concepts into
 code with testable ownership, capacity, determinism, and failure invariants.
 It is **not** production ready; the [roadmap](docs/ROADMAP.md) tracks the
@@ -73,19 +73,23 @@ evidence only, never production-latency claims.
   fill, and preflighted capacity so rejection mutates nothing.
 
 Current desktop-smoke evidence (Intel N95, Windows 11, Rust 1.96.0, fat LTO;
-methodology and raw tables in [docs/PERFORMANCE.md](docs/PERFORMANCE.md)):
+methodology and raw tables in [docs/PERFORMANCE.md](docs/PERFORMANCE.md)). All
+scenarios warm up before sampling, hold their fixtures in steady state, and
+report sorted percentiles, so single scheduler preemptions cannot dominate the
+headline numbers:
 
-| Workload | Result |
-| --- | ---: |
-| Gateway packet-to-report, 200,000 messages | 113-214 ns mean/message, 0 allocations |
-| Indexed cancel, 512-level book | 56-89 ns/cancel |
-| Risk check / fill / cancel / settle, 90% occupancy | 67-150 ns mean |
-| Best-price discovery, 120 active levels | 73-157 ns mean |
-| Match-plan submit (non-crossing to 8-fill) | 72-146 ns mean |
+| Workload | p50 | p99.9 | Mean |
+| --- | ---: | ---: | ---: |
+| Gateway packet-to-report, 200,000 messages | 300 ns | 400 ns | 194 ns/msg |
+| Indexed cancel, 512-level book | — | — | 63-90 ns/cancel |
+| Risk check / fill / cancel / settle, 90% occupancy | 100-200 ns | 200-300 ns | 125-144 ns |
+| Best-price discovery, 120 active levels | 100 ns | 200 ns | 110 ns |
+| Match-plan submit (non-crossing to 8-fill) | 200 ns | 300-900 ns | 206-314 ns |
 
-These are noisy desktop numbers with timer overhead included. They validate
-the allocation discipline and catch regressions; they are not Linux/NIC
-production-latency evidence.
+These are noisy desktop numbers with timer overhead included; the reported
+maximum still captures occasional OS preemption and is kept visible rather than
+trimmed. They validate the allocation discipline and catch regressions; they
+are not Linux/NIC production-latency evidence.
 
 ## Determinism Goals
 

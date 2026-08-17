@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+## v0.6.1 - 2026-08-17
+
+### Fixed
+
+- Benchmark harness hardening; no library code changed. Every scenario now runs
+  a fixed warm-up before sampling and keeps its fixture in a steady state, with
+  teardown (replenishing rest or cancel) outside the timed region. Previously
+  the gateway loop sampled its coldest first iterations, `submit_cross`
+  depleted all makers after `active` samples and then measured resting
+  rejections, `level_create` filled the book and then measured capacity
+  rejections, and `risk_check` at 90% occupancy overflowed the 1,024-slot order
+  capacity mid-run and measured `OrderCapacity` rejections.
+- All benches now report p50/p90/p99/p99.9/max alongside the mean, so a single
+  scheduler preemption can no longer dominate the headline number. The maximum
+  is still reported, not trimmed.
+
+### Performance
+
+- With cold-start samples excluded, the gateway workload's max dropped from
+  34 us-1.4 ms to 400 ns in the representative run (p50 300 ns, p99.9 400 ns).
+  Book and risk cells report p50 100-300 ns with p99.9 within 2-3x of p50.
+  Residual max spikes are single desktop scheduler preemptions, documented in
+  `docs/PERFORMANCE.md`. Zero measured allocations and unchanged logical digest
+  `64321af91735b704`.
+
+### Verification
+
+- `cargo fmt --all --check`
+- `cargo check --workspace --all-targets --all-features`
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- `cargo test --workspace --all-features`
+
 ## v0.6.0 - 2026-08-17
 
 ### Changed

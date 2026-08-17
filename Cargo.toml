@@ -16,10 +16,10 @@ members = [
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.6.1"
+version = "0.6.2"
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/Ninian-Lemain/hft-engine-rs"
+repository = "https://github.com/Ninian-Lemain/deterministic-exchange-rs"
 rust-version = "1.85"
 
 [workspace.lints.rust]

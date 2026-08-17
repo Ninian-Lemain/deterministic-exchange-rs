@@ -288,7 +288,7 @@ allocations and unchanged logical digest. See the
 
 ## Pre-v1 Stabilization
 
-- Add a small `hft-engine` facade, validated builder, bounded command/report/event
+- Add a small facade crate, validated builder, bounded command/report/event
   API, ownership/backpressure rustdoc, MSRV/features, examples, and format/API
   compatibility policy. The public API cannot bypass sequence, risk, or capacity.
 - Add only the operational harness needed to validate configuration, health,

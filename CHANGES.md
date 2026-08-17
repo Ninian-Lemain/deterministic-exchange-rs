@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+## v0.6.2 - 2026-08-17
+
+### Changed
+
+- Renamed the project from `hft-engine-rs` to `deterministic-exchange-rs` and
+  repositioned the documentation: a deterministic, allocation-free matching
+  engine and execution gateway — the backend core of an electronic financial
+  exchange, built for learning and experimentation. No code changed. The
+  workspace crate names (`hft-types`, `hft-book`, etc.) are internal package
+  identifiers and are unchanged.
+
+### Verification
+
+- `cargo fmt --all --check`
+- `cargo check --workspace --all-targets --all-features`
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- `cargo test --workspace --all-features`
+
 ## v0.6.1 - 2026-08-17
 
 ### Fixed

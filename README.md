@@ -1,26 +1,24 @@
-# hft-engine-rs
+# deterministic-exchange-rs
 
-[![CI](https://github.com/Ninian-Lemain/hft-engine-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/Ninian-Lemain/hft-engine-rs/actions/workflows/ci.yml)
+[![CI](https://github.com/Ninian-Lemain/deterministic-exchange-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/Ninian-Lemain/deterministic-exchange-rs/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE-MIT)
 [![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
 
-A deterministic, fixed-capacity Rust execution-gateway and matching-engine
-vertical slice: RX frame lease -> lifetime-bound binary parsing -> session
-sequencing -> indexed pre-trade risk -> price-time matching/cancel ->
-execution reports -> replay digest.
+A deterministic, allocation-free Rust matching engine and execution gateway —
+the high-speed backend server core of an electronic financial exchange, built
+for learning and experimentation. The pipeline is an RX frame lease ->
+lifetime-bound binary parsing -> session sequencing -> indexed pre-trade risk
+-> price-time matching/cancel -> execution reports -> replay digest.
 
-Current version: **v0.6.1**. The project is actively in development and is
-also a learning project: it exists to turn low-latency systems concepts into
-code with testable ownership, capacity, determinism, and failure invariants.
-It is **not** production ready; the [roadmap](docs/ROADMAP.md) tracks the
-remaining correctness, verification, and operational milestones toward a v1.
-
-The design targets the same engineering concerns found in electronic trading
-infrastructure: deterministic state transitions, conservative pre-trade risk,
-bounded resources, explicit backpressure, price-time priority, session
-sequencing, replayability, cache-aware cross-core handoff, and narrow driver
-boundaries. Nothing here replaces venue certification, proprietary feed
-handlers, or measured kernel-bypass deployment work.
+Current version: **v0.6.2**. The project is actively in development. It exists
+to turn exchange-infrastructure concepts — deterministic state transitions,
+conservative pre-trade risk, bounded resources, explicit backpressure,
+price-time priority, session sequencing, replayability, cache-aware cross-core
+handoff, and narrow driver boundaries — into code with testable ownership,
+capacity, and failure invariants. It is **not** production ready; the
+[roadmap](docs/ROADMAP.md) tracks the remaining correctness, verification, and
+operational milestones toward a v1. Nothing here replaces venue certification,
+proprietary feed handlers, or measured kernel-bypass deployment work.
 
 ## Why This Project
 

@@ -1,8 +1,11 @@
 # Engineering Lessons Learned
 
-This project was built to turn low-latency systems concepts into code with
-testable ownership, capacity, and failure invariants. These are the main
-engineering lessons demonstrated by the implementation.
+`deterministic-exchange-rs` is a learning project: a deterministic,
+allocation-free matching engine and execution gateway — the backend core of an
+electronic financial exchange — built to turn exchange-infrastructure concepts
+into code with testable ownership, capacity, determinism, and failure
+invariants. These are the main engineering lessons demonstrated by the
+implementation.
 
 ## Ownership Is Part of the Latency Design
 

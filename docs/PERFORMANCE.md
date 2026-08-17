@@ -213,6 +213,53 @@ Command: `cargo build --release -p hft-bench`, direct runs of
 codegen unit, aborting panics. 2,000 samples per cell; mean and max recorded.
 Desktop scheduling and frequency changes remain sources of noise.
 
+## v0.6.0 Match-Plan Benchmark
+
+The match-plan harness measures the full submit path (plan build, plan apply,
+and optional rest) across five scenarios on an `OrderBook<128, 8>` with an
+8-report buffer: a non-crossing taker that rests, a single-fill taker, a
+multi-fill taker crossing eight makers, a taker rejected by report capacity
+preflight, and a taker rejected for trying to rest into a full best-priced
+level. Each scenario times 2,000 submissions against a persistent book.
+
+| Scenario | Traversals | Mean latency | Max latency |
+| --- | ---: | ---: | ---: |
+| non_crossing | 0 | 141 ns | 25,300 ns |
+| single_fill | 1 | 146 ns | 24,200 ns |
+| multi_fill | 8 | 115 ns | 3,800 ns |
+| report_full | 9 | 114 ns | 200 ns |
+| deep_rejection | 1 | 72 ns | 100 ns |
+
+Report capacity and full-level rejections are preflighted, so the rejected
+cells mutate nothing and report zero fills. Zero allocations in every cell.
+The gateway 200,000-message workload produced the identical logical digest
+`64321af91735b704`.
+
+The v0.6.0 refactor also changed neighboring hot paths, and the same release
+run remeasured them:
+
+| Benchmark | v0.5.0-era mean | v0.6.0 mean | Driver |
+| --- | ---: | ---: | --- |
+| cancel_bench (512 levels, 1 order each) | 546 ns | 56-89 ns | binary-search level removal |
+| price level_create (128 levels, 120 active) | 418 ns | 75-147 ns | indexed level allocation |
+| price discovery (128 levels, 120 active) | 145 ns | 73-157 ns | crossing walk stops at the price limit |
+
+For the risk harness (now measuring live operations after the correction
+above), fill, cancel, and settle each measured 69-150 ns mean at 10-90%
+reservation occupancy across runs; account lookup measured 103-114 ns mean.
+
+Run-to-run variance on this loaded desktop is large (scenario means shifted up
+to 2x between consecutive runs, and individual maxima reach hundreds of
+microseconds under scheduler interference). The first table reports the
+least-interfered cell across three consecutive runs; only zero-allocation
+deltas and the unchanged digest are treated as gates.
+
+Command: `cargo build --release -p hft-bench`, direct runs of
+`target/release/hft-bench.exe`. Environment: Intel N95, Windows 11 Pro build
+26200, Rust 1.96.0/LLVM 22.1.2, `x86_64-pc-windows-msvc`, fat LTO, one
+codegen unit, aborting panics. 2,000 samples per cell; mean and max recorded.
+Desktop scheduling and frequency changes remain sources of noise.
+
 ## v0.6.1 Benchmark Harness Hardening
 
 The harness itself was audited and reworked; the engine is unchanged.
@@ -260,53 +307,6 @@ All cells measured zero allocation and deallocation deltas, and the gateway
 workload produced the unchanged logical digest `64321af91735b704`. Where a
 range is shown, it spans consecutive runs on the noisy desktop; percentile
 shapes were stable across runs.
-
-## v0.6.0 Match-Plan Benchmark
-
-The match-plan harness measures the full submit path (plan build, plan apply,
-and optional rest) across five scenarios on an `OrderBook<128, 8>` with an
-8-report buffer: a non-crossing taker that rests, a single-fill taker, a
-multi-fill taker crossing eight makers, a taker rejected by report capacity
-preflight, and a taker rejected for trying to rest into a full best-priced
-level. Each scenario times 2,000 submissions against a persistent book.
-
-| Scenario | Traversals | Mean latency | Max latency |
-| --- | ---: | ---: | ---: |
-| non_crossing | 0 | 141 ns | 25,300 ns |
-| single_fill | 1 | 146 ns | 24,200 ns |
-| multi_fill | 8 | 115 ns | 3,800 ns |
-| report_full | 9 | 114 ns | 200 ns |
-| deep_rejection | 1 | 72 ns | 100 ns |
-
-Report capacity and full-level rejections are preflighted, so the rejected
-cells mutate nothing and report zero fills. Zero allocations in every cell.
-The gateway 200,000-message workload produced the identical logical digest
-`64321af91735b704`.
-
-The v0.6.0 refactor also changed neighboring hot paths, and the same release
-run remeasured them:
-
-| Benchmark | v0.5.0-era mean | v0.6.0 mean | Driver |
-| --- | ---: | ---: | --- |
-| cancel_bench (512 levels, 1 order each) | 546 ns | 56-89 ns | binary-search level removal |
-| price level_create (128 levels, 120 active) | 418 ns | 75-147 ns | indexed level allocation |
-| price discovery (128 levels, 120 active) | 145 ns | 73-157 ns | crossing walk stops at the price limit |
-
-For the risk harness (now measuring live operations after the correction
-above), fill, cancel, and settle each measured 69-150 ns mean at 10-90%
-reservation occupancy across runs; account lookup measured 103-114 ns mean.
-
-Run-to-run variance on this loaded desktop is large (scenario means shifted up
-to 2x between consecutive runs, and individual maxima reach hundreds of
-microseconds under scheduler interference). The first table reports the
-least-interfered cell across three consecutive runs; only zero-allocation
-deltas and the unchanged digest are treated as gates.
-
-Command: `cargo build --release -p hft-bench`, direct runs of
-`target/release/hft-bench.exe`. Environment: Intel N95, Windows 11 Pro build
-26200, Rust 1.96.0/LLVM 22.1.2, `x86_64-pc-windows-msvc`, fat LTO, one
-codegen unit, aborting panics. 2,000 samples per cell; mean and max recorded.
-Desktop scheduling and frequency changes remain sources of noise.
 
 ## Dedicated Linux Protocol
 

@@ -57,61 +57,72 @@ enum IndexSlot {
     },
 }
 
+/// Open-addressed `OrderId -> OrderLocation` index with linear probing and
+/// deterministic back-shift deletion. Both sides share one index: four planes
+/// keep the live load at or below 50% of slots (two sides of at most
+/// `LEVELS * ORDERS` orders each), so probes stay short at maximum occupancy.
+/// The planes exist as a nested array because stable Rust cannot express
+/// `LEVELS * ORDERS * PLANES` as a single array length over const generics.
 #[derive(Debug)]
 struct OrderIndex<const LEVELS: usize, const ORDERS: usize> {
     slots: [[[IndexSlot; ORDERS]; LEVELS]; ORDER_INDEX_PLANES],
 }
 
 impl<const LEVELS: usize, const ORDERS: usize> OrderIndex<LEVELS, ORDERS> {
+    const CAPACITY: usize = LEVELS * ORDERS * ORDER_INDEX_PLANES;
+
     const fn new() -> Self {
         Self {
             slots: [[[IndexSlot::Empty; ORDERS]; LEVELS]; ORDER_INDEX_PLANES],
         }
     }
 
-    fn capacity() -> Option<usize> {
-        LEVELS.checked_mul(ORDERS)?.checked_mul(ORDER_INDEX_PLANES)
-    }
-
-    fn coordinates(flat_index: usize) -> Option<(usize, usize, usize)> {
-        let per_plane = LEVELS.checked_mul(ORDERS)?;
-        if per_plane == 0 {
-            return None;
-        }
+    /// Flat-index coordinates. Callers only pass indices below `CAPACITY`.
+    fn coordinates(flat_index: usize) -> (usize, usize, usize) {
+        debug_assert!(flat_index < Self::CAPACITY);
+        let per_plane = LEVELS * ORDERS;
         let plane = flat_index / per_plane;
         let within_plane = flat_index % per_plane;
-        Some((plane, within_plane / ORDERS, within_plane % ORDERS))
+        (plane, within_plane / ORDERS, within_plane % ORDERS)
     }
 
-    fn slot(&self, flat_index: usize) -> Option<&IndexSlot> {
-        let (plane, level, order) = Self::coordinates(flat_index)?;
-        self.slots.get(plane)?.get(level)?.get(order)
+    fn slot(&self, flat_index: usize) -> &IndexSlot {
+        let (plane, level, order) = Self::coordinates(flat_index);
+        &self.slots[plane][level][order]
     }
 
-    fn slot_mut(&mut self, flat_index: usize) -> Option<&mut IndexSlot> {
-        let (plane, level, order) = Self::coordinates(flat_index)?;
-        self.slots.get_mut(plane)?.get_mut(level)?.get_mut(order)
+    fn slot_mut(&mut self, flat_index: usize) -> &mut IndexSlot {
+        let (plane, level, order) = Self::coordinates(flat_index);
+        &mut self.slots[plane][level][order]
     }
 
-    fn probe_start(order_id: OrderId, capacity: usize) -> usize {
-        let capacity_u64 = u64::try_from(capacity).unwrap_or(u64::MAX);
+    /// Probing requires a non-zero capacity; callers guard `CAPACITY == 0`.
+    fn probe_start(order_id: OrderId) -> usize {
+        let capacity = u64::try_from(Self::CAPACITY).unwrap_or(u64::MAX);
         let mixed = order_id.0.wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        usize::try_from(mixed % capacity_u64).unwrap_or(0)
+        usize::try_from(mixed % capacity).unwrap_or(0)
+    }
+
+    fn probe_distance(home: usize, current: usize) -> usize {
+        if current >= home {
+            current - home
+        } else {
+            Self::CAPACITY - (home - current)
+        }
     }
 
     fn find_slot(&self, order_id: OrderId) -> Option<usize> {
-        let capacity = Self::capacity()?;
-        if capacity == 0 {
+        if Self::CAPACITY == 0 {
             return None;
         }
-        let start = Self::probe_start(order_id, capacity);
-        for offset in 0..capacity {
-            let slot_index = start.wrapping_add(offset) % capacity;
-            match self.slot(slot_index)? {
+        let start = Self::probe_start(order_id);
+        for offset in 0..Self::CAPACITY {
+            let flat_index = start.wrapping_add(offset) % Self::CAPACITY;
+            match self.slot(flat_index) {
                 IndexSlot::Empty => return None,
                 IndexSlot::Occupied {
                     order_id: indexed, ..
-                } if *indexed == order_id => return Some(slot_index),
+                } if *indexed == order_id => return Some(flat_index),
                 IndexSlot::Occupied { .. } => {}
             }
         }
@@ -119,94 +130,87 @@ impl<const LEVELS: usize, const ORDERS: usize> OrderIndex<LEVELS, ORDERS> {
     }
 
     fn location(&self, order_id: OrderId) -> Option<OrderLocation> {
-        match self.slot(self.find_slot(order_id)?)? {
+        match self.slot(self.find_slot(order_id)?) {
             IndexSlot::Occupied { location, .. } => Some(*location),
             IndexSlot::Empty => None,
         }
     }
 
     fn insert(&mut self, order_id: OrderId, location: OrderLocation) -> Result<u32, RejectReason> {
-        let capacity = Self::capacity().ok_or(RejectReason::OrderCapacity)?;
-        if capacity == 0 {
+        if Self::CAPACITY == 0 {
             return Err(RejectReason::OrderCapacity);
         }
-        let start = Self::probe_start(order_id, capacity);
-        for offset in 0..capacity {
-            let slot_index = start.wrapping_add(offset) % capacity;
-            match *self.slot(slot_index).ok_or(RejectReason::OrderCapacity)? {
+        let start = Self::probe_start(order_id);
+        for offset in 0..Self::CAPACITY {
+            let flat_index = start.wrapping_add(offset) % Self::CAPACITY;
+            match self.slot(flat_index) {
                 IndexSlot::Empty => {
                     let slot_id =
-                        u32::try_from(slot_index).map_err(|_| RejectReason::OrderCapacity)?;
-                    *self
-                        .slot_mut(slot_index)
-                        .ok_or(RejectReason::OrderCapacity)? =
-                        IndexSlot::Occupied { order_id, location };
+                        u32::try_from(flat_index).map_err(|_| RejectReason::OrderCapacity)?;
+                    *self.slot_mut(flat_index) = IndexSlot::Occupied { order_id, location };
                     return Ok(slot_id);
                 }
                 IndexSlot::Occupied {
                     order_id: indexed, ..
-                } if indexed == order_id => return Err(RejectReason::DuplicateOrderId),
+                } if *indexed == order_id => return Err(RejectReason::DuplicateOrderId),
                 IndexSlot::Occupied { .. } => {}
             }
         }
         Err(RejectReason::OrderCapacity)
     }
 
-    fn remove_at<F>(
+    /// Removes `order_id` at `slot_index` and closes the probe hole by
+    /// shifting displaced entries back, reporting each move through
+    /// `update_reverse_slot`. Fails closed on a stale handle.
+    fn remove_at(
         &mut self,
         slot_index: u32,
         order_id: OrderId,
-        mut update_reverse_slot: F,
-    ) -> Option<OrderLocation>
-    where
-        F: FnMut(OrderId, OrderLocation, u32) -> bool,
-    {
-        let slot_index = usize::try_from(slot_index).ok()?;
+        mut update_reverse_slot: impl FnMut(OrderId, OrderLocation, u32) -> bool,
+    ) -> Option<OrderLocation> {
+        let flat_index = usize::try_from(slot_index).ok()?;
+        if flat_index >= Self::CAPACITY {
+            return None;
+        }
         let IndexSlot::Occupied {
             order_id: indexed,
             location,
-        } = *self.slot(slot_index)?
+        } = *self.slot(flat_index)
         else {
             return None;
         };
         if indexed != order_id {
             return None;
         }
-        let capacity = Self::capacity()?;
-        let mut hole = slot_index;
-        let mut candidate_index = hole.wrapping_add(1) % capacity;
+        let mut hole = flat_index;
+        let mut candidate_index = hole.wrapping_add(1) % Self::CAPACITY;
         // Close the probe hole without retaining deletion tombstones.
         loop {
-            let candidate = *self.slot(candidate_index)?;
+            let candidate = *self.slot(candidate_index);
             let IndexSlot::Occupied {
                 order_id: candidate_id,
                 location: candidate_location,
             } = candidate
             else {
-                *self.slot_mut(hole)? = IndexSlot::Empty;
+                *self.slot_mut(hole) = IndexSlot::Empty;
                 break;
             };
-            let home_bucket = Self::probe_start(candidate_id, capacity);
-            if Self::probe_distance(home_bucket, hole, capacity)
-                < Self::probe_distance(home_bucket, candidate_index, capacity)
+            let home_bucket = Self::probe_start(candidate_id);
+            if Self::probe_distance(home_bucket, hole)
+                < Self::probe_distance(home_bucket, candidate_index)
             {
-                *self.slot_mut(hole)? = candidate;
-                let new_slot = u32::try_from(hole).ok()?;
-                let updated = update_reverse_slot(candidate_id, candidate_location, new_slot);
-                debug_assert!(updated);
+                *self.slot_mut(hole) = candidate;
+                let new_slot = u32::try_from(hole).expect("occupied slots fit u32");
+                debug_assert!(update_reverse_slot(
+                    candidate_id,
+                    candidate_location,
+                    new_slot
+                ));
                 hole = candidate_index;
             }
-            candidate_index = candidate_index.wrapping_add(1) % capacity;
+            candidate_index = candidate_index.wrapping_add(1) % Self::CAPACITY;
         }
         Some(location)
-    }
-
-    fn probe_distance(home: usize, current: usize, capacity: usize) -> usize {
-        if current >= home {
-            current - home
-        } else {
-            capacity - (home - current)
-        }
     }
 }
 
@@ -224,19 +228,20 @@ impl<const ORDERS: usize> PriceLevel<ORDERS> {
         }
     }
 
-    /// Appends at the tail and returns the stable slot handle.
-    fn push_tail(&mut self, mut order: RestingOrder) -> Result<usize, RejectReason> {
+    /// Appends at the tail and returns the stable slot handle, or `None` when
+    /// the level is full or its links are corrupt. Nothing mutates on `None`.
+    fn push_tail(&mut self, mut order: RestingOrder) -> Option<usize> {
         if self.free_head == NIL || self.len >= ORDERS {
-            return Err(RejectReason::PriceLevelOrderCapacity);
+            return None;
         }
         let slot = self.free_head;
         let Some(OrderSlot::Free { next_free }) = self.slots.get(slot).copied() else {
-            return Err(RejectReason::PriceLevelOrderCapacity);
+            return None;
         };
         if self.tail != NIL {
             match self.slots.get_mut(self.tail) {
                 Some(OrderSlot::Live(tail_order)) => tail_order.next = slot,
-                _ => return Err(RejectReason::ArithmeticOverflow),
+                _ => return None,
             }
         }
         order.prev = self.tail;
@@ -248,7 +253,7 @@ impl<const ORDERS: usize> PriceLevel<ORDERS> {
         }
         self.tail = slot;
         self.len += 1;
-        Ok(slot)
+        Some(slot)
     }
 
     /// Detaches a live slot and returns it to the free list. Stale or free
@@ -287,26 +292,6 @@ impl<const ORDERS: usize> PriceLevel<ORDERS> {
         Some(order)
     }
 
-    fn front(&self) -> Option<(usize, RestingOrder)> {
-        if self.head == NIL {
-            return None;
-        }
-        match self.slots.get(self.head).copied() {
-            Some(OrderSlot::Live(order)) => Some((self.head, order)),
-            _ => None,
-        }
-    }
-
-    fn front_mut(&mut self) -> Option<&mut RestingOrder> {
-        if self.head == NIL {
-            return None;
-        }
-        match self.slots.get_mut(self.head) {
-            Some(OrderSlot::Live(order)) => Some(order),
-            _ => None,
-        }
-    }
-
     fn get_live(&self, slot: usize) -> Option<&RestingOrder> {
         match self.slots.get(slot) {
             Some(OrderSlot::Live(order)) => Some(order),
@@ -340,73 +325,171 @@ pub struct CancelledOrder {
     pub quantity: Quantity,
 }
 
-/// Sorted index of occupied level indices. Bids are sorted by price
-/// descending (best bid first); asks are sorted by price ascending (best ask
-/// first). This gives O(1) best-price discovery and O(n) insertion/removal
-/// where n is the number of active levels (always ≤ LEVELS).
+/// Sorted index of occupied level slots plus the pool of free level slots for
+/// one side. Bids sort by price descending (best bid first); asks sort
+/// ascending (best ask first). Price lookup is O(log n) by binary search,
+/// best-price discovery is the first entry, and slot allocation is O(1) from
+/// the free pool. Occupied and free slots partition `0..LEVELS` exactly.
 #[derive(Debug)]
 struct LevelIndex<const LEVELS: usize> {
     len: usize,
     entries: [(PriceTicks, usize); LEVELS],
+    free: [usize; LEVELS],
+    free_len: usize,
 }
 
 impl<const LEVELS: usize> LevelIndex<LEVELS> {
     const fn new() -> Self {
+        let mut free = [0_usize; LEVELS];
+        let mut index = 0;
+        while index < LEVELS {
+            // The pool pops from the end, so a fresh book allocates the lowest
+            // level slots first.
+            free[index] = LEVELS - 1 - index;
+            index += 1;
+        }
         Self {
             len: 0,
             entries: [(PriceTicks(0), 0); LEVELS],
+            free,
+            free_len: LEVELS,
         }
     }
 
     fn is_full(&self) -> bool {
-        self.len == LEVELS
+        self.free_len == 0
     }
 
-    /// Insert a level in sorted position. Bids are sorted descending by price;
-    /// asks are sorted ascending by price.
-    fn insert(&mut self, price: PriceTicks, level_index: usize, descending: bool) {
-        debug_assert!(!self.is_full());
-        let pos = self
-            .entries
-            .iter()
-            .take(self.len)
-            .position(|&(p, _)| {
-                if descending {
-                    price.0 >= p.0
-                } else {
-                    price.0 <= p.0
-                }
-            })
-            .unwrap_or(self.len);
-        let mut i = self.len;
-        while i > pos {
-            self.entries[i] = self.entries[i - 1];
-            i -= 1;
-        }
-        self.entries[pos] = (price, level_index);
-        self.len += 1;
-    }
-
-    /// Remove a level by its array slot index.
-    fn remove(&mut self, level_index: usize) {
-        if let Some(pos) = self
-            .entries
-            .iter()
-            .take(self.len)
-            .position(|&(_, idx)| idx == level_index)
-        {
-            let mut i = pos;
-            while i + 1 < self.len {
-                self.entries[i] = self.entries[i + 1];
-                i += 1;
+    /// Sorted position of `price`: the insertion point and whether an entry
+    /// with that exact price occupies it.
+    fn position(&self, price: PriceTicks, descending: bool) -> (usize, bool) {
+        let entries = &self.entries[..self.len];
+        let position = entries.partition_point(|&(listed, _)| {
+            if descending {
+                listed.0 > price.0
+            } else {
+                listed.0 < price.0
             }
-            self.len -= 1;
+        });
+        let found = position < self.len && entries[position].0 == price;
+        (position, found)
+    }
+
+    /// Level slot holding `price`, if one is occupied at that price.
+    fn find(&self, price: PriceTicks, descending: bool) -> Option<usize> {
+        let (position, found) = self.position(price, descending);
+        if found {
+            Some(self.entries[position].1)
+        } else {
+            None
         }
+    }
+
+    /// Allocates a free level slot and indexes it at `price` in sorted order.
+    /// Returns the slot, or `None` when every level slot is occupied.
+    fn insert(&mut self, price: PriceTicks, descending: bool) -> Option<usize> {
+        let (position, found) = self.position(price, descending);
+        debug_assert!(!found, "price levels are unique per side");
+        if self.free_len == 0 {
+            return None;
+        }
+        self.free_len -= 1;
+        let level_index = self.free[self.free_len];
+        self.entries.copy_within(position..self.len, position + 1);
+        self.entries[position] = (price, level_index);
+        self.len += 1;
+        Some(level_index)
+    }
+
+    /// Removes the level at `price` and returns its slot to the free pool.
+    fn remove(&mut self, price: PriceTicks, descending: bool) -> Option<usize> {
+        let (position, found) = self.position(price, descending);
+        if !found {
+            return None;
+        }
+        let level_index = self.entries[position].1;
+        self.entries.copy_within(position + 1..self.len, position);
+        self.len -= 1;
+        self.free[self.free_len] = level_index;
+        self.free_len += 1;
+        Some(level_index)
     }
 
     /// Walk entries in sorted order (best to worst for the given side).
     fn iter(&self) -> impl Iterator<Item = &(PriceTicks, usize)> {
         self.entries.iter().take(self.len)
+    }
+}
+
+/// A single fill entry in a match plan. Records the maker order location and
+/// the traded quantity so that `apply_plan` can execute the fill without
+/// re-walking the book.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FillEntry {
+    level_index: usize,
+    slot: usize,
+    order_id: OrderId,
+    price: PriceTicks,
+    quantity: Quantity,
+}
+
+/// Compact match plan with bounded fill entries. Built during a single walk
+/// of the crossing levels; applied by direct mutation using the captured
+/// locations. A plan never heap-allocates and is bounded by the report
+/// capacity available at build time.
+#[derive(Clone, Debug)]
+struct MatchPlan<const FILLS: usize> {
+    fills: [FillEntry; FILLS],
+    fill_count: usize,
+    capacity: usize,
+    maker_side: Side,
+    resting_quantity: Quantity,
+}
+
+const DUMMY_FILL: FillEntry = FillEntry {
+    level_index: 0,
+    slot: 0,
+    order_id: OrderId(0),
+    price: PriceTicks(0),
+    quantity: Quantity(0),
+};
+
+impl<const FILLS: usize> MatchPlan<FILLS> {
+    fn new(maker_side: Side, report_capacity: usize) -> Self {
+        Self {
+            fills: [DUMMY_FILL; FILLS],
+            fill_count: 0,
+            capacity: report_capacity.min(FILLS),
+            maker_side,
+            resting_quantity: Quantity(0),
+        }
+    }
+
+    fn push_fill(
+        &mut self,
+        level_index: usize,
+        slot: usize,
+        order_id: OrderId,
+        price: PriceTicks,
+        quantity: Quantity,
+    ) -> Result<(), RejectReason> {
+        if self.fill_count >= self.capacity {
+            return Err(RejectReason::ReportCapacity);
+        }
+        self.fills[self.fill_count] = FillEntry {
+            level_index,
+            slot,
+            order_id,
+            price,
+            quantity,
+        };
+        self.fill_count += 1;
+        Ok(())
+    }
+
+    #[must_use]
+    fn fills(&self) -> &[FillEntry] {
+        &self.fills[..self.fill_count]
     }
 }
 
@@ -437,93 +520,52 @@ impl<const LEVELS: usize, const ORDERS_PER_LEVEL: usize> OrderBook<LEVELS, ORDER
         }
     }
 
+    fn side_levels(&self, side: Side) -> &[Option<PriceLevel<ORDERS_PER_LEVEL>>; LEVELS] {
+        match side {
+            Side::Buy => &self.bids,
+            Side::Sell => &self.asks,
+        }
+    }
+
+    fn side_levels_mut(
+        &mut self,
+        side: Side,
+    ) -> &mut [Option<PriceLevel<ORDERS_PER_LEVEL>>; LEVELS] {
+        match side {
+            Side::Buy => &mut self.bids,
+            Side::Sell => &mut self.asks,
+        }
+    }
+
+    fn side_index(&self, side: Side) -> &LevelIndex<LEVELS> {
+        match side {
+            Side::Buy => &self.bid_levels,
+            Side::Sell => &self.ask_levels,
+        }
+    }
+
+    fn side_index_mut(&mut self, side: Side) -> &mut LevelIndex<LEVELS> {
+        match side {
+            Side::Buy => &mut self.bid_levels,
+            Side::Sell => &mut self.ask_levels,
+        }
+    }
+
     /// # Errors
     ///
-    /// Returns an explicit validation or capacity rejection. All capacity
-    /// requirements are preflighted so such rejection leaves the book intact.
+    /// Returns an explicit validation or capacity rejection. `build_plan`
+    /// preflights every fallible condition, so a rejection provably leaves the
+    /// book and report buffer untouched.
     pub fn submit<const REPORTS: usize>(
         &mut self,
         order: NewOrder,
         reports: &mut ReportBuffer<REPORTS>,
     ) -> Result<MatchSummary, RejectReason> {
         let initial_report_count = reports.len();
-        self.preflight(order, reports.remaining_capacity())?;
-        let original = order.quantity.0;
-        let mut remaining = original;
-
-        while remaining > 0 {
-            let Some(level_index) = self.best_crossing_level(order.side, order.price) else {
-                break;
-            };
-            let (maker_side, head_slot, mut maker) = self
-                .front_maker(order.side, level_index)
-                .ok_or(RejectReason::ArithmeticOverflow)?;
-            let traded = remaining.min(maker.quantity.0);
-            reports.push(ExecutionReport {
-                maker_order_id: maker.id,
-                taker_order_id: order.order_id,
-                instrument_id: order.instrument_id,
-                price: maker.price,
-                quantity: Quantity(traded),
-                sequence: order.sequence,
-            })?;
-            remaining = remaining
-                .checked_sub(traded)
-                .ok_or(RejectReason::ArithmeticOverflow)?;
-            maker.quantity.0 = maker
-                .quantity
-                .0
-                .checked_sub(traded)
-                .ok_or(RejectReason::ArithmeticOverflow)?;
-            if maker.quantity.0 == 0 {
-                let location = OrderLocation {
-                    side: maker_side,
-                    level_index,
-                    slot: head_slot,
-                };
-                let removed_location = self.remove_index_entry(maker.index_slot, maker.id);
-                debug_assert_eq!(removed_location, Some(location));
-                let levels = match maker_side {
-                    Side::Buy => &mut self.bids,
-                    Side::Sell => &mut self.asks,
-                };
-                let Some(level) = levels[level_index].as_mut() else {
-                    return Err(RejectReason::ArithmeticOverflow);
-                };
-                let removed = level
-                    .unlink(head_slot)
-                    .ok_or(RejectReason::ArithmeticOverflow)?;
-                debug_assert_eq!(removed.id, maker.id);
-                if level.len == 0 {
-                    levels[level_index] = None;
-                    let level_indices = match maker_side {
-                        Side::Buy => &mut self.bid_levels,
-                        Side::Sell => &mut self.ask_levels,
-                    };
-                    level_indices.remove(level_index);
-                }
-            } else {
-                let levels = match maker_side {
-                    Side::Buy => &mut self.bids,
-                    Side::Sell => &mut self.asks,
-                };
-                let Some(level) = levels[level_index].as_mut() else {
-                    return Err(RejectReason::ArithmeticOverflow);
-                };
-                let Some(head) = level.front_mut() else {
-                    return Err(RejectReason::ArithmeticOverflow);
-                };
-                head.quantity = maker.quantity;
-            }
-        }
-
-        let filled = original
-            .checked_sub(remaining)
-            .ok_or(RejectReason::ArithmeticOverflow)?;
-        if remaining > 0 {
-            self.rest(order, Quantity(remaining))?;
-        }
-        let state = if remaining == 0 {
+        let plan = self.build_plan::<REPORTS>(order, reports.remaining_capacity())?;
+        self.apply_plan(order, &plan, reports);
+        let filled = order.quantity.0 - plan.resting_quantity.0;
+        let state = if plan.resting_quantity.0 == 0 {
             OrderState::Filled
         } else if filled == 0 {
             OrderState::Accepted
@@ -533,64 +575,20 @@ impl<const LEVELS: usize, const ORDERS_PER_LEVEL: usize> OrderBook<LEVELS, ORDER
         Ok(MatchSummary {
             state,
             filled_quantity: Quantity(filled),
-            resting_quantity: Quantity(remaining),
+            resting_quantity: plan.resting_quantity,
             report_count: reports.len() - initial_report_count,
         })
     }
 
-    /// Removes an owned resting order while retaining FIFO order for all peers.
-    ///
-    /// # Errors
-    ///
-    /// Returns an instrument, unknown-order, or ownership rejection without
-    /// mutating the book.
-    pub fn cancel(&mut self, cancel: CancelOrder) -> Result<CancelledOrder, RejectReason> {
-        if cancel.instrument_id != self.instrument {
-            return Err(RejectReason::InvalidInstrument);
-        }
-        let (side, level_index, slot, owner, quantity, index_slot) = self
-            .find_order(cancel.order_id)
-            .ok_or(RejectReason::UnknownOrder)?;
-        if owner != cancel.account_id {
-            return Err(RejectReason::NotOrderOwner);
-        }
-        let location = OrderLocation {
-            side,
-            level_index,
-            slot,
-        };
-        let removed_location = self.remove_index_entry(index_slot, cancel.order_id);
-        if removed_location != Some(location) {
-            return Err(RejectReason::ArithmeticOverflow);
-        }
-        let levels = match side {
-            Side::Buy => &mut self.bids,
-            Side::Sell => &mut self.asks,
-        };
-        let level = levels[level_index]
-            .as_mut()
-            .ok_or(RejectReason::UnknownOrder)?;
-        let removed = level.unlink(slot).ok_or(RejectReason::UnknownOrder)?;
-        if removed.id != cancel.order_id {
-            return Err(RejectReason::ArithmeticOverflow);
-        }
-        if level.len == 0 {
-            levels[level_index] = None;
-            let level_indices = match side {
-                Side::Buy => &mut self.bid_levels,
-                Side::Sell => &mut self.ask_levels,
-            };
-            level_indices.remove(level_index);
-        }
-        debug_assert_eq!(removed.quantity, quantity);
-        Ok(CancelledOrder {
-            order_id: removed.id,
-            account_id: removed.account_id,
-            quantity: removed.quantity,
-        })
-    }
-
-    fn preflight(&self, order: NewOrder, report_capacity: usize) -> Result<(), RejectReason> {
+    /// Walks crossing levels once to build a compact match plan, preflighting
+    /// validation, duplicates, report capacity, and resting capacity. Because
+    /// every fallible condition is decided here against an unchanged book,
+    /// `apply_plan` afterwards is infallible and needs no rollback path.
+    fn build_plan<const REPORTS: usize>(
+        &self,
+        order: NewOrder,
+        report_capacity: usize,
+    ) -> Result<MatchPlan<REPORTS>, RejectReason> {
         if order.instrument_id != self.instrument {
             return Err(RejectReason::InvalidInstrument);
         }
@@ -603,129 +601,207 @@ impl<const LEVELS: usize, const ORDERS_PER_LEVEL: usize> OrderBook<LEVELS, ORDER
         if self.contains_order(order.order_id) {
             return Err(RejectReason::DuplicateOrderId);
         }
-
-        let (remaining, report_count) = self.simulate_matches(order)?;
-        if report_count > report_capacity {
-            return Err(RejectReason::ReportCapacity);
-        }
-        if remaining > 0 {
-            let levels = match order.side {
-                Side::Buy => &self.bids,
-                Side::Sell => &self.asks,
-            };
-            if let Some(level) = levels
-                .iter()
-                .flatten()
-                .find(|level| level.price == order.price)
-            {
-                if level.len == ORDERS_PER_LEVEL {
-                    return Err(RejectReason::PriceLevelOrderCapacity);
-                }
-            } else if levels.iter().all(Option::is_some) {
-                return Err(RejectReason::PriceLevelCapacity);
-            }
-        }
-        Ok(())
-    }
-
-    fn simulate_matches(&self, order: NewOrder) -> Result<(u64, usize), RejectReason> {
-        self.simulate_sorted(order)
-    }
-
-    fn simulate_sorted(&self, order: NewOrder) -> Result<(u64, usize), RejectReason> {
-        let levels = match order.side {
-            Side::Buy => &self.asks,
-            Side::Sell => &self.bids,
+        let maker_side = match order.side {
+            Side::Buy => Side::Sell,
+            Side::Sell => Side::Buy,
         };
-        let index = match order.side {
-            Side::Buy => &self.ask_levels,
-            Side::Sell => &self.bid_levels,
-        };
+        let maker_levels = self.side_levels(maker_side);
+        let mut plan = MatchPlan::<REPORTS>::new(maker_side, report_capacity);
         let mut remaining = order.quantity.0;
-        let mut reports = 0_usize;
-        let mut boundary: Option<PriceTicks> = None;
-        for &(_, level_index) in index.iter() {
+        for &(price, level_index) in self.side_index(maker_side).iter() {
             if remaining == 0 {
                 break;
             }
-            let Some(level) = levels[level_index].as_ref() else {
-                continue;
-            };
             let crosses = match order.side {
-                Side::Buy => {
-                    level.price.0 <= order.price.0
-                        && boundary.is_none_or(|price| level.price.0 > price.0)
-                }
-                Side::Sell => {
-                    level.price.0 >= order.price.0
-                        && boundary.is_none_or(|price| level.price.0 < price.0)
-                }
+                Side::Buy => price.0 <= order.price.0,
+                Side::Sell => price.0 >= order.price.0,
             };
+            // Levels are visited best to worst, so the first non-crossing
+            // level ends the walk.
             if !crosses {
-                continue;
+                break;
             }
-            boundary = Some(level.price);
+            let level = maker_levels[level_index]
+                .as_ref()
+                .expect("indexed level is occupied");
             let mut cursor = level.head;
             while cursor != NIL && remaining > 0 {
-                let Some(OrderSlot::Live(maker)) = level.slots.get(cursor) else {
-                    break;
+                let OrderSlot::Live(maker) = level.slots[cursor] else {
+                    unreachable!("live chain only links live slots");
                 };
-                remaining -= remaining.min(maker.quantity.0);
-                reports = reports
-                    .checked_add(1)
-                    .ok_or(RejectReason::ArithmeticOverflow)?;
+                let traded = remaining.min(maker.quantity.0);
+                plan.push_fill(level_index, cursor, maker.id, price, Quantity(traded))?;
+                remaining -= traded;
                 cursor = maker.next;
             }
         }
-        Ok((remaining, reports))
-    }
-
-    fn best_crossing_level(&self, side: Side, price: PriceTicks) -> Option<usize> {
-        let levels = match side {
-            Side::Buy => &self.asks,
-            Side::Sell => &self.bids,
-        };
-        let index = match side {
-            Side::Buy => &self.ask_levels,
-            Side::Sell => &self.bid_levels,
-        };
-        for &(_, level_index) in index.iter() {
-            if let Some(level) = levels[level_index].as_ref() {
-                let crosses = match side {
-                    Side::Buy => level.price.0 <= price.0,
-                    Side::Sell => level.price.0 >= price.0,
-                };
-                if crosses {
-                    return Some(level_index);
+        if remaining > 0 {
+            let descending = order.side == Side::Buy;
+            if let Some(level_index) = self.side_index(order.side).find(order.price, descending) {
+                let level = self.side_levels(order.side)[level_index]
+                    .as_ref()
+                    .expect("indexed level is occupied");
+                if level.len == ORDERS_PER_LEVEL {
+                    return Err(RejectReason::PriceLevelOrderCapacity);
                 }
+            } else if self.side_index(order.side).is_full() {
+                return Err(RejectReason::PriceLevelCapacity);
             }
         }
-        None
+        plan.resting_quantity = Quantity(remaining);
+        Ok(plan)
     }
 
-    fn front_maker(
-        &self,
-        taker_side: Side,
-        level_index: usize,
-    ) -> Option<(Side, usize, RestingOrder)> {
-        let (maker_side, levels) = match taker_side {
-            Side::Buy => (Side::Sell, &self.asks),
-            Side::Sell => (Side::Buy, &self.bids),
-        };
-        let (head_slot, maker) = levels.get(level_index)?.as_ref()?.front()?;
-        Some((maker_side, head_slot, maker))
+    /// Applies a pre-built match plan, emitting one execution report per fill.
+    /// Infallible: `build_plan` preflighted report capacity, level capacity,
+    /// and duplicates, and the book cannot change between the two calls.
+    /// Violations of those preflighted invariants are bugs, not rejections.
+    fn apply_plan<const REPORTS: usize>(
+        &mut self,
+        order: NewOrder,
+        plan: &MatchPlan<REPORTS>,
+        reports: &mut ReportBuffer<REPORTS>,
+    ) {
+        for fill in plan.fills() {
+            let (index_slot, full_fill) = {
+                let level = self.side_levels(plan.maker_side)[fill.level_index]
+                    .as_ref()
+                    .expect("plan level is occupied");
+                let maker = level.get_live(fill.slot).expect("plan maker is live");
+                debug_assert_eq!(maker.id, fill.order_id);
+                reports
+                    .push(ExecutionReport {
+                        maker_order_id: fill.order_id,
+                        taker_order_id: order.order_id,
+                        instrument_id: order.instrument_id,
+                        price: fill.price,
+                        quantity: fill.quantity,
+                        sequence: order.sequence,
+                    })
+                    .expect("report capacity was preflighted");
+                (maker.index_slot, maker.quantity.0 == fill.quantity.0)
+            };
+            if full_fill {
+                let removed_location = self.remove_index_entry(index_slot, fill.order_id);
+                debug_assert_eq!(
+                    removed_location,
+                    Some(OrderLocation {
+                        side: plan.maker_side,
+                        level_index: fill.level_index,
+                        slot: fill.slot,
+                    })
+                );
+                let level = self.side_levels_mut(plan.maker_side)[fill.level_index]
+                    .as_mut()
+                    .expect("plan level is occupied");
+                let removed = level.unlink(fill.slot).expect("plan maker is live");
+                debug_assert_eq!(removed.quantity, fill.quantity);
+                if level.len == 0 {
+                    let price = level.price;
+                    self.side_levels_mut(plan.maker_side)[fill.level_index] = None;
+                    let removed_index = self
+                        .side_index_mut(plan.maker_side)
+                        .remove(price, plan.maker_side == Side::Buy);
+                    debug_assert_eq!(removed_index, Some(fill.level_index));
+                }
+            } else {
+                let maker = self.side_levels_mut(plan.maker_side)[fill.level_index]
+                    .as_mut()
+                    .and_then(|level| level.get_live_mut(fill.slot))
+                    .expect("plan maker is live");
+                maker.quantity.0 -= fill.quantity.0;
+            }
+        }
+        if plan.resting_quantity.0 > 0 {
+            self.rest(order, plan.resting_quantity);
+        }
     }
 
-    fn rest(&mut self, order: NewOrder, quantity: Quantity) -> Result<(), RejectReason> {
-        let (levels, index) = match order.side {
-            Side::Buy => (&mut self.bids, &mut self.index),
-            Side::Sell => (&mut self.asks, &mut self.index),
+    /// Removes an owned resting order while retaining FIFO order for all peers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an instrument, unknown-order, or ownership rejection without
+    /// mutating the book.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the book's internal index invariants are broken, which
+    /// is a bug, not a rejection path.
+    pub fn cancel(&mut self, cancel: CancelOrder) -> Result<CancelledOrder, RejectReason> {
+        if cancel.instrument_id != self.instrument {
+            return Err(RejectReason::InvalidInstrument);
+        }
+        let (location, owner) = self
+            .locate(cancel.order_id)
+            .ok_or(RejectReason::UnknownOrder)?;
+        if owner != cancel.account_id {
+            return Err(RejectReason::NotOrderOwner);
+        }
+        // Located and owner-checked: removal cannot fail.
+        let level = self.side_levels_mut(location.side)[location.level_index]
+            .as_mut()
+            .expect("indexed level is occupied");
+        let removed = level.unlink(location.slot).expect("indexed slot is live");
+        debug_assert_eq!(removed.id, cancel.order_id);
+        if level.len == 0 {
+            let price = level.price;
+            self.side_levels_mut(location.side)[location.level_index] = None;
+            let removed_index = self
+                .side_index_mut(location.side)
+                .remove(price, location.side == Side::Buy);
+            debug_assert_eq!(removed_index, Some(location.level_index));
+        }
+        let removed_location = self.remove_index_entry(removed.index_slot, cancel.order_id);
+        debug_assert_eq!(removed_location, Some(location));
+        Ok(CancelledOrder {
+            order_id: removed.id,
+            account_id: removed.account_id,
+            quantity: removed.quantity,
+        })
+    }
+
+    #[cfg(test)]
+    fn best_crossing_level(&self, side: Side, price: PriceTicks) -> Option<usize> {
+        let maker_side = match side {
+            Side::Buy => Side::Sell,
+            Side::Sell => Side::Buy,
         };
-        let level_indices = match order.side {
-            Side::Buy => &mut self.bid_levels,
-            Side::Sell => &mut self.ask_levels,
+        let &(level_price, level_index) = self.side_index(maker_side).iter().next()?;
+        let crosses = match side {
+            Side::Buy => level_price.0 <= price.0,
+            Side::Sell => level_price.0 >= price.0,
+        };
+        if crosses { Some(level_index) } else { None }
+    }
+
+    /// Rests the unfilled remainder. Infallible: `build_plan` preflighted a
+    /// level slot with room or a free level slot, and the order index always
+    /// has spare capacity (four planes for at most `2 * LEVELS * ORDERS` live
+    /// orders).
+    fn rest(&mut self, order: NewOrder, quantity: Quantity) {
+        let Self {
+            bids,
+            asks,
+            index,
+            bid_levels,
+            ask_levels,
+            ..
+        } = self;
+        let (levels, sorted) = match order.side {
+            Side::Buy => (bids, bid_levels),
+            Side::Sell => (asks, ask_levels),
         };
         let descending = order.side == Side::Buy;
+        let level_index = if let Some(level_index) = sorted.find(order.price, descending) {
+            level_index
+        } else {
+            let level_index = sorted
+                .insert(order.price, descending)
+                .expect("level capacity was preflighted");
+            levels[level_index] = Some(PriceLevel::new(order.price));
+            level_index
+        };
         let resting = RestingOrder {
             id: order.order_id,
             account_id: order.account_id,
@@ -736,64 +812,24 @@ impl<const LEVELS: usize, const ORDERS_PER_LEVEL: usize> OrderBook<LEVELS, ORDER
             prev: NIL,
             next: NIL,
         };
-        if let Some(level_index) = levels
-            .iter()
-            .position(|level| level.is_some_and(|level| level.price == order.price))
-        {
-            let level = levels[level_index]
-                .as_mut()
-                .ok_or(RejectReason::PriceLevelCapacity)?;
-            let slot = level.push_tail(resting)?;
-            let location = OrderLocation {
-                side: order.side,
-                level_index,
-                slot,
-            };
-            let index_slot = match index.insert(order.order_id, location) {
-                Ok(index_slot) => index_slot,
-                Err(error) => {
-                    let _ = level.unlink(slot);
-                    return Err(error);
-                }
-            };
-            let Some(stored) = level.get_live_mut(slot) else {
-                let _ = level.unlink(slot);
-                return Err(RejectReason::ArithmeticOverflow);
-            };
-            stored.index_slot = index_slot;
-            return Ok(());
-        }
-        let level_index = levels
-            .iter()
-            .position(Option::is_none)
-            .ok_or(RejectReason::PriceLevelCapacity)?;
-        let mut level = PriceLevel::new(order.price);
-        let slot = level.push_tail(resting)?;
-        levels[level_index] = Some(level);
-        level_indices.insert(order.price, level_index, descending);
+        let level = levels[level_index]
+            .as_mut()
+            .expect("indexed level is occupied");
+        let slot = level
+            .push_tail(resting)
+            .expect("level order capacity was preflighted");
         let location = OrderLocation {
             side: order.side,
             level_index,
             slot,
         };
-        let index_slot = match index.insert(order.order_id, location) {
-            Ok(index_slot) => index_slot,
-            Err(error) => {
-                levels[level_index] = None;
-                level_indices.remove(level_index);
-                return Err(error);
-            }
-        };
-        let Some(stored) = levels[level_index]
-            .as_mut()
-            .and_then(|level| level.get_live_mut(slot))
-        else {
-            levels[level_index] = None;
-            level_indices.remove(level_index);
-            return Err(RejectReason::ArithmeticOverflow);
-        };
-        stored.index_slot = index_slot;
-        Ok(())
+        let index_slot = index
+            .insert(order.order_id, location)
+            .expect("order index capacity was preflighted");
+        level
+            .get_live_mut(slot)
+            .expect("slot was just inserted")
+            .index_slot = index_slot;
     }
 
     fn remove_index_entry(&mut self, index_slot: u32, order_id: OrderId) -> Option<OrderLocation> {
@@ -822,30 +858,19 @@ impl<const LEVELS: usize, const ORDERS_PER_LEVEL: usize> OrderBook<LEVELS, ORDER
         self.index.location(order_id).is_some()
     }
 
-    fn find_order(
-        &self,
-        order_id: OrderId,
-    ) -> Option<(Side, usize, usize, AccountId, Quantity, u32)> {
+    /// Resolves an order ID to its location and owner, failing closed when the
+    /// index entry is stale.
+    fn locate(&self, order_id: OrderId) -> Option<(OrderLocation, AccountId)> {
         let location = self.index.location(order_id)?;
-        let levels = match location.side {
-            Side::Buy => &self.bids,
-            Side::Sell => &self.asks,
-        };
-        let order = levels
+        let order = self
+            .side_levels(location.side)
             .get(location.level_index)?
             .as_ref()?
             .get_live(location.slot)?;
         if order.id != order_id {
             return None;
         }
-        Some((
-            location.side,
-            location.level_index,
-            location.slot,
-            order.account_id,
-            order.quantity,
-            order.index_slot,
-        ))
+        Some((location, order.account_id))
     }
 
     #[must_use]
@@ -859,16 +884,11 @@ impl<const LEVELS: usize, const ORDERS_PER_LEVEL: usize> OrderBook<LEVELS, ORDER
 
     fn digest_side(&self, digest: &mut u64, side: Side) {
         mix(digest, u64::from(side as u8));
-        let levels = match side {
-            Side::Buy => &self.bids,
-            Side::Sell => &self.asks,
-        };
-        let index = match side {
-            Side::Buy => &self.bid_levels,
-            Side::Sell => &self.ask_levels,
-        };
-        for &(_, level_index) in index.iter() {
+        let levels = self.side_levels(side);
+        for &(_, level_index) in self.side_index(side).iter() {
             if let Some(level) = levels[level_index].as_ref() {
+                // Bit-identical on any CPU byte order (MSRV precludes
+                // `cast_unsigned`).
                 mix(digest, u64::from_be_bytes(level.price.0.to_be_bytes()));
                 level.for_each_live(|order| {
                     mix(digest, order.id.0);
@@ -941,10 +961,10 @@ mod tests {
                     assert_eq!(
                         book.index
                             .slot(usize::try_from(resting.index_slot).expect("valid index slot")),
-                        Some(&IndexSlot::Occupied {
+                        &IndexSlot::Occupied {
                             order_id: resting.id,
                             location,
-                        })
+                        }
                     );
                     prev = cursor;
                     cursor = resting.next;
@@ -1195,18 +1215,18 @@ mod tests {
             slot: location.slot + 1,
             ..location
         };
-        *book.index.slot_mut(flat).expect("index slot") = IndexSlot::Occupied {
+        *book.index.slot_mut(flat) = IndexSlot::Occupied {
             order_id: OrderId(1),
             location: stale,
         };
-        assert_eq!(book.find_order(OrderId(1)), None);
+        assert_eq!(book.locate(OrderId(1)), None);
         assert_eq!(book.cancel(cancel(2)), Err(RejectReason::UnknownOrder));
         let level = book.asks[location.level_index].as_mut().expect("level");
         assert_eq!(level.unlink(stale.slot), None);
         assert_eq!(level.len, 1, "failed unlink left the level untouched");
 
         // A legitimate removal invalidates the handle: a repeat cancel fails.
-        *book.index.slot_mut(flat).expect("index slot") = IndexSlot::Occupied {
+        *book.index.slot_mut(flat) = IndexSlot::Occupied {
             order_id: OrderId(1),
             location,
         };
@@ -1514,60 +1534,51 @@ mod tests {
         dump
     }
 
+    fn assert_side_index_consistent<const LEVELS: usize, const ORDERS: usize>(
+        levels: &[Option<PriceLevel<ORDERS>>; LEVELS],
+        index: &LevelIndex<LEVELS>,
+        descending: bool,
+    ) {
+        // Sorted in side order with unique prices.
+        for window in index.entries[..index.len].windows(2) {
+            let (best, worse) = (window[0].0.0, window[1].0.0);
+            if descending {
+                assert!(best > worse, "bid index not strictly descending");
+            } else {
+                assert!(best < worse, "ask index not strictly ascending");
+            }
+        }
+        // Occupied and free slots partition the level array exactly once.
+        assert_eq!(index.len + index.free_len, LEVELS, "slot sets cover levels");
+        let mut indexed = vec![false; LEVELS];
+        for &(price, slot) in index.iter() {
+            assert!(slot < LEVELS, "indexed slot in range");
+            assert!(!indexed[slot], "slot {slot} indexed twice");
+            indexed[slot] = true;
+            let level = levels[slot].as_ref().expect("indexed level occupied");
+            assert_eq!(level.price, price, "indexed price matches the level");
+        }
+        let mut freed = vec![false; LEVELS];
+        for &slot in &index.free[..index.free_len] {
+            assert!(slot < LEVELS, "free slot in range");
+            assert!(!freed[slot], "slot {slot} freed twice");
+            assert!(!indexed[slot], "slot {slot} both free and indexed");
+            freed[slot] = true;
+        }
+        for (slot, level) in levels.iter().enumerate() {
+            assert_eq!(
+                level.is_some(),
+                indexed[slot],
+                "slot {slot} occupancy matches index"
+            );
+        }
+    }
+
     fn assert_level_index_consistent<const LEVELS: usize, const ORDERS: usize>(
         book: &OrderBook<LEVELS, ORDERS>,
     ) {
-        // Bids sorted descending by price.
-        for window in book.bid_levels.entries[..book.bid_levels.len].windows(2) {
-            assert!(
-                window[0].0.0 >= window[1].0.0,
-                "bid index not sorted descending: {:?} vs {:?}",
-                window[0].0,
-                window[1].0
-            );
-        }
-        // Asks sorted ascending by price.
-        for window in book.ask_levels.entries[..book.ask_levels.len].windows(2) {
-            assert!(
-                window[0].0.0 <= window[1].0.0,
-                "ask index not sorted ascending: {:?} vs {:?}",
-                window[0].0,
-                window[1].0
-            );
-        }
-        // Every indexed level is occupied and every occupied level is indexed.
-        let mut bid_indexed = std::vec::Vec::new();
-        for &(_, idx) in book.bid_levels.iter() {
-            assert!(
-                book.bids[idx].is_some(),
-                "bid level index points to empty slot {idx}"
-            );
-            bid_indexed.push(idx);
-        }
-        for (i, level) in book.bids.iter().enumerate() {
-            if level.is_some() {
-                assert!(
-                    bid_indexed.contains(&i),
-                    "occupied bid level {i} not in index"
-                );
-            }
-        }
-        let mut ask_indexed = std::vec::Vec::new();
-        for &(_, idx) in book.ask_levels.iter() {
-            assert!(
-                book.asks[idx].is_some(),
-                "ask level index points to empty slot {idx}"
-            );
-            ask_indexed.push(idx);
-        }
-        for (i, level) in book.asks.iter().enumerate() {
-            if level.is_some() {
-                assert!(
-                    ask_indexed.contains(&i),
-                    "occupied ask level {i} not in index"
-                );
-            }
-        }
+        assert_side_index_consistent(&book.bids, &book.bid_levels, true);
+        assert_side_index_consistent(&book.asks, &book.ask_levels, false);
     }
 
     #[test]
@@ -1799,5 +1810,127 @@ mod tests {
             );
             assert_index_consistent(&book);
         }
+    }
+
+    #[test]
+    fn duplicate_resting_id_is_rejected_without_mutation() {
+        let mut book = OrderBook::<2, 2>::new(InstrumentId(1));
+        let mut reports = ReportBuffer::<2>::new();
+        book.submit(order(1, 100, 1, Side::Sell), &mut reports)
+            .expect("rest ask");
+        let digest = book.stable_digest();
+        assert_eq!(
+            book.submit(order(1, 101, 1, Side::Sell), &mut reports),
+            Err(RejectReason::DuplicateOrderId)
+        );
+        assert_eq!(book.stable_digest(), digest);
+        assert_index_consistent(&book);
+    }
+
+    #[test]
+    fn crossing_stops_at_the_taker_price_limit() {
+        let mut book = OrderBook::<8, 2>::new(InstrumentId(1));
+        let mut reports = ReportBuffer::<8>::new();
+        for (id, price) in [(1, 100), (2, 105), (3, 110)] {
+            book.submit(order(id, price, 2, Side::Sell), &mut reports)
+                .expect("rest ask");
+            reports.clear();
+        }
+        // A buy at 105 must not touch the 110 ask.
+        let summary = book
+            .submit(order(4, 105, 4, Side::Buy), &mut reports)
+            .expect("cross two levels");
+        assert_eq!(summary.state, OrderState::Filled);
+        let makers: std::vec::Vec<_> = reports.iter().map(|report| report.maker_order_id).collect();
+        assert_eq!(makers, [OrderId(1), OrderId(2)]);
+        assert_eq!(book.order_count(), 1);
+        assert_index_consistent(&book);
+        assert_level_index_consistent(&book);
+    }
+
+    #[test]
+    fn partial_cross_then_rest_keeps_price_time_position() {
+        let mut book = OrderBook::<4, 4>::new(InstrumentId(1));
+        let mut reports = ReportBuffer::<4>::new();
+        book.submit(order(1, 100, 5, Side::Sell), &mut reports)
+            .expect("rest ask");
+        reports.clear();
+        // Taker fills the 5 and rests the remaining 2 as a bid at 100.
+        let summary = book
+            .submit(order(2, 100, 7, Side::Buy), &mut reports)
+            .expect("partial cross then rest");
+        assert_eq!(summary.state, OrderState::PartiallyFilled);
+        assert_eq!(summary.resting_quantity, Quantity(2));
+        reports.clear();
+        // A second bid at the same price queues behind the rested taker.
+        book.submit(order(3, 100, 1, Side::Buy), &mut reports)
+            .expect("join bid level");
+        reports.clear();
+        // A sell at 100 fills the rested taker (2), then the queued bid (1 of
+        // 1), and rests its own remainder: price-time order within the level.
+        book.submit(order(4, 100, 4, Side::Sell), &mut reports)
+            .expect("cross bid level");
+        let makers: std::vec::Vec<_> = reports.iter().map(|report| report.maker_order_id).collect();
+        assert_eq!(makers, [OrderId(2), OrderId(3)]);
+        assert_index_consistent(&book);
+    }
+
+    #[test]
+    fn exact_report_capacity_fit_succeeds() {
+        let mut book = OrderBook::<4, 2>::new(InstrumentId(1));
+        let mut reports = ReportBuffer::<2>::new();
+        book.submit(order(1, 100, 1, Side::Sell), &mut reports)
+            .expect("first ask");
+        reports.clear();
+        book.submit(order(2, 101, 1, Side::Sell), &mut reports)
+            .expect("second ask");
+        reports.clear();
+        let summary = book
+            .submit(order(3, 101, 2, Side::Buy), &mut reports)
+            .expect("both fills exactly fit the report buffer");
+        assert_eq!(summary.state, OrderState::Filled);
+        assert_eq!(summary.report_count, 2);
+        assert_index_consistent(&book);
+    }
+
+    #[test]
+    fn emptied_level_slot_is_reused_by_later_rest() {
+        let mut book = OrderBook::<4, 2>::new(InstrumentId(1));
+        let mut reports = ReportBuffer::<4>::new();
+        book.submit(order(1, 100, 2, Side::Sell), &mut reports)
+            .expect("rest ask");
+        reports.clear();
+        // Fully fill the only ask level: it is removed and its slot freed.
+        book.submit(order(2, 100, 2, Side::Buy), &mut reports)
+            .expect("fill the level");
+        reports.clear();
+        assert_level_index_consistent(&book);
+        // Rest at the same price again: the freed slot is reused.
+        book.submit(order(3, 100, 1, Side::Sell), &mut reports)
+            .expect("re-rest at the same price");
+        assert_eq!(book.order_count(), 1);
+        assert_index_consistent(&book);
+        assert_level_index_consistent(&book);
+    }
+
+    #[test]
+    fn rejected_rest_levels_and_reports_stay_untouched() {
+        let mut book = OrderBook::<2, 2>::new(InstrumentId(1));
+        let mut reports = ReportBuffer::<1>::new();
+        for (id, price) in [(1, 101), (2, 102)] {
+            book.submit(order(id, price, 1, Side::Sell), &mut reports)
+                .expect("rest ask");
+            reports.clear();
+        }
+        // Both level slots are occupied: a new resting price must reject.
+        let digest = book.stable_digest();
+        assert_eq!(
+            book.submit(order(3, 99, 1, Side::Sell), &mut reports),
+            Err(RejectReason::PriceLevelCapacity)
+        );
+        assert_eq!(reports.len(), 0);
+        assert_eq!(book.stable_digest(), digest);
+        assert_index_consistent(&book);
+        assert_level_index_consistent(&book);
     }
 }

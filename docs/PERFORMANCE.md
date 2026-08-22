@@ -126,8 +126,8 @@ cell.
 The risk harness compares v0.3.0's linear-scan risk state with v0.4.0's
 fixed-capacity open-addressed indices for accounts and reservations. Each
 operation runs 256 timed samples against a `RiskEngine::<64, 1024>` at
-stated occupancy. Reservation occupancy sweeps are 102, 512, and 921 (≈10%,
-50%, 90% of capacity). Account occupancy sweeps are 6, 32, and 57 (≈10%,
+stated occupancy. Reservation occupancy sweeps are 102, 512, and 921 (â‰ˆ10%,
+50%, 90% of capacity). Account occupancy sweeps are 6, 32, and 57 (â‰ˆ10%,
 50%, 90% of capacity). All samples are timed with `Instant`; per-sample
 overhead is included.
 
@@ -308,6 +308,19 @@ workload produced the unchanged logical digest `64321af91735b704`. Where a
 range is shown, it spans consecutive runs on the noisy desktop; percentile
 shapes were stable across runs.
 
+Command: `cargo build --release -p hft-bench`, direct runs of
+`target/release/hft-bench.exe`. Environment: Intel N95, Windows 11 Pro build
+26200, Rust 1.96.0/LLVM 22.1.2, `x86_64-pc-windows-msvc`, fat LTO, one
+codegen unit, aborting panics. 2,000 samples per cell; mean and max recorded.
+Desktop scheduling and frequency changes remain sources of noise.
+
+## v0.7.0 Regression Check
+
+No engine changes; this release adds seeded property and reference-model test
+coverage. The full release suite was rerun on the same desktop environment:
+the gateway workload produced the unchanged logical digest
+`64321af91735b704`, queue occupancy 64 with one backpressure event, and zero
+allocation/deallocation deltas in every scenario.
 ## Dedicated Linux Protocol
 
 Record all of the following with each result:

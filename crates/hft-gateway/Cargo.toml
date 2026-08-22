@@ -13,5 +13,9 @@ hft-risk = { path = "../hft-risk" }
 hft-types = { path = "../hft-types" }
 hft-wire = { path = "../hft-wire" }
 
+[dev-dependencies]
+hft-model = { path = "../hft-model" }
+hft-replay = { path = "../hft-replay" }
+
 [lints]
 workspace = true

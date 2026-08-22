@@ -111,21 +111,21 @@ report-full rejection, and deep rejection at 72-115 ns mean with zero
 allocations and unchanged logical digest. See the
 [performance methodology](PERFORMANCE.md) for the workload and evidence.
 
-## Next
-
 ### v0.7.0 - Property and Reference Models
 
-- **Purpose / scope:** add deterministic bounded command generation and simple
-  reference models before more order semantics.
-- **Invariants / tests:** quantity conservation, non-negative remainder,
-  price-time priority, owner cancel, unique terminal transition, reservation
-  equals live exposure, replay equality, and lossless accepted SPSC elements.
-  Later features must add FOK atomicity, IOC/post-only behavior, replace
-  atomicity, snapshot-tail equality, and deterministic sharding properties.
-- **Benchmarks:** run the release suite to detect instrumentation regressions;
-  property-test speed is informational.
-- **Exit:** reproducible seeds and model comparisons run in CI.
-- **Dependencies / limits:** follows v0.3-v0.6; state exploration is bounded.
+A shared test-support crate (`hft-model`) provides seeded deterministic
+command generation, a naive array reference book, and a gateway-level
+reference model that mirrors sequencing, duplicate-id policy, risk
+reservations, and matching outcomes. Fixed-seed CI coverage now checks
+quantity conservation, non-negative remainder, price-time priority via fill
+sequence equality across multiple book shapes, owner cancel, unique terminal
+transitions, reservation-equals-live-exposure account snapshots at every
+step, replay digest equality over full byte streams including rejections,
+and lossless SPSC delivery under seeded interleavings. The release benchmark
+suite was rerun with unchanged digests and zero measured hot-path
+allocations.
+
+## Next
 
 ### v0.8.0 - Reproducible Benchmark Suite
 

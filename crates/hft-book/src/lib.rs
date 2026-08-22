@@ -919,6 +919,7 @@ fn mix(digest: &mut u64, value: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hft_model::Command;
     use hft_types::AccountId;
 
     fn order(id: u64, price: i64, quantity: u64, side: Side) -> NewOrder {
@@ -1283,238 +1284,9 @@ mod tests {
         assert_index_consistent(&book);
     }
 
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    struct ModelOrder {
-        id: u64,
-        account: u32,
-        quantity: u64,
-        sequence: u64,
-    }
-
-    /// Reference array model: per-level dense FIFO with shift removal.
-    #[derive(Default)]
-    struct ModelBook {
-        bids: std::vec::Vec<(i64, std::collections::VecDeque<ModelOrder>)>,
-        asks: std::vec::Vec<(i64, std::collections::VecDeque<ModelOrder>)>,
-    }
-
-    type ModelLevels = std::vec::Vec<(i64, std::collections::VecDeque<ModelOrder>)>;
-
-    impl ModelBook {
-        /// Validation and preflight; mirrors the book's atomic rejection.
-        fn plan(
-            &self,
-            order: &NewOrder,
-            report_capacity: usize,
-            level_cap: usize,
-            order_cap: usize,
-        ) -> Result<std::vec::Vec<i64>, RejectReason> {
-            if order.price.0 <= 0 {
-                return Err(RejectReason::InvalidPrice);
-            }
-            if order.quantity.0 == 0 {
-                return Err(RejectReason::InvalidQuantity);
-            }
-            if [&self.bids, &self.asks]
-                .into_iter()
-                .flatten()
-                .flat_map(|(_, queue)| queue)
-                .any(|resting| resting.id == order.order_id.0)
-            {
-                return Err(RejectReason::DuplicateOrderId);
-            }
-            let (maker_levels, own_levels) = match order.side {
-                Side::Buy => (&self.asks, &self.bids),
-                Side::Sell => (&self.bids, &self.asks),
-            };
-            let mut crossing: std::vec::Vec<i64> = maker_levels
-                .iter()
-                .map(|(price, _)| *price)
-                .filter(|price| match order.side {
-                    Side::Buy => *price <= order.price.0,
-                    Side::Sell => *price >= order.price.0,
-                })
-                .collect();
-            crossing.sort_unstable();
-            if order.side == Side::Sell {
-                crossing.reverse();
-            }
-            let mut remaining = order.quantity.0;
-            let mut report_count = 0_usize;
-            'simulate: for price in &crossing {
-                let (_, queue) = maker_levels
-                    .iter()
-                    .find(|(level_price, _)| level_price == price)
-                    .expect("crossing level");
-                for maker in queue {
-                    if remaining == 0 {
-                        break 'simulate;
-                    }
-                    remaining -= remaining.min(maker.quantity);
-                    report_count += 1;
-                }
-            }
-            if report_count > report_capacity {
-                return Err(RejectReason::ReportCapacity);
-            }
-            if remaining > 0 {
-                if let Some((_, queue)) =
-                    own_levels.iter().find(|(price, _)| *price == order.price.0)
-                {
-                    if queue.len() == order_cap {
-                        return Err(RejectReason::PriceLevelOrderCapacity);
-                    }
-                } else if own_levels.len() == level_cap {
-                    return Err(RejectReason::PriceLevelCapacity);
-                }
-            }
-            Ok(crossing)
-        }
-
-        fn submit(
-            &mut self,
-            order: &NewOrder,
-            report_capacity: usize,
-            level_cap: usize,
-            order_cap: usize,
-        ) -> Result<(OrderState, Quantity, Quantity, std::vec::Vec<OrderId>), RejectReason>
-        {
-            let crossing = self.plan(order, report_capacity, level_cap, order_cap)?;
-            let mut remaining = order.quantity.0;
-            let maker_levels = match order.side {
-                Side::Buy => &mut self.asks,
-                Side::Sell => &mut self.bids,
-            };
-            let mut makers = std::vec::Vec::new();
-            for price in &crossing {
-                if remaining == 0 {
-                    break;
-                }
-                let position = maker_levels
-                    .iter()
-                    .position(|(level_price, _)| level_price == price)
-                    .expect("crossing level");
-                let queue = &mut maker_levels[position].1;
-                while remaining > 0 {
-                    let Some(front) = queue.front_mut() else {
-                        break;
-                    };
-                    let traded = remaining.min(front.quantity);
-                    makers.push(OrderId(front.id));
-                    remaining -= traded;
-                    front.quantity -= traded;
-                    if front.quantity == 0 {
-                        queue.pop_front();
-                    }
-                }
-                if queue.is_empty() {
-                    maker_levels.remove(position);
-                }
-            }
-            if remaining > 0 {
-                let own_levels = match order.side {
-                    Side::Buy => &mut self.bids,
-                    Side::Sell => &mut self.asks,
-                };
-                let resting = ModelOrder {
-                    id: order.order_id.0,
-                    account: order.account_id.0,
-                    quantity: remaining,
-                    sequence: order.sequence.0,
-                };
-                match own_levels
-                    .iter_mut()
-                    .find(|(price, _)| *price == order.price.0)
-                {
-                    Some((_, queue)) => queue.push_back(resting),
-                    None => own_levels
-                        .push((order.price.0, std::collections::VecDeque::from([resting]))),
-                }
-            }
-            let filled = order.quantity.0 - remaining;
-            let state = if remaining == 0 {
-                OrderState::Filled
-            } else if filled == 0 {
-                OrderState::Accepted
-            } else {
-                OrderState::PartiallyFilled
-            };
-            Ok((state, Quantity(filled), Quantity(remaining), makers))
-        }
-
-        fn cancel(&mut self, cancel: &CancelOrder) -> Result<(u64, u32, u64), RejectReason> {
-            if let Some(result) = Self::cancel_from(&mut self.bids, cancel) {
-                return result;
-            }
-            if let Some(result) = Self::cancel_from(&mut self.asks, cancel) {
-                return result;
-            }
-            Err(RejectReason::UnknownOrder)
-        }
-
-        fn cancel_from(
-            levels: &mut ModelLevels,
-            cancel: &CancelOrder,
-        ) -> Option<Result<(u64, u32, u64), RejectReason>> {
-            for position in 0..levels.len() {
-                let queue = &mut levels[position].1;
-                let Some(index) = queue.iter().position(|order| order.id == cancel.order_id.0)
-                else {
-                    continue;
-                };
-                let order = queue[index];
-                if order.account != cancel.account_id.0 {
-                    return Some(Err(RejectReason::NotOrderOwner));
-                }
-                queue.remove(index);
-                if queue.is_empty() {
-                    levels.remove(position);
-                }
-                return Some(Ok((order.id, order.account, order.quantity)));
-            }
-            None
-        }
-    }
-
-    struct Lcg(u64);
-
-    impl Lcg {
-        fn below(&mut self, bound: u64) -> u64 {
-            self.0 = self
-                .0
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1_442_695_040_888_963_407);
-            (self.0 >> 33) % bound
-        }
-    }
-
-    type Dump = std::vec::Vec<(Side, i64, u64, u64, u64)>;
-
-    fn dump_levels(side: Side, levels: &ModelLevels) -> Dump {
-        let mut dump = std::vec::Vec::new();
-        let mut prices: std::vec::Vec<i64> = levels.iter().map(|(price, _)| *price).collect();
-        prices.sort_unstable();
-        for price in prices {
-            let (_, queue) = levels
-                .iter()
-                .find(|(level_price, _)| *level_price == price)
-                .expect("dump level");
-            for order in queue {
-                dump.push((side, price, order.id, order.quantity, order.sequence));
-            }
-        }
-        dump
-    }
-
-    fn dump_model(model: &ModelBook) -> Dump {
-        let mut dump = dump_levels(Side::Buy, &model.bids);
-        dump.extend(dump_levels(Side::Sell, &model.asks));
-        dump
-    }
-
     fn dump_book<const LEVELS: usize, const ORDERS: usize>(
         book: &OrderBook<LEVELS, ORDERS>,
-    ) -> Dump {
+    ) -> hft_model::ModelDump {
         let mut dump = std::vec::Vec::new();
         for (side, levels) in [(Side::Buy, &book.bids), (Side::Sell, &book.asks)] {
             let mut prices: std::vec::Vec<i64> =
@@ -1726,86 +1498,84 @@ mod tests {
         const ORDERS: usize = 4;
         const REPORTS: usize = 8;
         let mut book = OrderBook::<LEVELS, ORDERS>::new(InstrumentId(1));
-        let mut model = ModelBook::default();
+        let mut model = hft_model::ModelBook::default();
         let mut reports = ReportBuffer::<REPORTS>::new();
-        let mut lcg = Lcg(0x5eed);
-        let mut next_id = 1_u64;
+        let mut generator = hft_model::CommandGen::new(
+            hft_model::GenConfig {
+                accounts: 2,
+                minimum_price: 99,
+                maximum_price: 101,
+                max_quantity: 3,
+                cancel_probability_pct: 60,
+                duplicate_id_probability_pct: 10,
+            },
+            InstrumentId(1),
+            0x5eed,
+        );
         for step in 0..600_u64 {
-            if next_id == 1 || lcg.below(5) < 3 {
-                let id = next_id;
-                next_id += 1;
-                let side = if lcg.below(2) == 0 {
-                    Side::Buy
-                } else {
-                    Side::Sell
-                };
-                let price = 99 + i64::try_from(lcg.below(3)).expect("small price");
-                let command = NewOrder {
-                    order_id: OrderId(id),
-                    account_id: AccountId(1 + u32::try_from(lcg.below(2)).expect("small account")),
-                    instrument_id: InstrumentId(1),
-                    price: PriceTicks(price),
-                    quantity: Quantity(1 + lcg.below(3)),
-                    sequence: SequenceNumber(id),
-                    side,
-                };
-                reports.clear();
-                let actual = book.submit(command, &mut reports);
-                let expected = model.submit(&command, REPORTS, LEVELS, ORDERS);
-                match (actual, expected) {
-                    (Ok(summary), Ok((state, filled, resting, makers))) => {
-                        assert_eq!(summary.state, state, "state at step {step}");
-                        assert_eq!(summary.filled_quantity, filled, "filled at step {step}");
-                        assert_eq!(summary.resting_quantity, resting, "resting at step {step}");
-                        let actual_makers: std::vec::Vec<_> =
-                            reports.iter().map(|report| report.maker_order_id).collect();
-                        assert_eq!(actual_makers, makers, "maker sequence at step {step}");
-                    }
-                    (Err(actual_error), Err(expected_error)) => {
-                        assert_eq!(
-                            actual_error, expected_error,
-                            "submit rejection at step {step}"
-                        );
-                    }
-                    (actual, expected) => {
-                        panic!("submit divergence at step {step}: {actual:?} vs {expected:?}");
+            match generator.next_command() {
+                Command::New(command) => {
+                    reports.clear();
+                    let actual = book.submit(command, &mut reports);
+                    let expected = model.submit(&command, REPORTS, LEVELS, ORDERS);
+                    match (actual, expected) {
+                        (Ok(summary), Ok((state, filled, resting, fills))) => {
+                            assert_eq!(summary.state, state, "state at step {step}");
+                            assert_eq!(summary.filled_quantity, filled, "filled at step {step}");
+                            assert_eq!(summary.resting_quantity, resting, "resting at step {step}");
+                            let actual_fills: std::vec::Vec<_> = reports
+                                .iter()
+                                .map(|report| {
+                                    (report.maker_order_id, report.price, report.quantity)
+                                })
+                                .collect();
+                            let expected_fills: std::vec::Vec<_> = fills
+                                .iter()
+                                .map(|fill| (fill.maker_order_id, fill.price, fill.quantity))
+                                .collect();
+                            assert_eq!(actual_fills, expected_fills, "fills at step {step}");
+                        }
+                        (Err(actual_error), Err(expected_error)) => {
+                            assert_eq!(
+                                actual_error, expected_error,
+                                "submit rejection at step {step}"
+                            );
+                        }
+                        (actual, expected) => {
+                            panic!("submit divergence at step {step}: {actual:?} vs {expected:?}");
+                        }
                     }
                 }
-            } else {
-                let command = CancelOrder {
-                    order_id: OrderId(1 + lcg.below(next_id - 1)),
-                    account_id: AccountId(1 + u32::try_from(lcg.below(3)).expect("small account")),
-                    instrument_id: InstrumentId(1),
-                    sequence: SequenceNumber(next_id),
-                };
-                let actual = book.cancel(command);
-                let expected = model.cancel(&command);
-                match (actual, expected) {
-                    (Ok(cancelled), Ok((id, account, quantity))) => {
-                        assert_eq!(cancelled.order_id.0, id, "cancel id at step {step}");
-                        assert_eq!(
-                            cancelled.account_id.0, account,
-                            "cancel account at step {step}"
-                        );
-                        assert_eq!(
-                            cancelled.quantity.0, quantity,
-                            "cancel quantity at step {step}"
-                        );
-                    }
-                    (Err(actual_error), Err(expected_error)) => {
-                        assert_eq!(
-                            actual_error, expected_error,
-                            "cancel rejection at step {step}"
-                        );
-                    }
-                    (actual, expected) => {
-                        panic!("cancel divergence at step {step}: {actual:?} vs {expected:?}");
+                Command::Cancel(command) => {
+                    let actual = book.cancel(command);
+                    let expected = model.cancel(&command);
+                    match (actual, expected) {
+                        (Ok(cancelled), Ok((id, account, quantity))) => {
+                            assert_eq!(cancelled.order_id.0, id, "cancel id at step {step}");
+                            assert_eq!(
+                                cancelled.account_id.0, account,
+                                "cancel account at step {step}"
+                            );
+                            assert_eq!(
+                                cancelled.quantity.0, quantity,
+                                "cancel quantity at step {step}"
+                            );
+                        }
+                        (Err(actual_error), Err(expected_error)) => {
+                            assert_eq!(
+                                actual_error, expected_error,
+                                "cancel rejection at step {step}"
+                            );
+                        }
+                        (actual, expected) => {
+                            panic!("cancel divergence at step {step}: {actual:?} vs {expected:?}");
+                        }
                     }
                 }
             }
             assert_eq!(
                 dump_book(&book),
-                dump_model(&model),
+                hft_model::dump_model(&model),
                 "book state at step {step}"
             );
             assert_index_consistent(&book);

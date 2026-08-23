@@ -11,7 +11,7 @@ RX frame lease -> lifetime-bound binary parsing -> session sequencing ->
 indexed pre-trade risk -> price-time matching/cancel -> execution reports ->
 replay digest.
 
-Current version: **v0.7.0**, under active development and not production
+Current version: **v0.8.0**, under active development and not production
 ready. The project implements exchange-infrastructure mechanics by hand:
 deterministic state transitions, fixed memory layouts, conservative
 pre-trade risk, explicit backpressure, price-time priority, session

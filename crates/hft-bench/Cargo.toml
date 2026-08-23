@@ -10,6 +10,7 @@ rust-version.workspace = true
 hft-book = { path = "../hft-book" }
 hft-gateway = { path = "../hft-gateway" }
 hft-io = { path = "../hft-io" }
+hft-model = { path = "../hft-model" }
 hft-risk = { path = "../hft-risk" }
 hft-spsc = { path = "../hft-spsc" }
 hft-types = { path = "../hft-types" }

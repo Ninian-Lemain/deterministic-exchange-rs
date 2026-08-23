@@ -321,6 +321,46 @@ coverage. The full release suite was rerun on the same desktop environment:
 the gateway workload produced the unchanged logical digest
 `64321af91735b704`, queue occupancy 64 with one backpressure event, and zero
 allocation/deallocation deltas in every scenario.
+
+## v0.8.0 Reproducible Benchmark Suite
+
+The harness now prints one JSON record per line (`hft-bench-results/1`).
+Each record carries an explicit boundary (component, gateway, or network),
+samples, mean, p50/p90/p99/p99.9/max, ops/s, allocation and deallocation
+deltas, and a workload checksum. The schema fixture at
+`crates/hft-bench/tests/fixtures/bench_results.schema.json` is validated in
+CI against a reduced-suite run that also asserts roadmap workload coverage.
+Every scenario warms up untimed, keeps its fixture in a steady state, and
+fails on any allocation inside its measured region.
+
+New workloads: alternating new-order/cancel frame parsing, an SPSC push/pop
+random walk with occupancy high-water and backpressure counts, a seeded
+20,000-command mixed gateway session whose checksum is the final digest, and
+deep-book takers consuming 1/8/64 levels per sample with untimed replenish.
+Risk cells now emit real checksums instead of a constant.
+
+Two findings from validating this suite:
+
+- The multi-fill match-plan fixture had rested deep makers, so its taker
+  filled once at the best price while the output label claimed eight fills;
+  it now rests single-unit makers across eight levels with untimed
+  replenishment and asserts eight reports per taker. Pre-v0.8 numbers for
+  that cell are not comparable.
+- Long seeded sessions exposed a release-only engine defect: both
+  open-addressed indexes invoked their back-shift update closures inside
+  `debug_assert!`, so release binaries stranded moved handles, leaked index
+  entries until a table filled, then spun forever removing from it. The
+  closures now run unconditionally, with regression tests at the risk and
+  book levels. The first complete fixed run reproduces the pre-existing
+  gateway digest `64321af91735b704`.
+
+Representative full pass on the reference desktop: gateway pair-rest-fill
+mean 136 ns/message (2,000 samples), cancel sweep 512x1 median 49 ns/cancel,
+mixed seeded session mean 231 ns/command, deep-book traversal cost scaling
+with the cycled depth. Cycles, instructions, branch, and cache-miss counters
+are unavailable on this host and are deferred to the dedicated Linux
+qualification protocol below.
+
 ## Dedicated Linux Protocol
 
 Record all of the following with each result:

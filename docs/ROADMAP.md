@@ -125,22 +125,26 @@ and lossless SPSC delivery under seeded interleavings. The release benchmark
 suite was rerun with unchanged digests and zero measured hot-path
 allocations.
 
-## Next
-
 ### v0.8.0 - Reproducible Benchmark Suite
 
-- **Purpose / scope:** add parser; all risk operations; rest; best-price match;
-  single/multi-fill; head/middle/tail cancel; SPSC; gateway; mixed/deep-book;
-  and high-reservation-occupancy workloads with fixed seeded distributions.
-  IOC, FOK, post-only, and replace releases must add their cases to this suite.
-- **Invariants / tests:** deterministic workloads/checksums, warm-up and sample
-  validation, allocation failure, and a machine-readable schema fixture.
-- **Benchmarks:** p50/p90/p99/p99.9/max, throughput, cycles, instructions,
-  branches/misses, cache misses, allocations, queue occupancy, and book shape.
-- **Exit:** commit-comparable output with component, gateway, and network
-  boundaries separated.
-- **Dependencies / limits:** follows v0.4-v0.7; CI validates correctness, not
-  latency.
+The harness emits one machine-readable JSON record per cell (schema fixture
+validated in CI against a reduced run) with p50/p90/p99/p99.9/max,
+throughput, allocation deltas, deterministic checksums, and separated
+component, gateway, and network boundaries. Workloads cover wire parsing,
+SPSC ring traffic with occupancy and backpressure tracking, a seeded mixed
+gateway session, deep-book traversals at cycled depths, head/middle/tail
+FIFO operations across depths, full risk-operation sweeps at three
+reservation occupancies, best-price discovery, and match-plan scenarios;
+every scenario warms up untimed, validates percentile ordering, and fails on
+any measured allocation. Validating the suite exposed a release-only defect:
+both open-addressed indexes ran their back-shift update closures inside
+debug_assert, stranding moved handles and leaking entries in release builds.
+The closures now run unconditionally with regression coverage. Perf counters
+(cycles, instructions, branches, cache misses) stay deferred to the dedicated
+Linux qualification; Windows runs validate correctness and allocation
+behavior only.
+
+## Next
 
 ## Planned Order Semantics
 

@@ -1,0 +1,37 @@
+{
+  "schema": "hft-bench-results/1",
+  "boundaries": ["component", "gateway", "network"],
+  "components": ["parser", "spsc", "queue", "book", "risk", "gateway"],
+  "required_strings": ["boundary", "component", "scenario"],
+  "required_numbers": [
+    "samples",
+    "mean_ns",
+    "p50_ns",
+    "p90_ns",
+    "p99_ns",
+    "p99_9_ns",
+    "max_ns",
+    "ops_per_second",
+    "allocations",
+    "deallocations"
+  ],
+  "checksum_key": "checksum",
+  "param_names": [
+    "messages",
+    "capacity",
+    "max_occupancy",
+    "backpressure_events",
+    "depth",
+    "book_bytes",
+    "index",
+    "occupancy",
+    "engine_bytes",
+    "shape",
+    "levels",
+    "orders_per_level",
+    "plan",
+    "commands",
+    "new_frames",
+    "cancel_frames"
+  ]
+}

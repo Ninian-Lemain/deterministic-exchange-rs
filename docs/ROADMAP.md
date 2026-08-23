@@ -172,15 +172,19 @@ never trades, joins the FIFO tail, rejection leaves book state untouched.
 
 ### v0.11.0 - Replace and Order Lifecycle
 
-- **Purpose / scope:** add owned quantity reduction/increase and price change;
-  price changes/increases lose priority, allowed reductions retain it.
-- **Invariants / tests:** rejected replace atomic, reservation restored on
-  failure, terminal orders immutable, no double fill/cancel, explicit states.
-- **Benchmarks:** reduce/increase/reprice and accepted/rejected paths; report book
-  and risk costs separately.
-- **Exit:** property model covers replace churn and every transition.
-- **Dependencies / limits:** requires v0.3, v0.4, v0.7, v0.8; venue-specific
-  amend policies remain out of scope.
+Protocol type 3 adds owned replaces. A same-price quantity reduction patches
+the resting slot in place and keeps FIFO priority; a price change or increase
+loses priority, re-enters at the destination tail after capacity preflight,
+and rejects with `ReplaceWouldCross` when the new price would cross the
+opposing best. Risk reservations adjust before the book mutates and are
+restored exactly on any rejected replace; filled or canceled orders are
+terminal and reject further replaces as unknown. The reference model mirrors
+every transition, seeded property sessions drive replace churn through
+gateway equivalence, per-step reservation-equals-exposure snapshots, and
+replay equality, and explicit tests lock rejected-replace atomicity,
+priority retention, and terminal immutability. Benchmarks report book-side
+reduce/increase/reprice/reject cells and a separate risk-only adjustment
+cell.
 
 ## Planned Verification and Qualification
 

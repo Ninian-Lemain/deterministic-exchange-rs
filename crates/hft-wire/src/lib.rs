@@ -2,17 +2,20 @@
 
 use hft_io::RxFrame;
 use hft_types::{
-    AccountId, CancelOrder, InstrumentId, NewOrder, OrderId, PriceTicks, Quantity, SequenceNumber,
-    Side, TimeInForce,
+    AccountId, CancelOrder, InstrumentId, NewOrder, OrderId, PriceTicks, Quantity, ReplaceOrder,
+    SequenceNumber, Side, TimeInForce,
 };
 
 pub const PROTOCOL_VERSION: u8 = 2;
 pub const NEW_ORDER_TYPE: u8 = 1;
 pub const CANCEL_ORDER_TYPE: u8 = 2;
+pub const REPLACE_ORDER_TYPE: u8 = 3;
 pub const NEW_ORDER_LEN: usize = 46;
 const NEW_ORDER_WIRE_LEN: u16 = 46;
 pub const CANCEL_ORDER_LEN: usize = 28;
 const CANCEL_ORDER_WIRE_LEN: u16 = 28;
+pub const REPLACE_ORDER_LEN: usize = 44;
+const REPLACE_ORDER_WIRE_LEN: u16 = 44;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ParseError {
@@ -28,6 +31,7 @@ pub enum ParseError {
 pub enum BorrowedMessage<'frame> {
     NewOrder(BorrowedNewOrder<'frame>),
     CancelOrder(BorrowedCancelOrder<'frame>),
+    ReplaceOrder(BorrowedReplaceOrder<'frame>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -42,7 +46,8 @@ impl BorrowedNewOrder<'_> {
             time_in_force: match self.bytes[45] {
                 value if value == TimeInForce::Gtc as u8 => TimeInForce::Gtc,
                 value if value == TimeInForce::Ioc as u8 => TimeInForce::Ioc,
-                _ => TimeInForce::Fok,
+                value if value == TimeInForce::Fok as u8 => TimeInForce::Fok,
+                _ => TimeInForce::PostOnly,
             },
             order_id: OrderId(read_u64(self.bytes, 4)),
             account_id: AccountId(read_u32(self.bytes, 12)),
@@ -86,6 +91,30 @@ impl BorrowedCancelOrder<'_> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BorrowedReplaceOrder<'frame> {
+    bytes: &'frame [u8],
+}
+
+impl BorrowedReplaceOrder<'_> {
+    #[must_use]
+    pub fn to_owned(self) -> ReplaceOrder {
+        ReplaceOrder {
+            order_id: OrderId(read_u64(self.bytes, 4)),
+            account_id: AccountId(read_u32(self.bytes, 12)),
+            instrument_id: InstrumentId(read_u32(self.bytes, 16)),
+            sequence: SequenceNumber(read_u64(self.bytes, 20)),
+            price: PriceTicks(read_i64(self.bytes, 28)),
+            quantity: Quantity(read_u64(self.bytes, 36)),
+        }
+    }
+
+    #[must_use]
+    pub const fn wire_bytes(&self) -> &[u8] {
+        self.bytes
+    }
+}
+
 /// # Errors
 ///
 /// Returns a specific [`ParseError`] for an invalid header, length, type, or
@@ -118,6 +147,7 @@ pub fn parse_message<'frame>(
                 value if value == TimeInForce::Gtc as u8
                     || value == TimeInForce::Ioc as u8
                     || value == TimeInForce::Fok as u8
+                    || value == TimeInForce::PostOnly as u8
             ) {
                 return Err(ParseError::InvalidTimeInForce);
             }
@@ -128,6 +158,14 @@ pub fn parse_message<'frame>(
                 return Err(ParseError::InvalidLength);
             }
             Ok(BorrowedMessage::CancelOrder(BorrowedCancelOrder { bytes }))
+        }
+        REPLACE_ORDER_TYPE => {
+            if declared != REPLACE_ORDER_LEN {
+                return Err(ParseError::InvalidLength);
+            }
+            Ok(BorrowedMessage::ReplaceOrder(BorrowedReplaceOrder {
+                bytes,
+            }))
         }
         _ => Err(ParseError::UnknownMessageType),
     }
@@ -160,6 +198,21 @@ pub fn encode_cancel_order(cancel: CancelOrder) -> [u8; CANCEL_ORDER_LEN] {
     bytes[12..16].copy_from_slice(&cancel.account_id.0.to_be_bytes());
     bytes[16..20].copy_from_slice(&cancel.instrument_id.0.to_be_bytes());
     bytes[20..28].copy_from_slice(&cancel.sequence.0.to_be_bytes());
+    bytes
+}
+
+#[must_use]
+pub fn encode_replace_order(replace: ReplaceOrder) -> [u8; REPLACE_ORDER_LEN] {
+    let mut bytes = [0_u8; REPLACE_ORDER_LEN];
+    bytes[0] = PROTOCOL_VERSION;
+    bytes[1] = REPLACE_ORDER_TYPE;
+    bytes[2..4].copy_from_slice(&REPLACE_ORDER_WIRE_LEN.to_be_bytes());
+    bytes[4..12].copy_from_slice(&replace.order_id.0.to_be_bytes());
+    bytes[12..16].copy_from_slice(&replace.account_id.0.to_be_bytes());
+    bytes[16..20].copy_from_slice(&replace.instrument_id.0.to_be_bytes());
+    bytes[20..28].copy_from_slice(&replace.sequence.0.to_be_bytes());
+    bytes[28..36].copy_from_slice(&replace.price.0.to_be_bytes());
+    bytes[36..44].copy_from_slice(&replace.quantity.0.to_be_bytes());
     bytes
 }
 

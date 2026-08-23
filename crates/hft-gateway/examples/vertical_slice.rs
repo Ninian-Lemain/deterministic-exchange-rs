@@ -1,4 +1,4 @@
-﻿use hft_gateway::Gateway;
+use hft_gateway::Gateway;
 use hft_io::RxFrame;
 use hft_risk::{RiskEngine, RiskLimits};
 use hft_types::{

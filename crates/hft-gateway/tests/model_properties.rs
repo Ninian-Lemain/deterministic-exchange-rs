@@ -12,7 +12,7 @@ use hft_model::{
 };
 use hft_risk::{RiskEngine, RiskLimits};
 use hft_types::{AccountId, InstrumentId, OrderState, PriceTicks, Quantity, ReportBuffer};
-use hft_wire::{encode_cancel_order, encode_new_order};
+use hft_wire::{encode_cancel_order, encode_new_order, encode_replace_order};
 
 const ACCOUNT_IDS: [AccountId; 2] = [AccountId(1), AccountId(2)];
 const RISK_ORDERS: usize = 32;
@@ -58,6 +58,7 @@ fn gen_config() -> GenConfig {
         ioc_probability_pct: 15,
         fok_probability_pct: 10,
         post_only_probability_pct: 10,
+        replace_probability_pct: 30,
     }
 }
 
@@ -81,6 +82,28 @@ fn map_rejection(error: &GatewayError) -> ModelRejection {
     }
 }
 
+fn compare_replace(
+    actual: Result<GatewayOutcome, GatewayError>,
+    expected: Result<hft_model::ModelReplaced, ModelRejection>,
+) {
+    match (&actual, &expected) {
+        (Ok(GatewayOutcome::Replaced(replaced)), Ok(model_replaced)) => {
+            assert_eq!(replaced.order_id, model_replaced.order_id);
+            assert_eq!(replaced.account_id, model_replaced.account_id);
+            assert_eq!(replaced.old_quantity, model_replaced.old_quantity);
+            assert_eq!(replaced.new_quantity, model_replaced.new_quantity);
+            assert_eq!(replaced.price, model_replaced.price);
+            assert_eq!(
+                replaced.priority_lost, model_replaced.priority_lost,
+                "priority retention"
+            );
+        }
+        (Err(error), Err(rejection)) => {
+            assert_eq!(map_rejection(error), *rejection, "replace rejection");
+        }
+        (actual, expected) => panic!("replace divergence: {actual:?} vs {expected:?}"),
+    }
+}
 fn assert_snapshots_match(
     gateway: &Gateway<2, RISK_ORDERS, LEVELS, ORDERS_PER_LEVEL>,
     model: &ModelEngine,
@@ -140,6 +163,14 @@ fn run_session(seed: u64) {
                 let bytes = encode_cancel_order(cancel);
                 let actual = gateway.process_frame(&RxFrame::from_bytes(&bytes), &mut reports);
                 compare_cancel(actual, expected, &mut terminal_ids);
+                frames.push(bytes.to_vec());
+            }
+            Command::Replace(replace) => {
+                assert_eq!(replace.sequence.0, step + 1, "sequence drift");
+                let expected = model.apply_replace(&replace);
+                let bytes = encode_replace_order(replace);
+                let actual = gateway.process_frame(&RxFrame::from_bytes(&bytes), &mut reports);
+                compare_replace(actual, expected);
                 frames.push(bytes.to_vec());
             }
         }
@@ -276,6 +307,7 @@ fn accepted_frames_replay_through_the_replay_helper() {
         ioc_probability_pct: 0,
         fok_probability_pct: 0,
         post_only_probability_pct: 0,
+        replace_probability_pct: 0,
     };
     let mut generator = CommandGen::new(config, InstrumentId(1), 0x0a7c_0005);
     let mut oracle = ModelEngine::new(InstrumentId(1), LEVELS, ORDERS_PER_LEVEL);

@@ -9,7 +9,7 @@ use crate::{ALLOCATIONS, DEALLOCATIONS, analyze};
 use hft_book::OrderBook;
 use hft_types::{
     AccountId, CancelOrder, InstrumentId, NewOrder, OrderId, PriceTicks, Quantity, RejectReason,
-    ReportBuffer, SequenceNumber, Side, TimeInForce,
+    ReplaceOrder, ReportBuffer, SequenceNumber, Side, TimeInForce,
 };
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -801,4 +801,160 @@ fn run_po_cell(
         checksum,
         &mut latencies,
     );
+}
+
+/// Replace benchmarks: book mutation cost versus risk adjustment cost,
+/// measured separately on pre-seeded fixtures.
+use hft_risk::RiskEngine;
+
+fn replace_book_cell(
+    samples: usize,
+    scenario: &'static str,
+    new_price: i64,
+    new_qty: u64,
+    out: &mut Vec<BenchRecord>,
+) {
+    const WARMUP: usize = 32;
+    if samples == 0 {
+        return;
+    }
+    let mut latencies = vec![0_u64; samples];
+    let mut checksum = 0_u64;
+    let mut next_id = 1_000_000_u64;
+    // Every sample gets a fresh one-maker book built untimed, so the replace
+    // always starts from the exact same shape.
+    for (offset, sample) in latencies.iter_mut().enumerate() {
+        let step = WARMUP + offset;
+        let mut book = Box::new(OrderBook::<128, 8>::new(INSTRUMENT));
+        let mut reports = ReportBuffer::<16>::new();
+        let maker_id = take_id(&mut next_id);
+        book.submit(
+            order(
+                maker_id,
+                MAKER_ACCOUNT,
+                100,
+                10,
+                Side::Sell,
+                TimeInForce::Gtc,
+            ),
+            &mut reports,
+        )
+        .expect("fixture maker rests");
+        reports.clear();
+        let replace = ReplaceOrder {
+            order_id: OrderId(maker_id),
+            account_id: MAKER_ACCOUNT,
+            instrument_id: INSTRUMENT,
+            sequence: SequenceNumber(maker_id),
+            price: PriceTicks(new_price),
+            quantity: Quantity(new_qty),
+        };
+        if step >= WARMUP {
+            let started = Instant::now();
+            let result = book.replace(replace);
+            let elapsed_ns = started.elapsed().as_nanos();
+            match result {
+                Ok(replaced) => checksum ^= replaced.new_quantity.0,
+                Err(_) => checksum ^= 0x9e,
+            }
+            *sample = u64::try_from(elapsed_ns).unwrap_or(u64::MAX);
+        } else {
+            let _ = book.replace(replace);
+        }
+        debug_assert_eq!(book.order_count(), 1, "replaced order still rests");
+    }
+    assert_gate(
+        snapshot_gate(),
+        (
+            ALLOCATIONS.load(Ordering::SeqCst),
+            DEALLOCATIONS.load(Ordering::SeqCst),
+        ),
+        scenario,
+    );
+    finish(
+        out,
+        BenchRecord::new(
+            "component",
+            "book",
+            scenario,
+            &[("tif", Extra::Text("replace"))],
+        ),
+        checksum,
+        &mut latencies,
+    );
+}
+/// Risk-only reservation adjustments at fixed totals (alternating 1 <-> 4).
+fn replace_risk_cell(samples: usize, out: &mut Vec<BenchRecord>) {
+    if samples == 0 {
+        return;
+    }
+    let mut risk = RiskEngine::<2, 64>::new();
+    let limits = hft_risk::RiskLimits {
+        max_quantity: Quantity(16),
+        max_notional: 1_000_000_000,
+        max_abs_position: Quantity(1_000),
+        max_open_orders: 32,
+        minimum_price: PriceTicks(1),
+        maximum_price: PriceTicks(10_000),
+    };
+    risk.register_account(AccountId(1), limits)
+        .expect("risk cell account");
+    let seed_id = 500_u64;
+    risk.check_and_reserve(hft_types::NewOrder {
+        time_in_force: hft_types::TimeInForce::Gtc,
+        order_id: OrderId(seed_id),
+        account_id: AccountId(1),
+        instrument_id: InstrumentId(1),
+        price: PriceTicks(100),
+        quantity: Quantity(1),
+        sequence: SequenceNumber(seed_id),
+        side: Side::Sell,
+    })
+    .expect("seed reservation");
+    let mut latencies = vec![0_u64; samples];
+    let mut checksum = 0_u64;
+    let before = snapshot_gate();
+    for (index, sample) in latencies.iter_mut().enumerate() {
+        let target = if index % 2 == 0 { 4_u64 } else { 1_u64 };
+        let started = Instant::now();
+        let adjusted = risk.adjust_reservation(
+            OrderId(seed_id),
+            AccountId(1),
+            PriceTicks(100),
+            Quantity(target),
+        );
+        let elapsed_ns = started.elapsed().as_nanos();
+        if let Ok((released, _)) = adjusted {
+            checksum ^= released.0;
+        }
+        *sample = u64::try_from(elapsed_ns).unwrap_or(u64::MAX);
+    }
+    assert_gate(
+        before,
+        (
+            ALLOCATIONS.load(Ordering::SeqCst),
+            DEALLOCATIONS.load(Ordering::SeqCst),
+        ),
+        "replace_risk_adjust",
+    );
+    finish(
+        out,
+        BenchRecord::new(
+            "component",
+            "risk",
+            "replace_risk_adjust",
+            &[("tif", Extra::Text("replace"))],
+        ),
+        checksum,
+        &mut latencies,
+    );
+}
+
+pub fn replace_benchmarks(samples: usize, out: &mut Vec<BenchRecord>) {
+    let _ = samples; // risk cell is O(1) per sample; kept for symmetry.
+    replace_book_cell(samples, "replace_reduce", 100, 5, out);
+    replace_book_cell(samples, "replace_increase", 100, 12, out);
+    replace_book_cell(samples, "replace_reprice", 101, 10, out);
+    replace_book_cell(samples, "replace_reject_unknown", 99, 5, out);
+    replace_risk_cell(samples, out);
 }

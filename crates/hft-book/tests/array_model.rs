@@ -5,6 +5,7 @@ use hft_book::OrderBook;
 use hft_model::{Command, CommandGen, GenConfig, ModelBook};
 use hft_types::{InstrumentId, ReportBuffer};
 
+#[allow(clippy::too_many_lines)]
 fn run_shape<const LEVELS: usize, const ORDERS: usize, const REPORTS: usize>(
     seed: u64,
     steps: u64,
@@ -20,6 +21,7 @@ fn run_shape<const LEVELS: usize, const ORDERS: usize, const REPORTS: usize>(
             max_quantity: 4,
             cancel_probability_pct: 55,
             duplicate_id_probability_pct: 8,
+            replace_probability_pct: 25,
             ioc_probability_pct: 15,
             fok_probability_pct: 10,
             post_only_probability_pct: 10,
@@ -31,6 +33,14 @@ fn run_shape<const LEVELS: usize, const ORDERS: usize, const REPORTS: usize>(
         match generator.next_command() {
             Command::New(command) => {
                 reports.clear();
+                eprintln!(
+                    "step {step} tif={:?} side={:?} px={} qty={} id={}",
+                    command.time_in_force,
+                    command.side,
+                    command.price.0,
+                    command.quantity.0,
+                    command.order_id.0
+                );
                 let actual = book.submit(command, &mut reports);
                 let expected = model.submit(&command, REPORTS, LEVELS, ORDERS);
                 match (actual, expected) {
@@ -81,6 +91,29 @@ fn run_shape<const LEVELS: usize, const ORDERS: usize, const REPORTS: usize>(
                     }
                     (actual, expected) => {
                         panic!("cancel divergence at step {step}: {actual:?} vs {expected:?}");
+                    }
+                }
+            }
+            Command::Replace(command) => {
+                let actual = book.replace(command);
+                let expected = model.replace(&command, LEVELS, ORDERS);
+                match (actual, expected) {
+                    (Ok(replaced), Ok((old_quantity, priority_lost))) => {
+                        assert_eq!(replaced.old_quantity.0, old_quantity);
+                        assert_eq!(
+                            replaced.priority_lost, priority_lost,
+                            "priority at step {step}"
+                        );
+                        assert_eq!(replaced.new_quantity.0, command.quantity.0);
+                    }
+                    (Err(actual_error), Err(expected_error)) => {
+                        assert_eq!(
+                            actual_error, expected_error,
+                            "replace rejection at step {step}"
+                        );
+                    }
+                    (actual, expected) => {
+                        panic!("replace divergence at step {step}: {actual:?} vs {expected:?}");
                     }
                 }
             }

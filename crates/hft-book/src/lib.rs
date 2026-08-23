@@ -2,8 +2,8 @@
 
 use hft_types::{
     AccountId, CancelOrder, ExecutionReport, InstrumentId, MatchSummary, NewOrder, OrderId,
-    OrderState, PriceTicks, Quantity, RejectReason, ReportBuffer, SequenceNumber, Side,
-    TimeInForce,
+    OrderState, PriceTicks, Quantity, RejectReason, ReplaceOrder, ReportBuffer, SequenceNumber,
+    Side, TimeInForce,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -329,6 +329,18 @@ pub struct CancelledOrder {
     pub order_id: OrderId,
     pub account_id: AccountId,
     pub quantity: Quantity,
+}
+
+/// Outcome of an owned replace.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReplacedOrder {
+    pub order_id: OrderId,
+    pub account_id: AccountId,
+    pub old_quantity: Quantity,
+    pub new_quantity: Quantity,
+    pub price: PriceTicks,
+    /// False only for same-price quantity reductions, which keep priority.
+    pub priority_lost: bool,
 }
 
 /// Sorted index of occupied level slots plus the pool of free level slots for
@@ -761,6 +773,151 @@ impl<const LEVELS: usize, const ORDERS_PER_LEVEL: usize> OrderBook<LEVELS, ORDER
         }
     }
 
+    /// Amends an owned resting order. A pure quantity reduction keeps its
+    /// slot and FIFO priority; any price change or quantity increase loses
+    /// priority and re-enters at the destination level tail. Repricing never
+    /// executes against the book, so a replace whose new price would cross
+    /// the opposing best price is rejected before mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns instrument, unknown-order, ownership, validation, crossing,
+    /// or capacity rejection without mutating the book.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if internal index invariants are broken, which is a bug,
+    /// not a rejection path.
+    #[allow(clippy::too_many_lines)]
+    pub fn replace(&mut self, replace: ReplaceOrder) -> Result<ReplacedOrder, RejectReason> {
+        if replace.instrument_id != self.instrument {
+            return Err(RejectReason::InvalidInstrument);
+        }
+        let (location, owner) = self
+            .locate(replace.order_id)
+            .ok_or(RejectReason::UnknownOrder)?;
+        if owner != replace.account_id {
+            return Err(RejectReason::NotOrderOwner);
+        }
+        if replace.price.0 <= 0 {
+            return Err(RejectReason::InvalidPrice);
+        }
+        if replace.quantity.0 == 0 {
+            return Err(RejectReason::InvalidQuantity);
+        }
+        let old = {
+            let level = self.side_levels(location.side)[location.level_index]
+                .as_ref()
+                .expect("indexed level is occupied");
+            *level.get_live(location.slot).expect("indexed slot is live")
+        };
+        let priority_kept = replace.price == old.price && replace.quantity.0 < old.quantity.0;
+        if !priority_kept {
+            if replace.price != old.price {
+                // A repriced order must not cross: check the opposing best.
+                let opposing = match location.side {
+                    Side::Buy => Side::Sell,
+                    Side::Sell => Side::Buy,
+                };
+                if let Some(&(best_price, _)) = self.side_index(opposing).iter().next() {
+                    let crosses = match location.side {
+                        Side::Buy => replace.price.0 >= best_price.0,
+                        Side::Sell => replace.price.0 <= best_price.0,
+                    };
+                    if crosses {
+                        return Err(RejectReason::ReplaceWouldCross);
+                    }
+                }
+            }
+            // Destination capacity preflight against the unchanged book.
+            let descending = location.side == Side::Buy;
+            if let Some(level_index) = self
+                .side_index(location.side)
+                .find(replace.price, descending)
+            {
+                let dest_len = self.side_levels(location.side)[level_index]
+                    .as_ref()
+                    .expect("dest level")
+                    .len;
+                let same_level = level_index == location.level_index && replace.price == old.price;
+                if dest_len == ORDERS_PER_LEVEL && !same_level {
+                    return Err(RejectReason::PriceLevelOrderCapacity);
+                }
+            } else {
+                let source_empties = self.side_levels(location.side)[location.level_index]
+                    .as_ref()
+                    .expect("source level")
+                    .len
+                    == 1;
+                let free_levels = LEVELS - self.side_index(location.side).iter().count();
+                if free_levels == 0 && !source_empties {
+                    return Err(RejectReason::PriceLevelCapacity);
+                }
+            }
+        }
+
+        if priority_kept {
+            // In-place reduction: slot handle, index entry, and FIFO
+            // position all stay untouched.
+            let level = self.side_levels_mut(location.side)[location.level_index]
+                .as_mut()
+                .expect("indexed level is occupied");
+            let live = level.get_live_mut(location.slot).expect("slot stays live");
+            live.quantity = Quantity(replace.quantity.0);
+            return Ok(ReplacedOrder {
+                order_id: replace.order_id,
+                account_id: replace.account_id,
+                old_quantity: Quantity(old.quantity.0),
+                new_quantity: Quantity(replace.quantity.0),
+                price: replace.price,
+                priority_lost: false,
+            });
+        }
+
+        // Priority lost: unlink, drop an emptied source level, re-add at the
+        // destination tail.
+        let removed = {
+            let level = self.side_levels_mut(location.side)[location.level_index]
+                .as_mut()
+                .expect("indexed level is occupied");
+            level.unlink(location.slot).expect("indexed slot is live")
+        };
+        debug_assert_eq!(removed.id, replace.order_id);
+        let source_emptied = self.side_levels(location.side)[location.level_index]
+            .as_ref()
+            .expect("source level")
+            .len
+            == 0;
+        if source_emptied {
+            let price = removed.price;
+            self.side_levels_mut(location.side)[location.level_index] = None;
+            let removed_index = self
+                .side_index_mut(location.side)
+                .remove(price, location.side == Side::Buy);
+            debug_assert_eq!(removed_index, Some(location.level_index));
+        }
+        let removed_location = self.remove_index_entry(removed.index_slot, replace.order_id);
+        debug_assert_eq!(removed_location, Some(location));
+        let resting = RestingOrder {
+            id: replace.order_id,
+            account_id: replace.account_id,
+            index_slot: 0,
+            price: replace.price,
+            quantity: Quantity(replace.quantity.0),
+            sequence: replace.sequence,
+            prev: NIL,
+            next: NIL,
+        };
+        self.rest_at_tail(location.side, resting);
+        Ok(ReplacedOrder {
+            order_id: replace.order_id,
+            account_id: replace.account_id,
+            old_quantity: Quantity(old.quantity.0),
+            new_quantity: Quantity(replace.quantity.0),
+            price: replace.price,
+            priority_lost: true,
+        })
+    }
     /// Removes an owned resting order while retaining FIFO order for all peers.
     ///
     /// # Errors
@@ -824,28 +981,6 @@ impl<const LEVELS: usize, const ORDERS_PER_LEVEL: usize> OrderBook<LEVELS, ORDER
     /// has spare capacity (four planes for at most `2 * LEVELS * ORDERS` live
     /// orders).
     fn rest(&mut self, order: NewOrder, quantity: Quantity) {
-        let Self {
-            bids,
-            asks,
-            index,
-            bid_levels,
-            ask_levels,
-            ..
-        } = self;
-        let (levels, sorted) = match order.side {
-            Side::Buy => (bids, bid_levels),
-            Side::Sell => (asks, ask_levels),
-        };
-        let descending = order.side == Side::Buy;
-        let level_index = if let Some(level_index) = sorted.find(order.price, descending) {
-            level_index
-        } else {
-            let level_index = sorted
-                .insert(order.price, descending)
-                .expect("level capacity was preflighted");
-            levels[level_index] = Some(PriceLevel::new(order.price));
-            level_index
-        };
         let resting = RestingOrder {
             id: order.order_id,
             account_id: order.account_id,
@@ -856,6 +991,34 @@ impl<const LEVELS: usize, const ORDERS_PER_LEVEL: usize> OrderBook<LEVELS, ORDER
             prev: NIL,
             next: NIL,
         };
+        self.rest_at_tail(order.side, resting);
+    }
+
+    /// Appends one already-validated resting order at the side tail and
+    /// indexes it. Infallible for preflighted callers.
+    fn rest_at_tail(&mut self, side: Side, resting: RestingOrder) {
+        let Self {
+            bids,
+            asks,
+            index,
+            bid_levels,
+            ask_levels,
+            ..
+        } = self;
+        let (levels, sorted) = match side {
+            Side::Buy => (bids, bid_levels),
+            Side::Sell => (asks, ask_levels),
+        };
+        let descending = side == Side::Buy;
+        let level_index = if let Some(level_index) = sorted.find(resting.price, descending) {
+            level_index
+        } else {
+            let level_index = sorted
+                .insert(resting.price, descending)
+                .expect("level capacity was preflighted");
+            levels[level_index] = Some(PriceLevel::new(resting.price));
+            level_index
+        };
         let level = levels[level_index]
             .as_mut()
             .expect("indexed level is occupied");
@@ -863,12 +1026,12 @@ impl<const LEVELS: usize, const ORDERS_PER_LEVEL: usize> OrderBook<LEVELS, ORDER
             .push_tail(resting)
             .expect("level order capacity was preflighted");
         let location = OrderLocation {
-            side: order.side,
+            side,
             level_index,
             slot,
         };
         let index_slot = index
-            .insert(order.order_id, location)
+            .insert(resting.id, location)
             .expect("order index capacity was preflighted");
         level
             .get_live_mut(slot)
@@ -963,7 +1126,6 @@ fn mix(digest: &mut u64, value: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hft_model::Command;
     use hft_types::AccountId;
 
     fn order(id: u64, price: i64, quantity: u64, side: Side) -> NewOrder {
@@ -1538,6 +1700,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn generated_commands_match_array_model() {
         const LEVELS: usize = 4;
         const ORDERS: usize = 4;
@@ -1556,13 +1719,19 @@ mod tests {
                 ioc_probability_pct: 15,
                 fok_probability_pct: 10,
                 post_only_probability_pct: 10,
+                replace_probability_pct: 25,
             },
             InstrumentId(1),
             0x5eed,
         );
         for step in 0..600_u64 {
-            match generator.next_command() {
-                Command::New(command) => {
+            if step >= 9 {
+                eprintln!("s{step} book={:?}", dump_book(&book));
+                eprintln!("s{step} model={:?}", hft_model::dump_model(&model));
+            }
+            let command = generator.next_command();
+            match command {
+                hft_model::Command::New(command) => {
                     reports.clear();
                     let actual = book.submit(command, &mut reports);
                     let expected = model.submit(&command, REPORTS, LEVELS, ORDERS);
@@ -1594,7 +1763,7 @@ mod tests {
                         }
                     }
                 }
-                Command::Cancel(command) => {
+                hft_model::Command::Cancel(command) => {
                     let actual = book.cancel(command);
                     let expected = model.cancel(&command);
                     match (actual, expected) {
@@ -1617,6 +1786,32 @@ mod tests {
                         }
                         (actual, expected) => {
                             panic!("cancel divergence at step {step}: {actual:?} vs {expected:?}");
+                        }
+                    }
+                }
+                hft_model::Command::Replace(command) => {
+                    let actual = book.replace(command);
+                    let expected = model.replace(&command, LEVELS, ORDERS);
+                    match (actual, expected) {
+                        (Ok(replaced), Ok((old_quantity, priority_lost))) => {
+                            assert_eq!(
+                                replaced.old_quantity.0, old_quantity,
+                                "replace old quantity at step {step}"
+                            );
+                            assert_eq!(
+                                replaced.priority_lost, priority_lost,
+                                "priority retention at step {step}"
+                            );
+                            assert_eq!(replaced.new_quantity.0, command.quantity.0);
+                        }
+                        (Err(actual_error), Err(expected_error)) => {
+                            assert_eq!(
+                                actual_error, expected_error,
+                                "replace rejection at step {step}"
+                            );
+                        }
+                        (actual, expected) => {
+                            panic!("replace divergence at step {step}: {actual:?} vs {expected:?}");
                         }
                     }
                 }

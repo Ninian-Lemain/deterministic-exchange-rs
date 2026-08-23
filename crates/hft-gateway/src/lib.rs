@@ -4,7 +4,8 @@ use hft_book::{CancelledOrder, OrderBook};
 use hft_io::RxFrame;
 use hft_risk::RiskEngine;
 use hft_types::{
-    InstrumentId, MatchSummary, OrderId, Quantity, RejectReason, ReportBuffer, SequenceNumber,
+    InstrumentId, MatchSummary, OrderId, Quantity, RejectReason, ReplaceOrder, ReportBuffer,
+    SequenceNumber,
 };
 use hft_wire::{BorrowedMessage, ParseError, parse_message};
 
@@ -24,6 +25,7 @@ pub enum GatewayError {
 pub enum GatewayOutcome {
     NewOrder(MatchSummary),
     Cancelled(CancelledOrder),
+    Replaced(hft_book::ReplacedOrder),
 }
 
 #[derive(Debug)]
@@ -73,6 +75,7 @@ impl<
         let received_sequence = match message {
             BorrowedMessage::NewOrder(message) => message.to_owned().sequence,
             BorrowedMessage::CancelOrder(message) => message.to_owned().sequence,
+            BorrowedMessage::ReplaceOrder(message) => message.to_owned().sequence,
         };
         if received_sequence != self.expected_sequence {
             return Err(GatewayError::Sequence {
@@ -90,6 +93,7 @@ impl<
                 self.process_new_order(message.to_owned(), reports)
             }
             BorrowedMessage::CancelOrder(message) => self.process_cancel(message.to_owned()),
+            BorrowedMessage::ReplaceOrder(message) => self.process_replace(message.to_owned()),
         }
     }
 
@@ -135,6 +139,37 @@ impl<
         Ok(GatewayOutcome::NewOrder(summary))
     }
 
+    /// Owned amend: risk reservation adjusts first (limit-checked), then the
+    /// book mutates; a book rejection restores the prior reservation total.
+    fn process_replace(&mut self, replace: ReplaceOrder) -> Result<GatewayOutcome, GatewayError> {
+        self.risk
+            .can_cancel(replace.order_id, replace.account_id)
+            .map_err(GatewayError::Risk)?;
+        let released = self
+            .risk
+            .adjust_reservation(
+                replace.order_id,
+                replace.account_id,
+                replace.price,
+                replace.quantity,
+            )
+            .map_err(GatewayError::Risk)?;
+        let (_, prior_remaining) = released;
+        match self.book.replace(replace) {
+            Ok(replaced) => Ok(GatewayOutcome::Replaced(replaced)),
+            Err(error) => {
+                self.risk
+                    .adjust_reservation(
+                        replace.order_id,
+                        replace.account_id,
+                        replace.price,
+                        prior_remaining,
+                    )
+                    .map_err(GatewayError::RiskState)?;
+                Err(GatewayError::Book(error))
+            }
+        }
+    }
     fn process_cancel(
         &mut self,
         cancel: hft_types::CancelOrder,
@@ -182,7 +217,7 @@ mod tests {
         AccountId, CancelOrder, InstrumentId, NewOrder, OrderId, PriceTicks, Quantity,
         SequenceNumber, Side,
     };
-    use hft_wire::{encode_cancel_order, encode_new_order};
+    use hft_wire::{encode_cancel_order, encode_new_order, encode_replace_order};
 
     fn gateway() -> Gateway<2, 8, 4, 4> {
         let mut risk = RiskEngine::new();
@@ -274,6 +309,76 @@ mod tests {
         };
         assert_eq!(cancelled.quantity, Quantity(5));
         assert_eq!(gateway.risk().account_snapshot(AccountId(1)), Some((0, 0)));
+    }
+
+    #[test]
+    fn rejected_replace_restores_reservation_exactly() {
+        let mut gateway = gateway();
+        let mut reports = ReportBuffer::<4>::new();
+        let sell = encode_new_order(order(1, 1, Side::Sell));
+        gateway
+            .process_frame(&RxFrame::from_bytes(&sell), &mut reports)
+            .expect("rest sell");
+        assert_eq!(
+            gateway.risk().account_snapshot(AccountId(1)),
+            Some((-5, 1)),
+            "one open sell reservation of five"
+        );
+        // Rest an opposing bid so a repriced sell would cross.
+        let hedge = encode_new_order({
+            let mut order = order(2, 2, Side::Buy);
+            order.price = PriceTicks(98);
+            order.quantity = Quantity(3);
+            order
+        });
+        gateway
+            .process_frame(&RxFrame::from_bytes(&hedge), &mut reports)
+            .expect("rest bid");
+        // Price drops below the bid (would cross) while quantity increases:
+        // risk accepts the larger reservation, the book rejects the cross,
+        // and the rollback must restore the original five-unit reservation.
+        let crosser = ReplaceOrder {
+            order_id: OrderId(1),
+            account_id: AccountId(1),
+            instrument_id: InstrumentId(1),
+            sequence: SequenceNumber(3),
+            price: PriceTicks(97),
+            quantity: Quantity(8),
+        };
+        let bytes = encode_replace_order(crosser);
+        assert_eq!(
+            gateway.process_frame(&RxFrame::from_bytes(&bytes), &mut reports),
+            Err(GatewayError::Book(RejectReason::ReplaceWouldCross)),
+        );
+        assert_eq!(
+            gateway.risk().account_snapshot(AccountId(1)),
+            Some((-5, 1)),
+            "failed replace leaves the original reservation"
+        );
+        assert_eq!(gateway.risk().account_snapshot(AccountId(2)), Some((3, 1)));
+        // Terminal immutability: after a fill, replaces reject as unknown.
+        let buy = encode_new_order({
+            let mut order = order(3, 2, Side::Buy);
+            order.sequence = SequenceNumber(4);
+            order
+        });
+        gateway
+            .process_frame(&RxFrame::from_bytes(&buy), &mut reports)
+            .expect("crossing taker fills");
+        let late = ReplaceOrder {
+            order_id: OrderId(1),
+            account_id: AccountId(1),
+            instrument_id: InstrumentId(1),
+            sequence: SequenceNumber(5),
+            price: PriceTicks(100),
+            quantity: Quantity(5),
+        };
+        let bytes = encode_replace_order(late);
+        assert_eq!(
+            gateway.process_frame(&RxFrame::from_bytes(&bytes), &mut reports),
+            Err(GatewayError::Risk(RejectReason::UnknownOrder)),
+            "filled orders are immutable"
+        );
     }
 
     #[test]

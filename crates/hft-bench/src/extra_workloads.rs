@@ -15,8 +15,8 @@ use hft_types::{
     SequenceNumber, Side,
 };
 use hft_wire::{
-    BorrowedMessage, CANCEL_ORDER_LEN, NEW_ORDER_LEN, encode_cancel_order, encode_new_order,
-    parse_message,
+    BorrowedMessage, CANCEL_ORDER_LEN, NEW_ORDER_LEN, REPLACE_ORDER_LEN, encode_cancel_order,
+    encode_new_order, encode_replace_order, parse_message,
 };
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -131,6 +131,7 @@ fn owned_sequence(message: BorrowedMessage<'_>) -> u64 {
     match message {
         BorrowedMessage::NewOrder(order) => order.to_owned().sequence.0,
         BorrowedMessage::CancelOrder(cancel) => cancel.to_owned().sequence.0,
+        BorrowedMessage::ReplaceOrder(replace) => replace.to_owned().sequence.0,
     }
 }
 
@@ -284,6 +285,10 @@ fn encode_command(command: Command, frame: &mut [u8; NEW_ORDER_LEN]) -> usize {
             frame[..CANCEL_ORDER_LEN].copy_from_slice(&encode_cancel_order(cancel));
             CANCEL_ORDER_LEN
         }
+        Command::Replace(replace) => {
+            frame[..REPLACE_ORDER_LEN].copy_from_slice(&encode_replace_order(replace));
+            REPLACE_ORDER_LEN
+        }
     }
 }
 
@@ -321,6 +326,7 @@ pub fn gateway_mixed_benchmark(commands: u64, warmup: u64, seed: u64, out: &mut 
             ioc_probability_pct: 15,
             fok_probability_pct: 10,
             post_only_probability_pct: 10,
+            replace_probability_pct: 30,
         },
         InstrumentId(1),
         seed,

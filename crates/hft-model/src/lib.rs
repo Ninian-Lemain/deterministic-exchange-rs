@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 use hft_types::{
     AccountId, CancelOrder, InstrumentId, NewOrder, OrderId, OrderState, PriceTicks, Quantity,
-    RejectReason, SequenceNumber, Side, TimeInForce,
+    RejectReason, ReplaceOrder, SequenceNumber, Side, TimeInForce,
 };
 
 /// Deterministic `SplitMix64` stream. Same seed, same sequence, integer math
@@ -63,6 +63,8 @@ pub struct GenConfig {
     pub fok_probability_pct: u64,
     /// Share of New commands flagged post-only.
     pub post_only_probability_pct: u64,
+    /// Share of Cancel commands upgraded to owned replaces.
+    pub replace_probability_pct: u64,
 }
 
 /// One generated command with its strict session sequence number.
@@ -70,6 +72,7 @@ pub struct GenConfig {
 pub enum Command {
     New(NewOrder),
     Cancel(CancelOrder),
+    Replace(ReplaceOrder),
 }
 
 /// Bounded deterministic command stream. Sequence numbers start at 1 and grow
@@ -103,10 +106,15 @@ impl CommandGen {
         assert!(config.duplicate_id_probability_pct <= 100);
         assert!(config.ioc_probability_pct <= 100);
         assert!(config.fok_probability_pct <= 100);
+        assert!(config.post_only_probability_pct <= 100);
         assert!(
-            config.ioc_probability_pct + config.fok_probability_pct <= 100,
+            config.ioc_probability_pct
+                + config.fok_probability_pct
+                + config.post_only_probability_pct
+                <= 100,
             "tif probabilities exceed 100 percent"
         );
+        assert!(config.replace_probability_pct <= 100);
         Self {
             config,
             instrument,
@@ -120,8 +128,43 @@ impl CommandGen {
     pub fn next_command(&mut self) -> Command {
         if self.fresh_ids == 0 || self.rng.below(100) >= self.config.cancel_probability_pct {
             Command::New(self.next_new())
+        } else if self.rng.below(100) < self.config.replace_probability_pct {
+            Command::Replace(self.next_replace())
         } else {
             Command::Cancel(self.next_cancel())
+        }
+    }
+
+    /// Owned amend of a random issued id: quantity spans up to twice the
+    /// configured maximum so increases and reductions both occur; the price
+    /// stays inside the configured band.
+    ///
+    /// # Panics
+    ///
+    /// Panics when no order id has been issued yet.
+    pub fn next_replace(&mut self) -> ReplaceOrder {
+        assert!(self.fresh_ids >= 1, "no issued ids to replace");
+        let sequence = self.next_sequence();
+        let span = u64::try_from(
+            self.config
+                .maximum_price
+                .checked_sub(self.config.minimum_price)
+                .expect("ordered range")
+                + 1,
+        )
+        .expect("positive span");
+        let price = self
+            .config
+            .minimum_price
+            .checked_add(i64::try_from(self.rng.below(span)).expect("small offset"))
+            .expect("in-range price");
+        ReplaceOrder {
+            order_id: OrderId(1 + self.rng.below(self.fresh_ids)),
+            account_id: self.next_account(),
+            instrument_id: self.instrument,
+            sequence: SequenceNumber(sequence),
+            price: PriceTicks(price),
+            quantity: Quantity(1 + self.rng.below(self.config.max_quantity * 2)),
         }
     }
 
@@ -149,12 +192,17 @@ impl CommandGen {
         )
         .expect("positive span");
         let quantity_bound = self.config.max_quantity;
-        // TIF draw: FOK first, then IOC, else GTC.
+        // TIF draw: FOK, then IOC, then post-only, else GTC.
         let tif_draw = self.rng.below(100);
-        let time_in_force = if tif_draw < self.config.fok_probability_pct {
+        let ioc_start = self.config.fok_probability_pct;
+        let po_start = ioc_start + self.config.ioc_probability_pct;
+        let po_end = po_start + self.config.post_only_probability_pct;
+        let time_in_force = if tif_draw < ioc_start {
             TimeInForce::Fok
-        } else if tif_draw < self.config.fok_probability_pct + self.config.ioc_probability_pct {
+        } else if tif_draw < po_start {
             TimeInForce::Ioc
+        } else if tif_draw < po_end {
+            TimeInForce::PostOnly
         } else {
             TimeInForce::Gtc
         };
@@ -285,6 +333,9 @@ impl ModelBook {
         if order.side == Side::Sell {
             crossing.reverse();
         }
+        if order.time_in_force == TimeInForce::PostOnly && !crossing.is_empty() {
+            return Err(RejectReason::PostOnlyWouldTrade);
+        }
         let mut remaining = order.quantity.0;
         let mut report_count = 0_usize;
         'simulate: for price in &crossing {
@@ -369,6 +420,9 @@ impl ModelBook {
                     break;
                 };
                 let traded = remaining.min(front.quantity);
+                if front.id == 44 {
+                    eprintln!("FILL44 traded={traded} left={}", front.quantity - traded);
+                }
                 fills.push(ModelFill {
                     maker_order_id: OrderId(front.id),
                     price: PriceTicks(*price),
@@ -384,7 +438,12 @@ impl ModelBook {
                 maker_levels.remove(position);
             }
         }
-        if remaining > 0 && order.time_in_force == TimeInForce::Gtc {
+        if remaining > 0
+            && matches!(
+                order.time_in_force,
+                TimeInForce::Gtc | TimeInForce::PostOnly
+            )
+        {
             let own_levels = match order.side {
                 Side::Buy => &mut self.bids,
                 Side::Sell => &mut self.asks,
@@ -421,6 +480,151 @@ impl ModelBook {
             Quantity(discarded),
             fills,
         ))
+    }
+
+    /// Cancels by id, enforcing ownership.
+    ///
+    /// # Errors
+    ///
+    /// Returns unknown-order or ownership rejection without mutating state.
+    /// Mirrors the book's owned amend: same-price reductions keep priority,
+    /// everything else removes and re-adds at the destination tail. Repricing
+    /// that would cross the opposing best rejects without mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the mirrored rejection without mutating state.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a located row disappears mid-replace, which is a model bug.
+    #[allow(clippy::too_many_lines)]
+    pub fn replace(
+        &mut self,
+        replace: &ReplaceOrder,
+        level_cap: usize,
+        order_cap: usize,
+    ) -> Result<(u64, bool), RejectReason> {
+        if replace.price.0 <= 0 {
+            return Err(RejectReason::InvalidPrice);
+        }
+        if replace.quantity.0 == 0 {
+            return Err(RejectReason::InvalidQuantity);
+        }
+        // Phase 1: immutable reads.
+        let in_bids = Self::find_in(&self.bids, replace.order_id.0);
+        let in_asks = Self::find_in(&self.asks, replace.order_id.0);
+        let (side, position) = match (in_bids, in_asks) {
+            (Some(position), _) => (Side::Buy, position),
+            (_, Some(position)) => (Side::Sell, position),
+            (None, None) => return Err(RejectReason::UnknownOrder),
+        };
+        let levels = match side {
+            Side::Buy => &self.bids,
+            Side::Sell => &self.asks,
+        };
+        let (level_price, queue_position, old_quantity, old_account) = {
+            let (price, queue) = &levels[position];
+            let queue_position = queue
+                .iter()
+                .position(|order| order.id == replace.order_id.0)
+                .expect("located row");
+            (
+                *price,
+                queue_position,
+                queue[queue_position].quantity,
+                queue[queue_position].account,
+            )
+        };
+        if old_account != replace.account_id.0 {
+            return Err(RejectReason::NotOrderOwner);
+        }
+        let priority_kept = replace.price.0 == level_price && replace.quantity.0 < old_quantity;
+        if replace.order_id.0 == 44 {
+            eprintln!(
+                "MB44 lvl={level_price} qpos={queue_position} old={old_quantity} new={} kept={priority_kept}",
+                replace.quantity.0
+            );
+        }
+        if !priority_kept && replace.price.0 != level_price {
+            let opposing = if side == Side::Buy {
+                &self.asks
+            } else {
+                &self.bids
+            };
+            if let Some(&(best, _)) = opposing.iter().min_by(|x, y| {
+                if side == Side::Buy {
+                    x.0.cmp(&y.0)
+                } else {
+                    y.0.cmp(&x.0)
+                }
+            }) {
+                let crosses = if side == Side::Buy {
+                    replace.price.0 >= best
+                } else {
+                    replace.price.0 <= best
+                };
+                if crosses {
+                    return Err(RejectReason::ReplaceWouldCross);
+                }
+            }
+        }
+        if !priority_kept {
+            let dest_exists = levels.iter().any(|(price, _)| *price == replace.price.0);
+            if dest_exists {
+                let dest_index = levels
+                    .iter()
+                    .position(|(price, _)| *price == replace.price.0)
+                    .expect("checked dest");
+                let same_level = dest_index == position && replace.price.0 == level_price;
+                if levels[dest_index].1.len() == order_cap && !same_level {
+                    return Err(RejectReason::PriceLevelOrderCapacity);
+                }
+            } else {
+                let source_empties = levels[position].1.len() == 1;
+                if levels.len() == level_cap && !source_empties {
+                    return Err(RejectReason::PriceLevelCapacity);
+                }
+            }
+        }
+
+        // Phase 2: mutation.
+        let levels = match side {
+            Side::Buy => &mut self.bids,
+            Side::Sell => &mut self.asks,
+        };
+        if priority_kept {
+            // In-place reduction: FIFO position and level stay untouched.
+            let (_, queue) = &mut levels[position];
+            let row = queue.get_mut(queue_position).expect("located row");
+            row.quantity = replace.quantity.0;
+        } else {
+            let (_, queue) = &mut levels[position];
+            queue.remove(queue_position);
+            let source_emptied = queue.is_empty();
+            if source_emptied {
+                levels.remove(position);
+            }
+            let resting = ModelOrder {
+                id: replace.order_id.0,
+                account: replace.account_id.0,
+                quantity: replace.quantity.0,
+                sequence: replace.sequence.0,
+            };
+            match levels
+                .iter_mut()
+                .find(|(price, _)| *price == replace.price.0)
+            {
+                Some((_, queue)) => queue.push_back(resting),
+                None => levels.push((replace.price.0, VecDeque::from([resting]))),
+            }
+        }
+        Ok((old_quantity, !priority_kept))
+    }
+    fn find_in(levels: &ModelLevels, id: u64) -> Option<usize> {
+        levels
+            .iter()
+            .position(|(_, queue)| queue.iter().any(|order| order.id == id))
     }
 
     /// Cancels by id, enforcing ownership.
@@ -512,6 +716,17 @@ pub struct ModelNewOutcome {
     pub rested: Quantity,
     pub discarded: Quantity,
     pub fills: Vec<ModelFill>,
+}
+
+/// Outcome of an owned replace.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ModelReplaced {
+    pub order_id: OrderId,
+    pub account_id: AccountId,
+    pub old_quantity: Quantity,
+    pub new_quantity: Quantity,
+    pub price: PriceTicks,
+    pub priority_lost: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -719,6 +934,55 @@ impl ModelEngine {
         })
     }
 
+    /// Mirrors the gateway path for a replace frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns the mirrored risk or book rejection.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the command sequence drifts from the session counter or an
+    /// internal invariant breaks.
+    pub fn apply_replace(
+        &mut self,
+        replace: &ReplaceOrder,
+    ) -> Result<ModelReplaced, ModelRejection> {
+        assert_eq!(
+            replace.sequence.0, self.next_sequence,
+            "sequence {} out of order",
+            replace.sequence.0
+        );
+        self.next_sequence = self.next_sequence.wrapping_add(1);
+        let Some(reservation) = self.reservations.get(&replace.order_id.0) else {
+            return Err(ModelRejection::Risk(RejectReason::UnknownOrder));
+        };
+        if reservation.account_id != replace.account_id {
+            return Err(ModelRejection::Risk(RejectReason::NotOrderOwner));
+        }
+        let (_, prior_remaining) = match self.adjust_reservation(replace) {
+            Ok(amounts) => amounts,
+            Err(reason) => return Err(ModelRejection::Risk(reason)),
+        };
+        if replace.instrument_id != self.instrument {
+            self.restore_reservation(replace.order_id.0, prior_remaining);
+            return Err(ModelRejection::Book(RejectReason::InvalidInstrument));
+        }
+        match self.book.replace(replace, self.level_cap, self.order_cap) {
+            Ok((old_quantity, priority_lost)) => Ok(ModelReplaced {
+                order_id: replace.order_id,
+                account_id: replace.account_id,
+                old_quantity: Quantity(old_quantity),
+                new_quantity: Quantity(replace.quantity.0),
+                price: replace.price,
+                priority_lost,
+            }),
+            Err(reason) => {
+                self.restore_reservation(replace.order_id.0, prior_remaining);
+                Err(ModelRejection::Book(reason))
+            }
+        }
+    }
     /// Projected position and open-order count, mirroring `account_snapshot`.
     #[must_use]
     pub fn account_view(&self, id: AccountId) -> Option<(i128, u32)> {
@@ -807,6 +1071,123 @@ impl ModelEngine {
         }
     }
 
+    /// Debug helper for property diagnostics.
+    #[must_use]
+    pub fn reservation_of(&self, id: OrderId) -> Option<u64> {
+        self.reservations.get(&id.0).map(|r| r.remaining)
+    }
+
+    /// Mirrors `adjust_reservation` for the model: limit-checked increase or
+    /// immediate decrease of one reservation's total. Returns the released
+    /// amount (zero for increases).
+    fn adjust_reservation(&mut self, replace: &ReplaceOrder) -> Result<(u64, u64), RejectReason> {
+        let Some(reservation) = self.reservations.get_mut(&replace.order_id.0) else {
+            return Err(RejectReason::UnknownOrder);
+        };
+        let remaining = reservation.remaining;
+        let new_total = replace.quantity.0;
+        let side = reservation.side;
+        let account_id = reservation.account_id;
+        let prior = remaining;
+        if new_total == remaining {
+            return Ok((0, prior));
+        }
+        let account = self
+            .accounts
+            .get_mut(&account_id.0)
+            .expect("reserved account");
+        if new_total > remaining {
+            let added = new_total - remaining;
+            match side {
+                Side::Buy => {
+                    account.reserved_buys = account
+                        .reserved_buys
+                        .checked_add(u128::from(added))
+                        .ok_or(RejectReason::ArithmeticOverflow)?;
+                }
+                Side::Sell => {
+                    account.reserved_sells = account
+                        .reserved_sells
+                        .checked_add(u128::from(added))
+                        .ok_or(RejectReason::ArithmeticOverflow)?;
+                }
+            }
+            let absolute_price = replace
+                .price
+                .0
+                .checked_abs()
+                .ok_or(RejectReason::ArithmeticOverflow)?;
+            let notional = u128::from(
+                u64::try_from(absolute_price).map_err(|_| RejectReason::ArithmeticOverflow)?,
+            )
+            .checked_mul(u128::from(new_total))
+            .ok_or(RejectReason::ArithmeticOverflow)?;
+            if notional > account.limits.max_notional {
+                return Err(RejectReason::NotionalLimit);
+            }
+            let maximum_position = account.limits.max_abs_position;
+            let worst_long = account
+                .settled_position
+                .checked_add(i128::try_from(account.reserved_buys).unwrap_or(i128::MAX))
+                .ok_or(RejectReason::ArithmeticOverflow)?;
+            let worst_short = account
+                .settled_position
+                .checked_sub(i128::try_from(account.reserved_sells).unwrap_or(i128::MAX))
+                .ok_or(RejectReason::ArithmeticOverflow)?;
+            if worst_long > maximum_position || worst_short < -maximum_position {
+                return Err(RejectReason::PositionLimit);
+            }
+        } else {
+            let released = remaining - new_total;
+            match side {
+                Side::Buy => account.reserved_buys -= u128::from(released),
+                Side::Sell => account.reserved_sells -= u128::from(released),
+            }
+        }
+        let Some(reservation) = self.reservations.get_mut(&replace.order_id.0) else {
+            unreachable!("reservation present");
+        };
+        reservation.remaining = new_total;
+        Ok((remaining.saturating_sub(new_total), prior))
+    }
+
+    /// Restores a reservation total after a rolled-back book mutation.
+    fn restore_reservation(&mut self, order_id: u64, prior_remaining: u64) {
+        if order_id == 44 {
+            eprintln!(
+                "RESTORE44 prior={prior_remaining} current={:?}",
+                self.reservations.get(&order_id).map(|r| r.remaining)
+            );
+        }
+        // The rollback mirrors the gateway re-adjusting with the prior total.
+        let current = self
+            .reservations
+            .get(&order_id)
+            .map_or(prior_remaining, |reservation| reservation.remaining);
+        let delta = i128::from(prior_remaining) - i128::from(current);
+        if delta == 0 {
+            return;
+        }
+        let (side, account_id) = {
+            let reservation = self.reservations.get(&order_id).expect("live");
+            (reservation.side, reservation.account_id)
+        };
+        let account = self.accounts.get_mut(&account_id.0).expect("account");
+        match side {
+            Side::Buy => {
+                account.reserved_buys =
+                    (i128::try_from(account.reserved_buys).expect("fits") + delta).unsigned_abs();
+            }
+            Side::Sell => {
+                account.reserved_sells =
+                    (i128::try_from(account.reserved_sells).expect("fits") + delta).unsigned_abs();
+            }
+        }
+        self.reservations
+            .get_mut(&order_id)
+            .expect("live")
+            .remaining = prior_remaining;
+    }
     /// Releases a reservation completely without a position change; mirrors
     /// `settle(order_id, Quantity(0))` and full cancel releases.
     fn release(&mut self, order_id: u64) {
@@ -844,6 +1225,9 @@ impl ModelEngine {
             order_id.0
         );
         reservation.remaining -= traded;
+        if order_id.0 == 44 {
+            eprintln!("REC44 -{} res={}", traded, reservation.remaining);
+        }
         let (side, account_id, emptied) = (
             reservation.side,
             reservation.account_id,
@@ -979,6 +1363,7 @@ mod tests {
             ioc_probability_pct: 15,
             fok_probability_pct: 10,
             post_only_probability_pct: 10,
+            replace_probability_pct: 30,
         }
     }
 
@@ -1003,6 +1388,7 @@ mod tests {
         let first = generator.next_new();
         assert_eq!(first.order_id.0, 1);
         let mut seen_duplicate = false;
+        let mut seen_replace = false;
         let mut seen_cancel = false;
         for step in 1..=400_u64 {
             match generator.next_command() {
@@ -1017,9 +1403,15 @@ mod tests {
                     assert!(cancel.order_id.0 >= 1);
                     seen_cancel = true;
                 }
+                Command::Replace(replace) => {
+                    assert_eq!(replace.sequence.0, step + 1);
+                    assert!(replace.order_id.0 >= 1);
+                    seen_replace = true;
+                }
             }
         }
         assert!(seen_duplicate, "duplication never fired");
+        assert!(seen_replace, "replaces never fired");
         assert!(seen_cancel, "cancels never fired");
     }
 
@@ -1185,6 +1577,7 @@ mod tests {
                 ioc_probability_pct: 15,
                 fok_probability_pct: 10,
                 post_only_probability_pct: 10,
+                replace_probability_pct: 30,
             },
             InstrumentId(1),
             0xfeed,
@@ -1196,6 +1589,9 @@ mod tests {
                 }
                 Command::Cancel(cancel) => {
                     let _ = model.apply_cancel(&cancel);
+                }
+                Command::Replace(replace) => {
+                    let _ = model.apply_replace(&replace);
                 }
             }
             model.assert_consistent();

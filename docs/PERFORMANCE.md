@@ -404,6 +404,32 @@ host's run-to-run jitter rather than a depth cost, since both paths touch
 only the first sorted entry. All cells report zero allocation deltas.
 Seeded property sessions now include post-only orders end to end.
 
+## v0.11.0 Replace Lifecycle
+
+Protocol type 3 adds owned replaces. Same-price quantity reductions patch the
+resting slot in place (priority kept); price changes and increases remove and
+re-add at the destination tail after a capacity preflight, and any repriced
+order that would cross rejects before mutation. Risk reservations adjust
+first and are restored exactly on book rejection.
+
+Book-side cells time `OrderBook::replace` on a fresh one-maker fixture per
+sample; the risk cell times `RiskEngine::adjust_reservation` alternating
+between two fixed totals (2,000 samples each, same desktop environment):
+
+| Scenario | Mean |
+| --- | ---: |
+| replace_reduce | 48 ns |
+| replace_increase | 93 ns |
+| replace_reprice | 89 ns |
+| replace_reject_unknown | 86 ns |
+| replace_risk_adjust (risk only) | 56 ns |
+
+In-place reductions are roughly half the cost of priority-losing moves, and
+the isolated risk adjustment shows the reservation side is comparable to a
+cancel release. All cells report zero allocation deltas; seeded property
+sessions now include replaces with per-step model equivalence, snapshot
+invariants, and replay equality over the full byte stream.
+
 ## Dedicated Linux Protocol
 
 Record all of the following with each result:

@@ -523,6 +523,115 @@ impl<const ACCOUNTS: usize, const ORDERS: usize> RiskEngine<ACCOUNTS, ORDERS> {
         Ok(())
     }
 
+    /// Amends an owned reservation's total quantity without touching the
+    /// book. Returns the released amount: zero for increases and no-op
+    /// changes. Increases re-check position, notional, and arithmetic limits
+    /// at the new total; decreases release exposure immediately.
+    ///
+    /// # Errors
+    ///
+    /// Returns unknown-order or ownership rejection, limit rejection for an
+    /// unaffordable increase, or arithmetic failure. Rejection does not
+    /// mutate state.
+    pub fn adjust_reservation(
+        &mut self,
+        order_id: OrderId,
+        account_id: AccountId,
+        price: PriceTicks,
+        new_quantity: Quantity,
+    ) -> Result<(Quantity, Quantity), RejectReason> {
+        let Some((slot, mut reservation)) = self.live_reservation(order_id) else {
+            return Err(RejectReason::UnknownOrder);
+        };
+        if reservation.account_id != account_id {
+            return Err(RejectReason::NotOrderOwner);
+        }
+        let remaining = reservation.quantity.0;
+        let new_total = new_quantity.0;
+        let prior = Quantity(remaining);
+        if new_total == remaining {
+            return Ok((Quantity(0), prior));
+        }
+        let account_slot = self
+            .account_slot(account_id)
+            .ok_or(RejectReason::UnknownAccount)?;
+        let mut account = self.accounts[account_slot].ok_or(RejectReason::UnknownAccount)?;
+        if new_total > remaining {
+            let added = new_total - remaining;
+            let (reserved_buys, reserved_sells) = match reservation.side {
+                Side::Buy => (
+                    account
+                        .reserved_buys
+                        .checked_add(u128::from(added))
+                        .ok_or(RejectReason::ArithmeticOverflow)?,
+                    account.reserved_sells,
+                ),
+                Side::Sell => (
+                    account.reserved_buys,
+                    account
+                        .reserved_sells
+                        .checked_add(u128::from(added))
+                        .ok_or(RejectReason::ArithmeticOverflow)?,
+                ),
+            };
+            let absolute_price = price
+                .0
+                .checked_abs()
+                .ok_or(RejectReason::ArithmeticOverflow)?;
+            let notional = u128::from(
+                u64::try_from(absolute_price).map_err(|_| RejectReason::ArithmeticOverflow)?,
+            )
+            .checked_mul(u128::from(new_total))
+            .ok_or(RejectReason::ArithmeticOverflow)?;
+            if notional > account.limits.max_notional {
+                return Err(RejectReason::NotionalLimit);
+            }
+            let maximum_position = i128::from(account.limits.max_abs_position.0);
+            let worst_long = account
+                .settled_position
+                .checked_add(
+                    i128::try_from(reserved_buys).map_err(|_| RejectReason::ArithmeticOverflow)?,
+                )
+                .ok_or(RejectReason::ArithmeticOverflow)?;
+            let worst_short = account
+                .settled_position
+                .checked_sub(
+                    i128::try_from(reserved_sells).map_err(|_| RejectReason::ArithmeticOverflow)?,
+                )
+                .ok_or(RejectReason::ArithmeticOverflow)?;
+            if worst_long > maximum_position || worst_short < -maximum_position {
+                return Err(RejectReason::PositionLimit);
+            }
+            match reservation.side {
+                Side::Buy => account.reserved_buys = reserved_buys,
+                Side::Sell => account.reserved_sells = reserved_sells,
+            }
+            reservation.quantity = Quantity(new_total);
+            self.accounts[account_slot] = Some(account);
+            self.reservations[slot] = ReservationSlot::Live(reservation);
+            Ok((Quantity(0), prior))
+        } else {
+            let released = remaining - new_total;
+            match reservation.side {
+                Side::Buy => {
+                    account.reserved_buys = account
+                        .reserved_buys
+                        .checked_sub(u128::from(released))
+                        .ok_or(RejectReason::ArithmeticOverflow)?;
+                }
+                Side::Sell => {
+                    account.reserved_sells = account
+                        .reserved_sells
+                        .checked_sub(u128::from(released))
+                        .ok_or(RejectReason::ArithmeticOverflow)?;
+                }
+            }
+            reservation.quantity = Quantity(new_total);
+            self.accounts[account_slot] = Some(account);
+            self.reservations[slot] = ReservationSlot::Live(reservation);
+            Ok((Quantity(released), prior))
+        }
+    }
     /// Validates ownership of an open reservation without mutation.
     ///
     /// # Errors

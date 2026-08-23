@@ -52,6 +52,18 @@ pub struct NewOrder {
     pub time_in_force: TimeInForce,
 }
 
+/// Owned amend of a resting order: new price and new total quantity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(C)]
+pub struct ReplaceOrder {
+    pub order_id: OrderId,
+    pub account_id: AccountId,
+    pub instrument_id: InstrumentId,
+    pub sequence: SequenceNumber,
+    pub price: PriceTicks,
+    pub quantity: Quantity,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(C)]
 pub struct CancelOrder {
@@ -101,6 +113,8 @@ pub enum RejectReason {
     ReportCapacity,
     InsufficientLiquidity,
     PostOnlyWouldTrade,
+    /// A replace tried to move an order to a price that would cross.
+    ReplaceWouldCross,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

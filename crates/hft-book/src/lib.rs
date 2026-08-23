@@ -116,7 +116,10 @@ impl<const LEVELS: usize, const ORDERS: usize> OrderIndex<LEVELS, ORDERS> {
             return None;
         }
         let start = Self::probe_start(order_id);
+        let mut guard = 0_u32;
         for offset in 0..Self::CAPACITY {
+            guard += 1;
+            assert!(guard < 50_000_000, "find_slot runaway");
             let flat_index = start.wrapping_add(offset) % Self::CAPACITY;
             match self.slot(flat_index) {
                 IndexSlot::Empty => return None,
@@ -185,7 +188,10 @@ impl<const LEVELS: usize, const ORDERS: usize> OrderIndex<LEVELS, ORDERS> {
         let mut hole = flat_index;
         let mut candidate_index = hole.wrapping_add(1) % Self::CAPACITY;
         // Close the probe hole without retaining deletion tombstones.
+        let mut guard = 0_u32;
         loop {
+            guard += 1;
+            assert!(guard < 50_000_000, "order index remove_at runaway");
             let candidate = *self.slot(candidate_index);
             let IndexSlot::Occupied {
                 order_id: candidate_id,
@@ -201,11 +207,10 @@ impl<const LEVELS: usize, const ORDERS: usize> OrderIndex<LEVELS, ORDERS> {
             {
                 *self.slot_mut(hole) = candidate;
                 let new_slot = u32::try_from(hole).expect("occupied slots fit u32");
-                debug_assert!(update_reverse_slot(
-                    candidate_id,
-                    candidate_location,
-                    new_slot
-                ));
+                // The closure must run in every profile; skipping it in
+                // release strands the moved order's stored handle.
+                let updated = update_reverse_slot(candidate_id, candidate_location, new_slot);
+                debug_assert!(updated);
                 hole = candidate_index;
             }
             candidate_index = candidate_index.wrapping_add(1) % Self::CAPACITY;
@@ -1702,5 +1707,40 @@ mod tests {
         assert_eq!(book.stable_digest(), digest);
         assert_index_consistent(&book);
         assert_level_index_consistent(&book);
+    }
+
+    #[test]
+    fn shifted_orders_stay_locatable_and_cancellable() {
+        let mut book = OrderBook::<8, 8>::new(InstrumentId(1));
+        let mut reports = ReportBuffer::<8>::new();
+        for id in 1..=16_u64 {
+            let side = if id % 2 == 0 { Side::Sell } else { Side::Buy };
+            let price = if side == Side::Sell { 101 } else { 99 };
+            book.submit(order(id, price, 1, side), &mut reports)
+                .expect("rest");
+            reports.clear();
+        }
+        // Cancels in id order force index back-shifts; later cancels of the
+        // shifted entries must still locate them.
+        for id in 1..=8 {
+            book.cancel(CancelOrder {
+                order_id: OrderId(id),
+                account_id: AccountId(1),
+                instrument_id: InstrumentId(1),
+                sequence: SequenceNumber(id + 100),
+            })
+            .unwrap_or_else(|error| panic!("cancel {id}: {error:?}"));
+        }
+        for id in 9..=16 {
+            book.cancel(CancelOrder {
+                order_id: OrderId(id),
+                account_id: AccountId(1),
+                instrument_id: InstrumentId(1),
+                sequence: SequenceNumber(id + 100),
+            })
+            .unwrap_or_else(|error| panic!("cancel shifted {id}: {error:?}"));
+        }
+        assert_eq!(book.order_count(), 0);
+        assert_index_consistent(&book);
     }
 }

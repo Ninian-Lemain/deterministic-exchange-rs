@@ -194,7 +194,10 @@ impl<V: Copy, const PLANE: usize, const PLANES: usize> ProbeIndex<V, PLANE, PLAN
             {
                 *self.slot_mut(hole) = entry;
                 let new_flat = u32::try_from(hole).expect("occupied slots fit u32");
-                debug_assert!(update_moved(candidate_key, candidate_value, new_flat));
+                // The closure must run in every profile; skipping it in
+                // release strands the moved value's stored handle.
+                let updated = update_moved(candidate_key, candidate_value, new_flat);
+                debug_assert!(updated);
                 hole = candidate;
             }
             candidate = candidate.wrapping_add(1) % Self::CAPACITY;
@@ -1051,5 +1054,65 @@ mod tests {
         risk.settle(OrderId(4), Quantity(0))
             .expect("settle through preserved handle");
         assert_risk_consistent(&risk);
+    }
+
+    #[test]
+    fn shifted_reservations_stay_releasable_after_back_shift() {
+        let mut risk = RiskEngine::<4, 64>::new();
+        let limits = RiskLimits {
+            max_quantity: Quantity(10),
+            max_notional: 1_000_000,
+            max_abs_position: Quantity(1_000),
+            max_open_orders: 32,
+            minimum_price: PriceTicks(1),
+            maximum_price: PriceTicks(1_000),
+        };
+        for account in 1..=4_u32 {
+            risk.register_account(AccountId(account), limits)
+                .expect("register");
+        }
+        for id in 1..=40_u64 {
+            let side = if id % 2 == 0 { Side::Sell } else { Side::Buy };
+            risk.check_and_reserve(NewOrder {
+                order_id: OrderId(id),
+                account_id: AccountId(u32::try_from((id % 4) + 1).expect("account")),
+                instrument_id: InstrumentId(1),
+                price: PriceTicks(100),
+                quantity: Quantity(1),
+                sequence: SequenceNumber(id),
+                side,
+            })
+            .unwrap_or_else(|error| panic!("reserve {id}: {error:?}"));
+        }
+        // Interleaved releases force repeated back-shifts across the table;
+        // every later release must still find its moved entry.
+        for id in (1..=20).step_by(2) {
+            risk.cancel_reservation(
+                OrderId(id),
+                AccountId(u32::try_from((id % 4) + 1).expect("account")),
+            )
+            .expect("cancel odd");
+        }
+        for id in (2..=20).step_by(2) {
+            risk.cancel_reservation(
+                OrderId(id),
+                AccountId(u32::try_from((id % 4) + 1).expect("account")),
+            )
+            .expect("cancel even shifted");
+        }
+        for id in 21..=40 {
+            risk.cancel_reservation(
+                OrderId(id),
+                AccountId(u32::try_from((id % 4) + 1).expect("account")),
+            )
+            .expect("cancel late shifted");
+        }
+        for account in 1..=4_u32 {
+            assert_eq!(
+                risk.account_snapshot(AccountId(account)),
+                Some((0, 0)),
+                "account {account} drained"
+            );
+        }
     }
 }

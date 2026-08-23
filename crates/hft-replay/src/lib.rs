@@ -65,6 +65,7 @@ mod tests {
         let mut gateway = Gateway::<2, 8, 4, 4>::new(risk, InstrumentId(7));
         let make = |id, account, side| {
             encode_new_order(NewOrder {
+                time_in_force: hft_types::TimeInForce::Gtc,
                 order_id: OrderId(id),
                 account_id: AccountId(account),
                 instrument_id: InstrumentId(7),

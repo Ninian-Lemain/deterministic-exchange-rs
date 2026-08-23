@@ -32,6 +32,7 @@
     "plan",
     "commands",
     "new_frames",
-    "cancel_frames"
+    "cancel_frames",
+    "tif"
   ]
 }

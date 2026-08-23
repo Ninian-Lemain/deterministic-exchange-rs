@@ -3,14 +3,14 @@
 use hft_io::RxFrame;
 use hft_types::{
     AccountId, CancelOrder, InstrumentId, NewOrder, OrderId, PriceTicks, Quantity, SequenceNumber,
-    Side,
+    Side, TimeInForce,
 };
 
-pub const PROTOCOL_VERSION: u8 = 1;
+pub const PROTOCOL_VERSION: u8 = 2;
 pub const NEW_ORDER_TYPE: u8 = 1;
 pub const CANCEL_ORDER_TYPE: u8 = 2;
-pub const NEW_ORDER_LEN: usize = 45;
-const NEW_ORDER_WIRE_LEN: u16 = 45;
+pub const NEW_ORDER_LEN: usize = 46;
+const NEW_ORDER_WIRE_LEN: u16 = 46;
 pub const CANCEL_ORDER_LEN: usize = 28;
 const CANCEL_ORDER_WIRE_LEN: u16 = 28;
 
@@ -21,6 +21,7 @@ pub enum ParseError {
     UnknownMessageType,
     InvalidLength,
     InvalidSide,
+    InvalidTimeInForce,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -38,6 +39,11 @@ impl BorrowedNewOrder<'_> {
     #[must_use]
     pub fn to_owned(self) -> NewOrder {
         NewOrder {
+            time_in_force: match self.bytes[45] {
+                value if value == TimeInForce::Gtc as u8 => TimeInForce::Gtc,
+                value if value == TimeInForce::Ioc as u8 => TimeInForce::Ioc,
+                _ => TimeInForce::Fok,
+            },
             order_id: OrderId(read_u64(self.bytes, 4)),
             account_id: AccountId(read_u32(self.bytes, 12)),
             instrument_id: InstrumentId(read_u32(self.bytes, 16)),
@@ -107,6 +113,14 @@ pub fn parse_message<'frame>(
             {
                 return Err(ParseError::InvalidSide);
             }
+            if !matches!(
+                bytes[45],
+                value if value == TimeInForce::Gtc as u8
+                    || value == TimeInForce::Ioc as u8
+                    || value == TimeInForce::Fok as u8
+            ) {
+                return Err(ParseError::InvalidTimeInForce);
+            }
             Ok(BorrowedMessage::NewOrder(BorrowedNewOrder { bytes }))
         }
         CANCEL_ORDER_TYPE => {
@@ -132,6 +146,7 @@ pub fn encode_new_order(order: NewOrder) -> [u8; NEW_ORDER_LEN] {
     bytes[28..36].copy_from_slice(&order.quantity.0.to_be_bytes());
     bytes[36..44].copy_from_slice(&order.sequence.0.to_be_bytes());
     bytes[44] = order.side as u8;
+    bytes[45] = order.time_in_force as u8;
     bytes
 }
 
@@ -189,6 +204,7 @@ mod tests {
 
     fn order() -> NewOrder {
         NewOrder {
+            time_in_force: hft_types::TimeInForce::Gtc,
             order_id: OrderId(10),
             account_id: AccountId(20),
             instrument_id: InstrumentId(30),

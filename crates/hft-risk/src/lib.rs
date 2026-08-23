@@ -742,6 +742,7 @@ mod tests {
 
     fn order(id: u64, side: Side, quantity: u64) -> NewOrder {
         NewOrder {
+            time_in_force: hft_types::TimeInForce::Gtc,
             order_id: OrderId(id),
             account_id: AccountId(7),
             instrument_id: InstrumentId(1),
@@ -1074,6 +1075,7 @@ mod tests {
         for id in 1..=40_u64 {
             let side = if id % 2 == 0 { Side::Sell } else { Side::Buy };
             risk.check_and_reserve(NewOrder {
+                time_in_force: hft_types::TimeInForce::Gtc,
                 order_id: OrderId(id),
                 account_id: AccountId(u32::try_from((id % 4) + 1).expect("account")),
                 instrument_id: InstrumentId(1),

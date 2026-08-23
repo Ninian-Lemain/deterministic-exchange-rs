@@ -20,6 +20,8 @@ fn run_shape<const LEVELS: usize, const ORDERS: usize, const REPORTS: usize>(
             max_quantity: 4,
             cancel_probability_pct: 55,
             duplicate_id_probability_pct: 8,
+            ioc_probability_pct: 15,
+            fok_probability_pct: 10,
         },
         InstrumentId(1),
         seed,
@@ -31,13 +33,16 @@ fn run_shape<const LEVELS: usize, const ORDERS: usize, const REPORTS: usize>(
                 let actual = book.submit(command, &mut reports);
                 let expected = model.submit(&command, REPORTS, LEVELS, ORDERS);
                 match (actual, expected) {
-                    (Ok(summary), Ok((state, filled, resting, fills))) => {
+                    (Ok(summary), Ok((state, filled, resting, discarded, fills))) => {
                         assert_eq!(summary.state, state, "state at step {step}");
                         assert_eq!(summary.filled_quantity, filled);
                         assert_eq!(summary.resting_quantity, resting);
+                        assert_eq!(summary.discarded_quantity, discarded);
                         // Quantity conservation and a non-negative remainder.
                         assert_eq!(
-                            summary.filled_quantity.0 + summary.resting_quantity.0,
+                            summary.filled_quantity.0
+                                + summary.resting_quantity.0
+                                + summary.discarded_quantity.0,
                             command.quantity.0,
                             "conservation at step {step}"
                         );

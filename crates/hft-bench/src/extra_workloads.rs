@@ -41,6 +41,7 @@ pub fn parser_benchmark(samples: usize, out: &mut Vec<BenchRecord>) {
     for i in 0..new_frames {
         let index = u64::try_from(i).expect("frame index fits u64");
         frames_new.push(encode_new_order(NewOrder {
+            time_in_force: hft_types::TimeInForce::Gtc,
             order_id: OrderId(index + 1),
             account_id: AccountId(u32::try_from(1 + (i % 2)).expect("account fits u32")),
             instrument_id: InstrumentId(1),
@@ -317,6 +318,8 @@ pub fn gateway_mixed_benchmark(commands: u64, warmup: u64, seed: u64, out: &mut 
             max_quantity: 4,
             cancel_probability_pct: 40,
             duplicate_id_probability_pct: 3,
+            ioc_probability_pct: 15,
+            fok_probability_pct: 10,
         },
         InstrumentId(1),
         seed,
@@ -389,6 +392,7 @@ fn deep_taker_step(
     let taker_id = 1_000_000 + *next_maker_id;
     *next_maker_id += 1;
     let order = NewOrder {
+        time_in_force: hft_types::TimeInForce::Gtc,
         order_id: OrderId(taker_id),
         account_id: AccountId(2),
         instrument_id: InstrumentId(1),
@@ -424,6 +428,7 @@ fn deep_taker_step(
         *next_maker_id += 1;
         book.submit(
             NewOrder {
+                time_in_force: hft_types::TimeInForce::Gtc,
                 order_id: OrderId(id),
                 account_id: AccountId(1),
                 instrument_id: InstrumentId(1),
@@ -462,6 +467,7 @@ pub fn deep_book_benchmark(samples: usize, seed: u64, out: &mut Vec<BenchRecord>
         let price = 100 + i64::try_from(level_index).expect("level index fits i64");
         book.submit(
             NewOrder {
+                time_in_force: hft_types::TimeInForce::Gtc,
                 order_id: OrderId(id),
                 account_id: AccountId(1),
                 instrument_id: InstrumentId(1),

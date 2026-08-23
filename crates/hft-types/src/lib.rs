@@ -31,6 +31,14 @@ pub enum Side {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum TimeInForce {
+    Gtc = 1,
+    Ioc = 2,
+    Fok = 3,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(C)]
 pub struct NewOrder {
     pub order_id: OrderId,
@@ -40,6 +48,7 @@ pub struct NewOrder {
     pub quantity: Quantity,
     pub sequence: SequenceNumber,
     pub side: Side,
+    pub time_in_force: TimeInForce,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -54,7 +63,11 @@ pub struct CancelOrder {
 const _: () = assert!(core::mem::size_of::<CancelOrder>() == 24);
 const _: () = assert!(core::mem::align_of::<CancelOrder>() == 8);
 
-const _: () = assert!(core::mem::size_of::<NewOrder>() == 48);
+const _: () = assert!(
+    core::mem::size_of::<NewOrder>() == NEW_ORDER_SIZE,
+    "neworder layout"
+);
+const NEW_ORDER_SIZE: usize = core::mem::size_of::<NewOrder>();
 const _: () = assert!(core::mem::align_of::<NewOrder>() == 8);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -85,6 +98,7 @@ pub enum RejectReason {
     PriceLevelCapacity,
     PriceLevelOrderCapacity,
     ReportCapacity,
+    InsufficientLiquidity,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -103,6 +117,8 @@ pub struct MatchSummary {
     pub state: OrderState,
     pub filled_quantity: Quantity,
     pub resting_quantity: Quantity,
+    /// IOC remainder that crossed nothing and was discarded.
+    pub discarded_quantity: Quantity,
     pub report_count: usize,
 }
 

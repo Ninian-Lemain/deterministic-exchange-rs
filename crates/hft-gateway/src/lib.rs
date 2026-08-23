@@ -125,6 +125,13 @@ impl<
                 .record_fill(report.taker_order_id, report.quantity)
                 .map_err(GatewayError::RiskState)?;
         }
+        // Nothing rests behind an IOC or FOK order: any untraded reservation
+        // remainder is discarded exactly like a full cancel.
+        if summary.resting_quantity.0 == 0 && summary.filled_quantity.0 < order.quantity.0 {
+            self.risk
+                .settle(order.order_id, Quantity(0))
+                .map_err(GatewayError::RiskState)?;
+        }
         Ok(GatewayOutcome::NewOrder(summary))
     }
 
@@ -196,6 +203,7 @@ mod tests {
 
     fn order(id: u64, account: u32, side: Side) -> NewOrder {
         NewOrder {
+            time_in_force: hft_types::TimeInForce::Gtc,
             order_id: OrderId(id),
             account_id: AccountId(account),
             instrument_id: InstrumentId(1),

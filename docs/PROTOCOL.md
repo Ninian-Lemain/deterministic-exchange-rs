@@ -11,11 +11,11 @@ the declared length exactly; trailing bytes are rejected.
 
 | Offset | Width | Field | Value |
 | ---: | ---: | --- | --- |
-| 0 | 1 | Version | `1` |
+| 0 | 1 | Version | `2` |
 | 1 | 1 | Message type | `1` new, `2` cancel |
 | 2 | 2 | Total message length | Big-endian `u16` |
 
-## New Order (`type = 1`, 45 bytes)
+## New Order (`type = 1`, 46 bytes)
 
 | Offset | Width | Field | Type |
 | ---: | ---: | --- | --- |

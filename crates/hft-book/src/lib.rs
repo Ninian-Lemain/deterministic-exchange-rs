@@ -3,6 +3,7 @@
 use hft_types::{
     AccountId, CancelOrder, ExecutionReport, InstrumentId, MatchSummary, NewOrder, OrderId,
     OrderState, PriceTicks, Quantity, RejectReason, ReportBuffer, SequenceNumber, Side,
+    TimeInForce,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -449,6 +450,8 @@ struct MatchPlan<const FILLS: usize> {
     capacity: usize,
     maker_side: Side,
     resting_quantity: Quantity,
+    /// IOC remainder that crossed nothing and is discarded, never filled.
+    discarded: u64,
 }
 
 const DUMMY_FILL: FillEntry = FillEntry {
@@ -459,6 +462,8 @@ const DUMMY_FILL: FillEntry = FillEntry {
     quantity: Quantity(0),
 };
 
+const DUMMY_PLAN_DISCARDED: u64 = 0;
+
 impl<const FILLS: usize> MatchPlan<FILLS> {
     fn new(maker_side: Side, report_capacity: usize) -> Self {
         Self {
@@ -467,6 +472,7 @@ impl<const FILLS: usize> MatchPlan<FILLS> {
             capacity: report_capacity.min(FILLS),
             maker_side,
             resting_quantity: Quantity(0),
+            discarded: DUMMY_PLAN_DISCARDED,
         }
     }
 
@@ -569,8 +575,8 @@ impl<const LEVELS: usize, const ORDERS_PER_LEVEL: usize> OrderBook<LEVELS, ORDER
         let initial_report_count = reports.len();
         let plan = self.build_plan::<REPORTS>(order, reports.remaining_capacity())?;
         self.apply_plan(order, &plan, reports);
-        let filled = order.quantity.0 - plan.resting_quantity.0;
-        let state = if plan.resting_quantity.0 == 0 {
+        let filled = order.quantity.0 - plan.resting_quantity.0 - plan.discarded;
+        let state = if filled == order.quantity.0 {
             OrderState::Filled
         } else if filled == 0 {
             OrderState::Accepted
@@ -581,6 +587,7 @@ impl<const LEVELS: usize, const ORDERS_PER_LEVEL: usize> OrderBook<LEVELS, ORDER
             state,
             filled_quantity: Quantity(filled),
             resting_quantity: plan.resting_quantity,
+            discarded_quantity: Quantity(plan.discarded),
             report_count: reports.len() - initial_report_count,
         })
     }
@@ -613,6 +620,7 @@ impl<const LEVELS: usize, const ORDERS_PER_LEVEL: usize> OrderBook<LEVELS, ORDER
         let maker_levels = self.side_levels(maker_side);
         let mut plan = MatchPlan::<REPORTS>::new(maker_side, report_capacity);
         let mut remaining = order.quantity.0;
+        let mut discarded = 0_u64;
         for &(price, level_index) in self.side_index(maker_side).iter() {
             if remaining == 0 {
                 break;
@@ -640,20 +648,38 @@ impl<const LEVELS: usize, const ORDERS_PER_LEVEL: usize> OrderBook<LEVELS, ORDER
                 cursor = maker.next;
             }
         }
-        if remaining > 0 {
-            let descending = order.side == Side::Buy;
-            if let Some(level_index) = self.side_index(order.side).find(order.price, descending) {
-                let level = self.side_levels(order.side)[level_index]
-                    .as_ref()
-                    .expect("indexed level is occupied");
-                if level.len == ORDERS_PER_LEVEL {
-                    return Err(RejectReason::PriceLevelOrderCapacity);
+        match order.time_in_force {
+            TimeInForce::Fok => {
+                // Fill everything within the price limit or touch nothing.
+                if remaining > 0 {
+                    return Err(RejectReason::InsufficientLiquidity);
                 }
-            } else if self.side_index(order.side).is_full() {
-                return Err(RejectReason::PriceLevelCapacity);
+            }
+            TimeInForce::Ioc => {
+                // Execute what crossed and discard the remainder.
+                discarded = remaining;
+                remaining = 0;
+            }
+            TimeInForce::Gtc => {
+                if remaining > 0 {
+                    let descending = order.side == Side::Buy;
+                    if let Some(level_index) =
+                        self.side_index(order.side).find(order.price, descending)
+                    {
+                        let level = self.side_levels(order.side)[level_index]
+                            .as_ref()
+                            .expect("indexed level is occupied");
+                        if level.len == ORDERS_PER_LEVEL {
+                            return Err(RejectReason::PriceLevelOrderCapacity);
+                        }
+                    } else if self.side_index(order.side).is_full() {
+                        return Err(RejectReason::PriceLevelCapacity);
+                    }
+                }
             }
         }
         plan.resting_quantity = Quantity(remaining);
+        plan.discarded = discarded;
         Ok(plan)
     }
 
@@ -929,6 +955,7 @@ mod tests {
 
     fn order(id: u64, price: i64, quantity: u64, side: Side) -> NewOrder {
         NewOrder {
+            time_in_force: hft_types::TimeInForce::Gtc,
             order_id: OrderId(id),
             account_id: AccountId(1),
             instrument_id: InstrumentId(1),
@@ -1513,6 +1540,8 @@ mod tests {
                 max_quantity: 3,
                 cancel_probability_pct: 60,
                 duplicate_id_probability_pct: 10,
+                ioc_probability_pct: 15,
+                fok_probability_pct: 10,
             },
             InstrumentId(1),
             0x5eed,
@@ -1524,7 +1553,7 @@ mod tests {
                     let actual = book.submit(command, &mut reports);
                     let expected = model.submit(&command, REPORTS, LEVELS, ORDERS);
                     match (actual, expected) {
-                        (Ok(summary), Ok((state, filled, resting, fills))) => {
+                        (Ok(summary), Ok((state, filled, resting, _discarded, fills))) => {
                             assert_eq!(summary.state, state, "state at step {step}");
                             assert_eq!(summary.filled_quantity, filled, "filled at step {step}");
                             assert_eq!(summary.resting_quantity, resting, "resting at step {step}");
@@ -1742,5 +1771,85 @@ mod tests {
         }
         assert_eq!(book.order_count(), 0);
         assert_index_consistent(&book);
+    }
+
+    #[test]
+    fn ioc_never_rests_and_conserves_quantity() {
+        let mut book = OrderBook::<4, 4>::new(InstrumentId(1));
+        let mut reports = ReportBuffer::<4>::new();
+        book.submit(order(1, 100, 3, Side::Sell), &mut reports)
+            .expect("rest ask");
+        reports.clear();
+        // Partial: fills 3 of 5, discards 2.
+        let mut ioc = order(2, 100, 5, Side::Buy);
+        ioc.time_in_force = TimeInForce::Ioc;
+        let summary = book.submit(ioc, &mut reports).expect("ioc partial");
+        assert_eq!(summary.filled_quantity, Quantity(3));
+        assert_eq!(summary.resting_quantity, Quantity(0));
+        assert_eq!(summary.state, OrderState::PartiallyFilled);
+        assert_eq!(book.order_count(), 0, "nothing rests behind an IOC");
+        // Zero fill against a non-crossing market still consumes nothing.
+        book.submit(order(3, 100, 4, Side::Sell), &mut reports)
+            .expect("rest ask");
+        reports.clear();
+        let mut empty = order(4, 90, 2, Side::Buy);
+        empty.time_in_force = TimeInForce::Ioc;
+        let summary = book.submit(empty, &mut reports).expect("ioc empty");
+        assert_eq!(summary.filled_quantity, Quantity(0));
+        assert_eq!(summary.resting_quantity, Quantity(0));
+        assert_eq!(summary.state, OrderState::Accepted);
+        assert_eq!(book.order_count(), 1, "only the resting ask remains");
+    }
+
+    #[test]
+    fn fok_is_atomic_across_liquidity_and_capacity() {
+        let mut book = OrderBook::<4, 4>::new(InstrumentId(1));
+        let mut reports = ReportBuffer::<4>::new();
+        book.submit(order(1, 100, 3, Side::Sell), &mut reports)
+            .expect("rest ask");
+        reports.clear();
+        let digest = book.stable_digest();
+        // Insufficient liquidity rejects without mutation.
+        let mut short = order(2, 100, 5, Side::Buy);
+        short.time_in_force = TimeInForce::Fok;
+        assert_eq!(
+            book.submit(short, &mut reports),
+            Err(RejectReason::InsufficientLiquidity)
+        );
+        assert_eq!(book.stable_digest(), digest, "FOK reject mutates nothing");
+        assert!(reports.is_empty());
+        // Report capacity below the required fill count also rejects.
+        let mut wide = OrderBook::<4, 4>::new(InstrumentId(1));
+        let mut small_reports = ReportBuffer::<1>::new();
+        for id in 1..=2_u64 {
+            wide.submit(
+                order(
+                    id,
+                    100 + i64::try_from(id).expect("small id"),
+                    1,
+                    Side::Sell,
+                ),
+                &mut small_reports,
+            )
+            .expect("rest level");
+            small_reports.clear();
+        }
+        let mut two_level = order(9, 200, 2, Side::Buy);
+        two_level.time_in_force = TimeInForce::Fok;
+        assert_eq!(
+            wide.submit(two_level, &mut small_reports),
+            Err(RejectReason::ReportCapacity),
+            "FOK needs capacity for every fill"
+        );
+        assert_eq!(wide.order_count(), 2, "both makers untouched");
+        // Full liquidity executes completely.
+        let mut ok = order(3, 100, 3, Side::Buy);
+        ok.time_in_force = TimeInForce::Fok;
+        let summary = book.submit(ok, &mut reports).expect("fok full");
+        assert_eq!(summary.filled_quantity, Quantity(3));
+        assert_eq!(summary.resting_quantity, Quantity(0));
+        assert_eq!(summary.state, OrderState::Filled);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(book.order_count(), 0);
     }
 }

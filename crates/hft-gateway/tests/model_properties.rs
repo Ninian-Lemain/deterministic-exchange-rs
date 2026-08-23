@@ -55,6 +55,8 @@ fn gen_config() -> GenConfig {
         max_quantity: 4,
         cancel_probability_pct: 40,
         duplicate_id_probability_pct: 5,
+        ioc_probability_pct: 15,
+        fok_probability_pct: 10,
     }
 }
 
@@ -165,7 +167,7 @@ fn compare_new(
         (Ok(GatewayOutcome::NewOrder(summary)), Ok(outcome)) => {
             assert_eq!(summary.filled_quantity, outcome.filled, "filled");
             assert_eq!(summary.resting_quantity, outcome.rested, "rested");
-            let expected_state = if outcome.rested.0 == 0 {
+            let expected_state = if outcome.filled.0 == order.quantity.0 {
                 OrderState::Filled
             } else if outcome.filled.0 == 0 {
                 OrderState::Accepted
@@ -270,6 +272,8 @@ fn accepted_frames_replay_through_the_replay_helper() {
         max_quantity: 4,
         cancel_probability_pct: 0,
         duplicate_id_probability_pct: 0,
+        ioc_probability_pct: 0,
+        fok_probability_pct: 0,
     };
     let mut generator = CommandGen::new(config, InstrumentId(1), 0x0a7c_0005);
     let mut oracle = ModelEngine::new(InstrumentId(1), LEVELS, ORDERS_PER_LEVEL);

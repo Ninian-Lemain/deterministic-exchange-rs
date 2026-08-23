@@ -1,4 +1,4 @@
-use hft_gateway::Gateway;
+﻿use hft_gateway::Gateway;
 use hft_io::RxFrame;
 use hft_risk::{RiskEngine, RiskLimits};
 use hft_types::{
@@ -25,6 +25,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut reports = ReportBuffer::<2>::new();
     for (id, account, side) in [(1, 1, Side::Sell), (2, 2, Side::Buy)] {
         let bytes = encode_new_order(NewOrder {
+            time_in_force: hft_types::TimeInForce::Gtc,
             order_id: OrderId(id),
             account_id: AccountId(account),
             instrument_id: InstrumentId(7),

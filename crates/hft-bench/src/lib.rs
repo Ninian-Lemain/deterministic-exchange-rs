@@ -5,6 +5,7 @@
 
 pub mod extra_workloads;
 pub mod record;
+pub mod tif_workloads;
 
 use crate::record::{BenchRecord, Extra};
 use hft_book::OrderBook;
@@ -43,6 +44,7 @@ pub struct SuiteConfig {
     pub mixed_commands: u64,
     pub mixed_warmup: u64,
     pub deep_samples: usize,
+    pub tif_samples: usize,
 }
 
 impl SuiteConfig {
@@ -63,6 +65,7 @@ impl SuiteConfig {
             mixed_commands: 20_000,
             mixed_warmup: 1_000,
             deep_samples: 2_000,
+            tif_samples: 2_000,
         }
     }
 
@@ -83,6 +86,7 @@ impl SuiteConfig {
             mixed_commands: 600,
             mixed_warmup: 100,
             deep_samples: 96,
+            tif_samples: 96,
         }
     }
 }
@@ -110,6 +114,7 @@ pub fn run_suite(config: SuiteConfig) -> std::vec::Vec<std::string::String> {
         &mut records,
     );
     extra_workloads::deep_book_benchmark(config.deep_samples, 0x0a7c_dee1, &mut records);
+    tif_workloads::tif_benchmark(config.tif_samples, &mut records);
     records.iter().map(BenchRecord::to_json_line).collect()
 }
 
@@ -301,6 +306,7 @@ fn fifo_op<const DEPTH: usize>(
             let summary = book
                 .submit(
                     NewOrder {
+                        time_in_force: hft_types::TimeInForce::Gtc,
                         order_id: OrderId(taker),
                         account_id: AccountId(2),
                         instrument_id: InstrumentId(1),
@@ -379,6 +385,7 @@ fn fifo_fixture<const DEPTH: usize>() -> OrderBook<1, DEPTH> {
     for id in 1..=u64::try_from(DEPTH).expect("depth fits u64") {
         book.submit(
             NewOrder {
+                time_in_force: hft_types::TimeInForce::Gtc,
                 order_id: OrderId(id),
                 account_id: AccountId(1),
                 instrument_id: InstrumentId(1),
@@ -405,6 +412,7 @@ fn risk_fixture(occupancy: u64, limits: RiskLimits) -> RiskEngine<64, 1024> {
     for id in 1..=occupancy {
         let side = if id % 2 == 0 { Side::Sell } else { Side::Buy };
         risk.check_and_reserve(NewOrder {
+            time_in_force: hft_types::TimeInForce::Gtc,
             order_id: OrderId(id),
             account_id: AccountId(u32::try_from((id % 60) + 1).expect("account id fits u32")),
             instrument_id: InstrumentId(1),
@@ -426,6 +434,7 @@ fn reserve_one(
 ) -> Result<(), RejectReason> {
     let side = if id % 2 == 0 { Side::Sell } else { Side::Buy };
     risk.check_and_reserve(NewOrder {
+        time_in_force: hft_types::TimeInForce::Gtc,
         order_id: OrderId(id),
         account_id: AccountId(u32::try_from((id % 60) + 1).expect("account id fits u32")),
         instrument_id: InstrumentId(1),
@@ -711,6 +720,7 @@ fn risk_benchmark(config: SuiteConfig, out: &mut std::vec::Vec<BenchRecord>) {
 
 fn bench_order(id: u64, account: u32, price: i64, quantity: u64, side: Side) -> NewOrder {
     NewOrder {
+        time_in_force: hft_types::TimeInForce::Gtc,
         order_id: OrderId(id),
         account_id: AccountId(account),
         instrument_id: InstrumentId(1),
@@ -1280,6 +1290,7 @@ fn run_pair(
 
 const fn order(id: u64, account_id: AccountId, side: Side) -> NewOrder {
     NewOrder {
+        time_in_force: hft_types::TimeInForce::Gtc,
         order_id: OrderId(id),
         account_id,
         instrument_id: InstrumentId(1),

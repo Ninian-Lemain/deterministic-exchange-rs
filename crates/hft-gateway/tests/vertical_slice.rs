@@ -1,4 +1,4 @@
-use hft_gateway::Gateway;
+﻿use hft_gateway::Gateway;
 use hft_io::RxFrame;
 use hft_risk::{RiskEngine, RiskLimits};
 use hft_types::{
@@ -46,6 +46,7 @@ fn parse_order(line: &str) -> NewOrder {
     let fields: Vec<_> = line.split(',').collect();
     assert_eq!(fields.len(), 7);
     NewOrder {
+        time_in_force: hft_types::TimeInForce::Gtc,
         order_id: OrderId(fields[0].parse().expect("order ID")),
         account_id: AccountId(fields[1].parse().expect("account ID")),
         instrument_id: InstrumentId(fields[2].parse().expect("instrument ID")),

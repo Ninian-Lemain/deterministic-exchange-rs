@@ -144,20 +144,20 @@ The closures now run unconditionally with regression coverage. Perf counters
 Linux qualification; Windows runs validate correctness and allocation
 behavior only.
 
-## Next
-
-## Planned Order Semantics
-
 ### v0.9.0 - IOC and FOK
 
-- **Purpose / scope:** IOC executes available quantity and never rests; FOK
-  executes fully or performs no mutation.
-- **Invariants / tests:** FOK atomic across book/reports/risk, IOC never rests,
-  quantity conserved, and capacity rejection deterministic.
-- **Benchmarks:** IOC empty/partial/full and FOK reject/single/multi-fill versus
-  equivalent limit paths.
-- **Exit:** property/replay/allocation gates pass.
-- **Dependencies / limits:** requires v0.6-v0.8; no post-only/replace.
+Wire protocol v2 adds a time-in-force byte to new orders. IOC executes what
+crossed at the limit and never rests; its untraded remainder is reported as
+a discarded quantity and releases the risk reservation immediately, so
+quantity conservation reads filled + rested + discarded. FOK preflights full
+liquidity and report capacity in the plan walk and either fills completely
+or rejects with `InsufficientLiquidity` before any mutation. The reference
+model mirrors both semantics, seeded property sessions generate mixed TIF
+traffic with per-step snapshot equivalence and replay equality, and the
+benchmark suite gained IOC empty/partial/full plus FOK
+reject/single/multi-fill cells alongside their GTC comparisons.
+
+## Planned Order Semantics
 
 ### v0.10.0 - Post-Only
 

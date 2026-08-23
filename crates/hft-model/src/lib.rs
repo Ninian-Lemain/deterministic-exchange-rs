@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 use hft_types::{
     AccountId, CancelOrder, InstrumentId, NewOrder, OrderId, OrderState, PriceTicks, Quantity,
-    RejectReason, SequenceNumber, Side,
+    RejectReason, SequenceNumber, Side, TimeInForce,
 };
 
 /// Deterministic `SplitMix64` stream. Same seed, same sequence, integer math
@@ -58,6 +58,9 @@ pub struct GenConfig {
     pub max_quantity: u64,
     pub cancel_probability_pct: u64,
     pub duplicate_id_probability_pct: u64,
+    /// Share of New commands using IOC; FOK follows with its own share.
+    pub ioc_probability_pct: u64,
+    pub fok_probability_pct: u64,
 }
 
 /// One generated command with its strict session sequence number.
@@ -96,6 +99,12 @@ impl CommandGen {
         assert!(config.max_quantity >= 1, "quantity range empty");
         assert!(config.cancel_probability_pct <= 100);
         assert!(config.duplicate_id_probability_pct <= 100);
+        assert!(config.ioc_probability_pct <= 100);
+        assert!(config.fok_probability_pct <= 100);
+        assert!(
+            config.ioc_probability_pct + config.fok_probability_pct <= 100,
+            "tif probabilities exceed 100 percent"
+        );
         Self {
             config,
             instrument,
@@ -138,7 +147,17 @@ impl CommandGen {
         )
         .expect("positive span");
         let quantity_bound = self.config.max_quantity;
+        // TIF draw: FOK first, then IOC, else GTC.
+        let tif_draw = self.rng.below(100);
+        let time_in_force = if tif_draw < self.config.fok_probability_pct {
+            TimeInForce::Fok
+        } else if tif_draw < self.config.fok_probability_pct + self.config.ioc_probability_pct {
+            TimeInForce::Ioc
+        } else {
+            TimeInForce::Gtc
+        };
         NewOrder {
+            time_in_force,
             order_id,
             account_id: self.next_account(),
             instrument_id: self.instrument,
@@ -282,13 +301,27 @@ impl ModelBook {
         if report_count > report_capacity {
             return Err(RejectReason::ReportCapacity);
         }
-        if remaining > 0 {
-            if let Some((_, queue)) = own_levels.iter().find(|(price, _)| *price == order.price.0) {
-                if queue.len() == order_cap {
-                    return Err(RejectReason::PriceLevelOrderCapacity);
+        match order.time_in_force {
+            TimeInForce::Fok => {
+                if remaining > 0 {
+                    return Err(RejectReason::InsufficientLiquidity);
                 }
-            } else if own_levels.len() == level_cap {
-                return Err(RejectReason::PriceLevelCapacity);
+            }
+            TimeInForce::Ioc => {
+                // The discard itself is applied by `submit`.
+            }
+            TimeInForce::Gtc => {
+                if remaining > 0 {
+                    if let Some((_, queue)) =
+                        own_levels.iter().find(|(price, _)| *price == order.price.0)
+                    {
+                        if queue.len() == order_cap {
+                            return Err(RejectReason::PriceLevelOrderCapacity);
+                        }
+                    } else if own_levels.len() == level_cap {
+                        return Err(RejectReason::PriceLevelCapacity);
+                    }
+                }
             }
         }
         Ok(crossing)
@@ -311,9 +344,10 @@ impl ModelBook {
         report_capacity: usize,
         level_cap: usize,
         order_cap: usize,
-    ) -> Result<(OrderState, Quantity, Quantity, Vec<ModelFill>), RejectReason> {
+    ) -> Result<(OrderState, Quantity, Quantity, Quantity, Vec<ModelFill>), RejectReason> {
         let crossing = self.plan(order, report_capacity, level_cap, order_cap)?;
         let mut remaining = order.quantity.0;
+        let mut discarded = 0_u64;
         let maker_levels = match order.side {
             Side::Buy => &mut self.asks,
             Side::Sell => &mut self.bids,
@@ -348,7 +382,7 @@ impl ModelBook {
                 maker_levels.remove(position);
             }
         }
-        if remaining > 0 {
+        if remaining > 0 && order.time_in_force == TimeInForce::Gtc {
             let own_levels = match order.side {
                 Side::Buy => &mut self.bids,
                 Side::Sell => &mut self.asks,
@@ -366,16 +400,25 @@ impl ModelBook {
                 Some((_, queue)) => queue.push_back(resting),
                 None => own_levels.push((order.price.0, VecDeque::from([resting]))),
             }
+        } else if order.time_in_force == TimeInForce::Ioc {
+            discarded = remaining;
+            remaining = 0;
         }
-        let filled = order.quantity.0 - remaining;
-        let state = if remaining == 0 {
+        let filled = order.quantity.0 - remaining - discarded;
+        let state = if filled == order.quantity.0 {
             OrderState::Filled
         } else if filled == 0 {
             OrderState::Accepted
         } else {
             OrderState::PartiallyFilled
         };
-        Ok((state, Quantity(filled), Quantity(remaining), fills))
+        Ok((
+            state,
+            Quantity(filled),
+            Quantity(remaining),
+            Quantity(discarded),
+            fills,
+        ))
     }
 
     /// Cancels by id, enforcing ownership.
@@ -465,6 +508,7 @@ pub enum ModelRejection {
 pub struct ModelNewOutcome {
     pub filled: Quantity,
     pub rested: Quantity,
+    pub discarded: Quantity,
     pub fills: Vec<ModelFill>,
 }
 
@@ -623,14 +667,19 @@ impl ModelEngine {
                 self.release(order.order_id.0);
                 Err(ModelRejection::Book(reason))
             }
-            Ok((_, filled, rested, fills)) => {
+            Ok((_, filled, rested, discarded, fills)) => {
                 for fill in &fills {
                     self.record_fill(fill.maker_order_id, fill.quantity.0);
                     self.record_fill(order.order_id, fill.quantity.0);
                 }
+                // Mirror the gateway discarding an IOC/FOK remainder.
+                if rested.0 == 0 && filled.0 < order.quantity.0 {
+                    self.release(order.order_id.0);
+                }
                 Ok(ModelNewOutcome {
                     filled,
                     rested,
+                    discarded,
                     fills,
                 })
             }
@@ -925,6 +974,8 @@ mod tests {
             max_quantity: 3,
             cancel_probability_pct: cancel_pct,
             duplicate_id_probability_pct: dup_pct,
+            ioc_probability_pct: 15,
+            fok_probability_pct: 10,
         }
     }
 
@@ -989,6 +1040,7 @@ mod tests {
         side: Side,
     ) -> NewOrder {
         NewOrder {
+            time_in_force: hft_types::TimeInForce::Gtc,
             order_id: OrderId(id),
             account_id: AccountId(account),
             instrument_id: InstrumentId(1),
@@ -1127,6 +1179,8 @@ mod tests {
                 max_quantity: 4,
                 cancel_probability_pct: 40,
                 duplicate_id_probability_pct: 5,
+                ioc_probability_pct: 15,
+                fok_probability_pct: 10,
             },
             InstrumentId(1),
             0xfeed,

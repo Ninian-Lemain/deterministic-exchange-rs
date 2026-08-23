@@ -126,8 +126,8 @@ cell.
 The risk harness compares v0.3.0's linear-scan risk state with v0.4.0's
 fixed-capacity open-addressed indices for accounts and reservations. Each
 operation runs 256 timed samples against a `RiskEngine::<64, 1024>` at
-stated occupancy. Reservation occupancy sweeps are 102, 512, and 921 (â‰ˆ10%,
-50%, 90% of capacity). Account occupancy sweeps are 6, 32, and 57 (â‰ˆ10%,
+stated occupancy. Reservation occupancy sweeps are 102, 512, and 921 (Ã¢â€°Ë†10%,
+50%, 90% of capacity). Account occupancy sweeps are 6, 32, and 57 (Ã¢â€°Ë†10%,
 50%, 90% of capacity). All samples are timed with `Instant`; per-sample
 overhead is included.
 
@@ -361,6 +361,29 @@ with the cycled depth. Cycles, instructions, branch, and cache-miss counters
 are unavailable on this host and are deferred to the dedicated Linux
 qualification protocol below.
 
+## v0.9.0 IOC and FOK
+
+Protocol v2 adds a time-in-force byte to new orders; the engine gained IOC
+(never rests, remainder discarded and reported) and FOK (all-or-reject via
+plan preflight). The suite gained eight book-level cells comparing TIF paths
+on the same desktop environment:
+
+| Scenario | Mean | Note |
+| --- | ---: | --- |
+| ioc_empty | 90 ns | no crossing, zero fills |
+| ioc_partial | 116 ns | fills 3 of 5, discards rest |
+| ioc_full | 100 ns | equals gtc_full |
+| fok_reject | 60 ns | preflight reject, no mutation |
+| fok_single | 102 ns | single maker |
+| fok_multi | 334 ns | sweeps eight levels |
+| gtc_full | 101 ns | comparison cell |
+| gtc_partial_rests | 133 ns | rests remainder as a bid |
+
+FOK rejection is the cheapest path because the plan walk stops at the first
+shortfall without touching book or risk state. Every cell reports zero
+allocation deltas, and seeded property sessions now mix all three time-in-
+force values through the gateway/model equivalence, snapshot, and replay
+gates.
 ## Dedicated Linux Protocol
 
 Record all of the following with each result:

@@ -384,6 +384,26 @@ shortfall without touching book or risk state. Every cell reports zero
 allocation deltas, and seeded property sessions now mix all three time-in-
 force values through the gateway/model equivalence, snapshot, and replay
 gates.
+## v0.10.0 Post-Only
+
+Post-only rejection uses the best-price entry of the sorted-level index, so
+the crossing check is O(1) regardless of book depth; a rejected order
+mutates nothing, and an accepted one rests through the normal GTC path. The
+suite gained four cells (2,000 samples each, same desktop environment):
+
+| Scenario | Levels | Mean |
+| --- | ---: | ---: |
+| post_only_cross_shallow | 1 | 110 ns |
+| post_only_cross_deep | 64 | 48 ns |
+| post_only_noncross_shallow | 1 | 108 ns |
+| post_only_noncross_deep | 64 | 48 ns |
+
+Crossing rejects and resting submits both sit in the same low-100-ns band as
+their v0.9.0 GTC/IOC equivalents; the shallow/deep spread is within this
+host's run-to-run jitter rather than a depth cost, since both paths touch
+only the first sorted entry. All cells report zero allocation deltas.
+Seeded property sessions now include post-only orders end to end.
+
 ## Dedicated Linux Protocol
 
 Record all of the following with each result:

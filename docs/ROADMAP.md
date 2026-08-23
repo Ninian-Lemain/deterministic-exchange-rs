@@ -157,16 +157,18 @@ traffic with per-step snapshot equivalence and replay equality, and the
 benchmark suite gained IOC empty/partial/full plus FOK
 reject/single/multi-fill cells alongside their GTC comparisons.
 
-## Planned Order Semantics
-
 ### v0.10.0 - Post-Only
 
-- **Purpose / scope:** reject liquidity-taking post-only orders before mutation.
-- **Invariants / tests:** never trades; accepted order joins FIFO tail; rejection
-  leaves book/risk unchanged.
-- **Benchmarks:** crossing/non-crossing at shallow and deep level counts.
-- **Exit:** model, replay, and allocation gates pass.
-- **Dependencies / limits:** uses v0.5 best-price API; no replace.
+Post-only orders use the best-price sorted index to reject any order that
+would trade before a single mutation occurs; accepted post-only orders rest
+at the level tail exactly like other makers. The reference model mirrors the
+check, seeded property sessions include post-only traffic through the full
+gateway equivalence, snapshot, and replay gates, and the benchmark suite
+gained crossing and non-crossing post-only cells at shallow (one level) and
+deep (64 level) occupancies. Explicit unit tests lock the three invariants:
+never trades, joins the FIFO tail, rejection leaves book state untouched.
+
+## Planned Order Semantics
 
 ### v0.11.0 - Replace and Order Lifecycle
 

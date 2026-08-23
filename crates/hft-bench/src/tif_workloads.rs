@@ -54,6 +54,34 @@ pub fn tif_benchmark(samples: usize, out: &mut Vec<BenchRecord>) {
     run_fok_multi(samples, &mut next_taker_id, &mut replenish_id, out);
     run_gtc_full(samples, &mut next_taker_id, &mut replenish_id, out);
     run_gtc_partial_rests(samples, &mut next_taker_id, &mut replenish_id, out);
+    run_po_cell(
+        samples,
+        "post_only_cross_shallow",
+        false,
+        &mut next_taker_id,
+        out,
+    );
+    run_po_cell(
+        samples,
+        "post_only_cross_deep",
+        true,
+        &mut next_taker_id,
+        out,
+    );
+    run_po_cell(
+        samples,
+        "post_only_noncross_shallow",
+        false,
+        &mut next_taker_id,
+        out,
+    );
+    run_po_cell(
+        samples,
+        "post_only_noncross_deep",
+        true,
+        &mut next_taker_id,
+        out,
+    );
 }
 
 /// Builds a taker or maker order with the sequence number tracking the id.
@@ -649,6 +677,126 @@ fn run_gtc_partial_rests(
             "book",
             "gtc_partial_rests",
             &[("tif", Extra::Text("gtc"))],
+        ),
+        checksum,
+        &mut latencies,
+    );
+}
+
+/// Reject checksum so crossing-reject cells carry a non-trivial value.
+const PO_REJECT_CHECKSUM: u64 = 0x0070_6f72_656a;
+
+fn po_cross_step(
+    book: &mut BenchBook,
+    reports: &mut Reports,
+    next_taker_id: &mut u64,
+    checksum: &mut u64,
+) -> u128 {
+    let id = take_id(next_taker_id);
+    let started = Instant::now();
+    let submitted = book.submit(
+        order(id, TAKER_ACCOUNT, 100, 5, Side::Buy, TimeInForce::PostOnly),
+        reports,
+    );
+    let elapsed = started.elapsed().as_nanos();
+    let rejected = submitted.expect_err("crossing post-only rejects");
+    assert!(
+        matches!(rejected, RejectReason::PostOnlyWouldTrade),
+        "post-only reject reason"
+    );
+    *checksum ^= PO_REJECT_CHECKSUM;
+    elapsed
+}
+
+fn po_noncross_step(
+    book: &mut BenchBook,
+    reports: &mut Reports,
+    next_taker_id: &mut u64,
+    checksum: &mut u64,
+) -> u128 {
+    let id = take_id(next_taker_id);
+    let started = Instant::now();
+    let summary = book
+        .submit(
+            order(id, TAKER_ACCOUNT, 99, 1, Side::Buy, TimeInForce::PostOnly),
+            reports,
+        )
+        .expect("non-crossing post only rests");
+    let elapsed = started.elapsed().as_nanos();
+    assert_eq!(summary.filled_quantity.0, 0);
+    assert_eq!(summary.resting_quantity.0, 1);
+    *checksum ^= summary.resting_quantity.0;
+    book.cancel(CancelOrder {
+        order_id: OrderId(id),
+        account_id: TAKER_ACCOUNT,
+        instrument_id: INSTRUMENT,
+        sequence: SequenceNumber(id),
+    })
+    .expect("teardown cancel");
+    reports.clear();
+    elapsed
+}
+
+fn run_po_cell(
+    samples: usize,
+    scenario: &'static str,
+    deep: bool,
+    next_taker_id: &mut u64,
+    out: &mut Vec<BenchRecord>,
+) {
+    const WARMUP: usize = 32;
+    if samples == 0 {
+        return;
+    }
+    let mut replenish_id = 9_000_000_u64;
+    let mut book = BenchBook::new(INSTRUMENT);
+    let mut reports = ReportBuffer::<16>::new();
+    let maker_count = if deep { 64 } else { 1 };
+    for level_index in 0..maker_count {
+        rest_fixture(
+            &mut book,
+            &mut reports,
+            &mut replenish_id,
+            100 + i64::from(level_index),
+            10_000_000,
+        );
+    }
+    let mut latencies = vec![0_u64; samples];
+    let mut checksum = 0_u64;
+    for _ in 0..WARMUP {
+        if deep {
+            po_cross_step(&mut book, &mut reports, next_taker_id, &mut checksum);
+        } else {
+            po_noncross_step(&mut book, &mut reports, next_taker_id, &mut checksum);
+        }
+    }
+    let before = snapshot_gate();
+    for sample in &mut latencies {
+        let elapsed = if deep {
+            po_cross_step(&mut book, &mut reports, next_taker_id, &mut checksum)
+        } else {
+            po_noncross_step(&mut book, &mut reports, next_taker_id, &mut checksum)
+        };
+        *sample = u64::try_from(elapsed).unwrap_or(u64::MAX);
+    }
+    let after = (
+        ALLOCATIONS.load(Ordering::SeqCst),
+        DEALLOCATIONS.load(Ordering::SeqCst),
+    );
+    assert_gate(before, after, scenario);
+    finish(
+        out,
+        BenchRecord::new(
+            "component",
+            "book",
+            scenario,
+            &[
+                ("tif", Extra::Text("post_only")),
+                (
+                    "levels",
+                    Extra::U64(u64::try_from(maker_count).unwrap_or(u64::MAX)),
+                ),
+            ],
         ),
         checksum,
         &mut latencies,

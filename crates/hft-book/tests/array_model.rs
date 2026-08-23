@@ -22,6 +22,7 @@ fn run_shape<const LEVELS: usize, const ORDERS: usize, const REPORTS: usize>(
             duplicate_id_probability_pct: 8,
             ioc_probability_pct: 15,
             fok_probability_pct: 10,
+            post_only_probability_pct: 10,
         },
         InstrumentId(1),
         seed,

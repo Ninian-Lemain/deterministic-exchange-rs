@@ -61,6 +61,8 @@ pub struct GenConfig {
     /// Share of New commands using IOC; FOK follows with its own share.
     pub ioc_probability_pct: u64,
     pub fok_probability_pct: u64,
+    /// Share of New commands flagged post-only.
+    pub post_only_probability_pct: u64,
 }
 
 /// One generated command with its strict session sequence number.
@@ -310,7 +312,7 @@ impl ModelBook {
             TimeInForce::Ioc => {
                 // The discard itself is applied by `submit`.
             }
-            TimeInForce::Gtc => {
+            TimeInForce::Gtc | TimeInForce::PostOnly => {
                 if remaining > 0 {
                     if let Some((_, queue)) =
                         own_levels.iter().find(|(price, _)| *price == order.price.0)
@@ -976,6 +978,7 @@ mod tests {
             duplicate_id_probability_pct: dup_pct,
             ioc_probability_pct: 15,
             fok_probability_pct: 10,
+            post_only_probability_pct: 10,
         }
     }
 
@@ -1181,6 +1184,7 @@ mod tests {
                 duplicate_id_probability_pct: 5,
                 ioc_probability_pct: 15,
                 fok_probability_pct: 10,
+                post_only_probability_pct: 10,
             },
             InstrumentId(1),
             0xfeed,

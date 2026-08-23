@@ -320,6 +320,7 @@ pub fn gateway_mixed_benchmark(commands: u64, warmup: u64, seed: u64, out: &mut 
             duplicate_id_probability_pct: 3,
             ioc_probability_pct: 15,
             fok_probability_pct: 10,
+            post_only_probability_pct: 10,
         },
         InstrumentId(1),
         seed,

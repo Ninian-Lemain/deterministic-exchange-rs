@@ -57,6 +57,7 @@ fn gen_config() -> GenConfig {
         duplicate_id_probability_pct: 5,
         ioc_probability_pct: 15,
         fok_probability_pct: 10,
+        post_only_probability_pct: 10,
     }
 }
 
@@ -274,6 +275,7 @@ fn accepted_frames_replay_through_the_replay_helper() {
         duplicate_id_probability_pct: 0,
         ioc_probability_pct: 0,
         fok_probability_pct: 0,
+        post_only_probability_pct: 0,
     };
     let mut generator = CommandGen::new(config, InstrumentId(1), 0x0a7c_0005);
     let mut oracle = ModelEngine::new(InstrumentId(1), LEVELS, ORDERS_PER_LEVEL);

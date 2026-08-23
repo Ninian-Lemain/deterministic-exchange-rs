@@ -617,6 +617,19 @@ impl<const LEVELS: usize, const ORDERS_PER_LEVEL: usize> OrderBook<LEVELS, ORDER
             Side::Buy => Side::Sell,
             Side::Sell => Side::Buy,
         };
+        if order.time_in_force == TimeInForce::PostOnly {
+            // Best-price check: the sorted index puts the best level first,
+            // so if it does not cross, nothing does.
+            if let Some(&(best_price, _)) = self.side_index(maker_side).iter().next() {
+                let crosses = match order.side {
+                    Side::Buy => best_price.0 <= order.price.0,
+                    Side::Sell => best_price.0 >= order.price.0,
+                };
+                if crosses {
+                    return Err(RejectReason::PostOnlyWouldTrade);
+                }
+            }
+        }
         let maker_levels = self.side_levels(maker_side);
         let mut plan = MatchPlan::<REPORTS>::new(maker_side, report_capacity);
         let mut remaining = order.quantity.0;
@@ -660,7 +673,7 @@ impl<const LEVELS: usize, const ORDERS_PER_LEVEL: usize> OrderBook<LEVELS, ORDER
                 discarded = remaining;
                 remaining = 0;
             }
-            TimeInForce::Gtc => {
+            TimeInForce::Gtc | TimeInForce::PostOnly => {
                 if remaining > 0 {
                     let descending = order.side == Side::Buy;
                     if let Some(level_index) =
@@ -1542,6 +1555,7 @@ mod tests {
                 duplicate_id_probability_pct: 10,
                 ioc_probability_pct: 15,
                 fok_probability_pct: 10,
+                post_only_probability_pct: 10,
             },
             InstrumentId(1),
             0x5eed,
@@ -1851,5 +1865,63 @@ mod tests {
         assert_eq!(summary.state, OrderState::Filled);
         assert_eq!(reports.len(), 1);
         assert_eq!(book.order_count(), 0);
+    }
+
+    #[test]
+    fn post_only_crossing_rejects_without_mutation() {
+        let mut book = OrderBook::<4, 4>::new(InstrumentId(1));
+        let mut reports = ReportBuffer::<4>::new();
+        book.submit(order(1, 100, 3, Side::Sell), &mut reports)
+            .expect("rest ask");
+        reports.clear();
+        let digest = book.stable_digest();
+        // Buy at the ask would trade: reject before any mutation.
+        let mut po = order(2, 100, 5, Side::Buy);
+        po.time_in_force = TimeInForce::PostOnly;
+        assert_eq!(
+            book.submit(po, &mut reports),
+            Err(RejectReason::PostOnlyWouldTrade)
+        );
+        assert_eq!(book.stable_digest(), digest);
+        assert!(reports.is_empty());
+        // Below the market it cannot trade and rests normally.
+        let mut quiet = order(3, 99, 2, Side::Buy);
+        quiet.time_in_force = TimeInForce::PostOnly;
+        let summary = book.submit(quiet, &mut reports).expect("post only rests");
+        assert_eq!(summary.filled_quantity, Quantity(0));
+        assert_eq!(summary.resting_quantity, Quantity(2));
+        assert_eq!(summary.state, OrderState::Accepted);
+    }
+
+    #[test]
+    fn post_only_accepted_order_joins_the_fifo_tail() {
+        let mut book = OrderBook::<4, 8>::new(InstrumentId(1));
+        let mut reports = ReportBuffer::<8>::new();
+        book.submit(order(1, 100, 1, Side::Sell), &mut reports)
+            .expect("first ask");
+        reports.clear();
+        let mut po = order(2, 100, 1, Side::Sell);
+        po.time_in_force = TimeInForce::PostOnly;
+        book.submit(po, &mut reports)
+            .expect("post only joins level");
+        reports.clear();
+        book.submit(order(3, 100, 2, Side::Buy), &mut reports)
+            .expect("sweep level");
+        let makers: std::vec::Vec<_> = reports
+            .iter()
+            .map(|report| report.maker_order_id.0)
+            .collect();
+        assert_eq!(makers, [1, 2], "post-only order rests behind the elder");
+    }
+
+    #[test]
+    fn post_only_rests_into_an_empty_book() {
+        let mut book = OrderBook::<4, 4>::new(InstrumentId(1));
+        let mut reports = ReportBuffer::<4>::new();
+        let mut po = order(1, 100, 3, Side::Sell);
+        po.time_in_force = TimeInForce::PostOnly;
+        let summary = book.submit(po, &mut reports).expect("rests on empty side");
+        assert_eq!(summary.state, OrderState::Accepted);
+        assert_eq!(book.order_count(), 1);
     }
 }

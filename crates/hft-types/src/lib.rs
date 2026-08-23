@@ -36,6 +36,7 @@ pub enum TimeInForce {
     Gtc = 1,
     Ioc = 2,
     Fok = 3,
+    PostOnly = 4,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -99,6 +100,7 @@ pub enum RejectReason {
     PriceLevelOrderCapacity,
     ReportCapacity,
     InsufficientLiquidity,
+    PostOnlyWouldTrade,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

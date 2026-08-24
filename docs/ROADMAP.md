@@ -190,17 +190,17 @@ cell.
 
 ### v0.12.0 - Actual SPSC Loom and Unsafe Audit
 
-- **Purpose / scope:** model the actual queue algorithm where practical; audit
-  `UnsafeCell`, initialization/drop, wrap, full/empty, and endpoint lifetimes.
-- **Invariants / tests:** accepted values appear once in FIFO order; no read
-  before publication or overwrite before reclamation; values drop once. Use
-  Miri for relevant unsafe paths.
-- **Benchmarks:** prove testability changes do not regress SPSC latency,
-  throughput, cache traffic, or allocation behavior.
-- **Exit:** actual-algorithm Loom coverage; if infeasible, require a bounded model
-  of the same state machine, updated safety proof, Miri/stress evidence, and
-  independent review. A blocker alone cannot pass.
-- **Dependencies / limits:** requires v0.8; Loom explores bounded executions.
+The queue now swaps its atomics and slot cells to Loom primitives under
+`--features loom`, so CI explores the shipped algorithm directly: a
+capacity-two FIFO handoff across all publication/consumption interleavings
+and a capacity-one backpressure/wrap scenario asserting the rejected payload
+is returned intact. The stand-in model test was removed. The unsafe audit
+covers UnsafeCell sites, initialization/drop pairing, index wrap, full/empty
+discrimination, and endpoint lifetimes in [SAFETY](SAFETY.md). Miri runs the
+whole crate in CI with reduced iteration budgets and demonstrably rejects a
+weakened Release publication as a data race. The SPSC benchmark cell is
+unchanged at 43 ns mean before/after the refactor with zero allocation
+deltas.
 
 ### v0.13.0 - Dedicated Linux Qualification
 

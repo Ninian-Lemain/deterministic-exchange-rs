@@ -430,6 +430,35 @@ cancel release. All cells report zero allocation deltas; seeded property
 sessions now include replaces with per-step model equivalence, snapshot
 invariants, and replay equality over the full byte stream.
 
+## v0.12.0 SPSC Loom Coverage and Miri Qualification
+
+The queue's atomics and slot cells now swap to Loom primitives under
+`--features loom`, so the shipped algorithm itself runs inside the model;
+the previous stand-in `ModelQueue` test was deleted. Two actual-algorithm
+Loom tests run in CI: a capacity-two FIFO handoff across every
+publication/consumption interleaving (~22 s of schedule enumeration), and a
+capacity-one backpressure/wrap scenario proving the rejected payload is
+returned bit-intact.
+
+Miri now covers the whole crate (`cargo miri test -p hft-spsc`, CI),
+including the 10,000-value cross-thread transfer reduced to 100 iterations
+under Miri and the seeded lossless schedules reduced to 64 steps. As
+evidence that ordering is enforced, weakening the tail publication to
+`Relaxed` makes Miri report `Data race detected ... MaybeUninit<u64>`
+immediately, while the same build stays logically correct under Loom
+(Loom checks protocol-level races on its own primitives, not plain-memory
+visibility).
+
+No engine code changed in this release other than extracting the shared
+`push_impl`/`pop_impl` cores used by both the endpoints and the Loom tests.
+The SPSC benchmark cell is unchanged within noise before/after the refactor:
+
+| push_pop_walk | Before | After |
+| --- | ---: | ---: |
+| mean | 43 ns | 43 ns |
+| max occupancy | 85 | 85 |
+| backpressure events | 0 | 0 |
+| allocations / deallocations | 0 / 0 | 0 / 0 |
 ## Dedicated Linux Protocol
 
 Record all of the following with each result:

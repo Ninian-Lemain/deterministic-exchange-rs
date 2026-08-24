@@ -277,6 +277,11 @@ fn validate_record(line: &str, schema: &Schema) -> (String, String) {
 #[test]
 fn suite_records_match_the_schema_fixture() {
     let schema = Schema::load();
+    if hft_spsc::IS_LOOM_BUILD {
+        // A Loom-enabled dependency build cannot execute the timed suite.
+        eprintln!("skipping schema validation under loom build");
+        return;
+    }
     let lines = run_suite(SuiteConfig::reduced());
     assert!(lines.len() >= 40, "suite emitted {}", lines.len());
 

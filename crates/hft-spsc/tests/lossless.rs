@@ -35,9 +35,11 @@ const SEEDS: [u64; 4] = [
     0x9E37_79B9_97F4_A615,
 ];
 
-const STEPS_PER_SEED: u64 = 2_048;
+/// Iteration budget shrinks under Miri to keep qualification fast.
+const STEPS_PER_SEED: u64 = if cfg!(miri) { 64 } else { 2_048 };
 
-/// One pop checked against the shadow deque. Returns whether a value came out.
+/// One pop checked against the shadow deque. Returns whether a value came
+/// out.
 fn pop_matches_shadow<const N: usize>(
     consumer: &mut Consumer<'_, u64, N>,
     shadow: &mut VecDeque<u64>,

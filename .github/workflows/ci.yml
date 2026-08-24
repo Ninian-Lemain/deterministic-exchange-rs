@@ -21,7 +21,8 @@ jobs:
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --all-features
       - run: cargo test --doc --workspace
-      - run: cargo test -p hft-spsc --features loom loom_models_release_acquire_publication
+      - run: cargo test -p hft-spsc --features loom loom_
+      - run: cargo test -p hft-bench
       - run: cargo test -p hft-wire malformed_input_smoke_never_panics
       - run: cargo run --release -p hft-bench
       - run: python scripts/source_ratio.py
@@ -38,7 +39,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri
-      - run: cargo +nightly miri test -p hft-wire -p hft-risk -p hft-book
+      - run: cargo +nightly miri test -p hft-wire -p hft-risk -p hft-book -p hft-spsc
 
   ffi-sanitizers:
     runs-on: ubuntu-latest

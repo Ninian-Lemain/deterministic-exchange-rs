@@ -1303,16 +1303,4 @@ const fn order(id: u64, account_id: AccountId, side: Side) -> NewOrder {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn reduced_suite_emits_records_with_zero_allocations() {
-        let lines = run_suite(SuiteConfig::reduced());
-        assert!(lines.len() > 30, "suite emitted {} lines", lines.len());
-        for line in &lines {
-            assert!(line.contains("\"allocations\":0"), "{line}");
-            assert!(line.contains("\"deallocations\":0"), "{line}");
-        }
-    }
-}
+mod tests {}

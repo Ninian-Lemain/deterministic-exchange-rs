@@ -18,8 +18,33 @@ exactly one endpoint of each kind. Drop holds exclusive access and drops only
 the published half-open range `[head, tail)`. `T: Send` is required for
 `Sync`.
 
+v0.12 audit, point by point:
+
+- **UnsafeCell**: slot access is confined to four sites (producer write,
+  consumer read, `Drop`, `into_inner`). Under `--features loom` the cell type
+  swaps to `loom::cell::UnsafeCell`, so Loom tracks every slot access.
+- **Initialization/drop**: a slot is written exactly once between reclamation
+  and publication; it is read exactly once by the consumer (`assume_init_read`)
+  or dropped once by `Drop`/`into_inner`, which walk only `[head, tail)`.
+  `into_inner` drains by value and then forgets the wrapper so no slot is
+  dropped twice.
+- **Wrap**: indices are `usize` counters masked with `N - 1`; fullness uses
+  wrapping subtraction of cached peer positions. Capacity one wraps every
+  operation and is covered explicitly.
+- **Full/empty**: empty means `head == tail`; full means `tail - head == N`.
+  Cached positions are refreshed with Acquire loads, so a stale cache can only
+  cause a retry, never an out-of-bounds access or lost capacity.
+- **Endpoint lifetimes**: `Producer`/`Consumer` borrow the queue for `'queue`;
+  `split(&mut)` guarantees one endpoint pair per borrow. The core steps are
+  shared-reference functions used verbatim by the endpoints and by the Loom
+  tests, so the modeled algorithm is the shipped algorithm.
+
 Tests: FIFO order and full rejection, cross-thread transfer, invalid capacity,
-and a Loom publication model (`--features loom`, run in CI).
+drop-exactly-once property coverage, seeded lossless schedules, actual-
+algorithm Loom runs under `--features loom` (CI), and Miri on the whole crate
+including the cross-thread transfer test (CI). Miri demonstrably rejects a
+weakened Release publication as a data race; Loom demonstrably explores the
+publication/consumption interleavings of the real algorithm.
 
 ### FFI (`crates/hft-ffi/src/lib.rs`)
 

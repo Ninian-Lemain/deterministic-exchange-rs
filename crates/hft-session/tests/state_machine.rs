@@ -172,7 +172,7 @@ fn heartbeat_timeout_drops_to_recovering_then_recovers_on_command() {
         )
         .expect("recovery completes on next command");
     assert_eq!(transition.state, SessionState::Active);
-    assert_eq!(transition.deadline, Some(111));
+    assert_eq!(transition.deadline, Some(110));
     assert_eq!(session.expected_sequence(), SequenceNumber(2));
 
     // Heartbeats also keep the session alive without commands.

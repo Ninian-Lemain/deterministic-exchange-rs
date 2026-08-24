@@ -459,6 +459,28 @@ The SPSC benchmark cell is unchanged within noise before/after the refactor:
 | max occupancy | 85 | 85 |
 | backpressure events | 0 | 0 |
 | allocations / deallocations | 0 / 0 | 0 / 0 |
+## v0.14.0 Session State Machine
+
+The new `hft-session` crate owns the connection lifecycle (disconnected,
+connecting, logon, active, recovering, logout, failed) with a deterministic
+virtual clock: every deadline check takes `now` from the caller. Commands
+are admitted only in Active or Recovering; gaps and duplicates fail closed
+without touching state, sequence, or timers; a heartbeat timeout drops to
+Recovering with a second window armed, and a second consecutive timeout
+fails the session.
+
+Benchmark cells time session-plus-gateway end to end against the gateway
+baseline on the reference desktop:
+
+| Scenario | Mean |
+| --- | ---: |
+| session_active_admission (session + gateway frame) | 144 ns |
+| session_active_rejection (duplicate refused pre-gateway) | 41 ns |
+
+Admission costs roughly one gateway frame plus a sequence compare; refusal
+is about a third of that because the matching core is never touched. Both
+cells report zero allocation deltas.
+
 ## Dedicated Linux Protocol
 
 Record all of the following with each result:

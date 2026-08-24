@@ -215,17 +215,30 @@ deltas.
   and measured boundary.
 - **Dependencies / limits:** requires v0.8/v0.12; results do not generalize.
 
-## Planned Reliability
-
 ### v0.14.0 - Session State Machine
 
-- **Purpose / scope:** disconnected, connecting, logon, active, recovering,
-  logout, and failed states outside matching.
-- **Invariants / tests:** commands mutate only while active; invalid transitions,
-  duplicate, and gap fail closed without advancing state.
-- **Benchmarks:** active admission and rejection versus gateway baseline.
-- **Exit:** transition table, virtual-time tests, and replay fixtures pass.
-- **Dependencies / limits:** requires v0.7; recovery policy follows.
+The `hft-session` crate owns the connection lifecycle (disconnected,
+connecting, logon, active, recovering, logout, failed) outside the matching
+core, on a deterministic virtual clock. Commands are admitted only while
+Active or Recovering; gaps, duplicates, and invalid transitions fail closed
+without advancing state, sequence, or timers. A heartbeat timeout drops to
+Recovering with a second window armed, and a second consecutive timeout
+fails the session. An exhaustive state-times-event table test pins every
+cell of the transition matrix and asserts refusals leave the observable
+session untouched, virtual-time tests cover both deadline paths, and a
+replay fixture gates recorded gateway frames through an Active session,
+disconnects mid-stream, and replays the tail without gaps after re-logon.
+Benchmark cells time active admission versus duplicate rejection against
+the gateway baseline.
+
+## Planned Reliability
+
+> Note: v0.13 (Dedicated Linux Qualification) stays open above — it requires
+> dedicated host hardware and published raw evidence that cannot be produced
+> from a shared desktop. Its dependency chain does not gate the releases
+> below.
+
+
 
 ### v0.15.0 - Session Recovery
 

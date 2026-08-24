@@ -5,6 +5,7 @@
 
 pub mod extra_workloads;
 pub mod record;
+pub mod session_workloads;
 pub mod tif_workloads;
 
 use crate::record::{BenchRecord, Extra};
@@ -116,6 +117,7 @@ pub fn run_suite(config: SuiteConfig) -> std::vec::Vec<std::string::String> {
     extra_workloads::deep_book_benchmark(config.deep_samples, 0x0a7c_dee1, &mut records);
     tif_workloads::tif_benchmark(config.tif_samples, &mut records);
     tif_workloads::replace_benchmarks(config.tif_samples, &mut records);
+    session_workloads::session_benchmark(config.tif_samples, &mut records);
     records.iter().map(BenchRecord::to_json_line).collect()
 }
 

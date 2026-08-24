@@ -1,5 +1,18 @@
 # Roadmap
 
+## Where the project is
+
+Implemented through **v0.15.0**. The next committed milestone is
+**v0.16.0 - Bounded Command Journal**; its dependencies are met.
+
+Waiting on external prerequisites:
+
+- **v0.13 Dedicated Linux Qualification** needs a dedicated Linux host
+  (pinned CPU/governor/isolation) so `perf` results can be published with a
+  named environment manifest. Nothing else in the roadmap depends on it;
+  every later milestone's dependency chain skips over it. It stays open until
+  that hardware is available.
+
 ## Scope and Rules
 
 This is a library-first deterministic execution engine. The matching core is
@@ -168,8 +181,6 @@ gained crossing and non-crossing post-only cells at shallow (one level) and
 deep (64 level) occupancies. Explicit unit tests lock the three invariants:
 never trades, joins the FIFO tail, rejection leaves book state untouched.
 
-## Planned Order Semantics
-
 ### v0.11.0 - Replace and Order Lifecycle
 
 Protocol type 3 adds owned replaces. A same-price quantity reduction patches
@@ -186,11 +197,9 @@ priority retention, and terminal immutability. Benchmarks report book-side
 reduce/increase/reprice/reject cells and a separate risk-only adjustment
 cell.
 
-## Planned Verification and Qualification
-
 ### v0.12.0 - Actual SPSC Loom and Unsafe Audit
 
-The queue now swaps its atomics and slot cells to Loom primitives under
+The queue swaps its atomics and slot cells to Loom primitives under
 `--features loom`, so CI explores the shipped algorithm directly: a
 capacity-two FIFO handoff across all publication/consumption interleavings
 and a capacity-one backpressure/wrap scenario asserting the rejected payload
@@ -201,19 +210,6 @@ whole crate in CI with reduced iteration budgets and demonstrably rejects a
 weakened Release publication as a data race. The SPSC benchmark cell is
 unchanged at 43 ns mean before/after the refactor with zero allocation
 deltas.
-
-### v0.13.0 - Dedicated Linux Qualification
-
-- **Purpose / scope:** publish a dedicated-host protocol recording CPU,
-  microcode, kernel, compiler/target, governor, turbo, SMT, isolation, affinity,
-  IRQs, NUMA, memory, mitigations, NIC/firmware, warm-up, workload, and samples.
-- **Invariants / tests:** Linux and Windows correctness produce matching digests
-  and benchmark checksums.
-- **Benchmarks:** full v0.8 suite with `perf` cycles, instructions, branches,
-  misses, cache misses, switches, migrations, and page faults.
-- **Exit:** raw results and environment manifest published; claims name hardware
-  and measured boundary.
-- **Dependencies / limits:** requires v0.8/v0.12; results do not generalize.
 
 ### v0.14.0 - Session State Machine
 
@@ -229,7 +225,8 @@ session untouched, virtual-time tests cover both deadline paths, and a
 replay fixture gates recorded gateway frames through an Active session,
 disconnects mid-stream, and replays the tail without gaps after re-logon.
 Benchmark cells time active admission versus duplicate rejection against
-the gateway baseline.
+the gateway baseline. Shipped ahead of v0.13 because its dependency chain
+does not include it.
 
 ### v0.15.0 - Session Recovery
 
@@ -244,83 +241,54 @@ sequence, confirmation is idempotent, and benchmark cells cover active
 traffic, heartbeat keep-alive, gap entry with refill bursts, and full-
 retention replay.
 
-## Planned Reliability
-
-> Note: v0.13 (Dedicated Linux Qualification) stays open above — it requires
-> dedicated host hardware and published raw evidence that cannot be produced
-> from a shared desktop. Its dependency chain does not gate the releases
-> below.
-
-
-
-### v0.15.0 - Session Recovery
-
-- **Purpose / scope:** bounded heartbeat, timeout, retained messages,
-  retransmission, reconnect, and logout completion.
-- **Invariants / tests:** deterministic timeout/reconnect; delayed/reordered/
-  duplicated input cannot duplicate commands; retention exhaustion is explicit.
-- **Benchmarks:** active traffic, heartbeat, gap entry, replay burst, and full
-  retention.
-- **Exit:** failure tests and deterministic traffic generator pass.
-- **Dependencies / limits:** requires v0.14; no durable recovery.
+## Next
 
 ### v0.16.0 - Bounded Command Journal
 
-- **Purpose / scope:** versioned accepted-command records with sequence/checksum,
-  bounded SPSC persistence handoff, flush policy, and explicit backpressure.
-- **Invariants / tests:** records occur once/in order; corruption/truncation fails
-  closed; saturation is explicit; matching thread performs no storage syscall.
-- **Benchmarks:** enqueue, queue occupancy, consumer throughput, off-core flush,
-  and saturation.
-- **Exit:** crash-point fixtures and allocation checks pass.
-- **Dependencies / limits:** requires v0.12/v0.15; snapshot recovery follows.
+Dependencies met (v0.12/v0.15). Versioned accepted-command records with
+sequence/checksum, bounded SPSC persistence handoff, flush policy, and
+explicit backpressure. Records occur once and in order; corruption,
+truncation, and saturation fail closed; the matching thread performs no
+storage syscall. Exit: crash-point fixtures and allocation checks pass.
+
+## Waiting on dedicated hardware
+
+### v0.13.0 - Dedicated Linux Qualification
+
+Requires a dedicated Linux host (pinned CPU, governor, isolation, IRQs) so
+`perf` counters and an environment manifest can be published as raw evidence.
+Cannot be produced from a shared desktop; nothing below depends on it.
+
+## Planned Reliability
 
 ### v0.17.0 - Recovery and State Integrity
 
-- **Purpose / scope:** canonical versioned state, snapshot plus journal tail,
-  compatibility fixtures, and strong off-hot-path hash. Keep the fast 64-bit
-  digest for development only.
-- **Invariants / tests:** full replay equals snapshot plus tail; canonical bytes
-  are portable; corruption/version mismatch rejected; golden formats honored.
-- **Benchmarks:** recovery throughput, snapshot size/time, strong-hash cost, and
-  journal-tail length; no cryptographic hashing in matching.
-- **Exit:** crash/restart reproduces logical state and integrity value.
-- **Dependencies / limits:** requires v0.16; replication remains later.
+Requires v0.16. Canonical versioned state, snapshot plus journal tail,
+compatibility fixtures, and strong off-hot-path hash; the fast 64-bit digest
+stays development-only. Full replay equals snapshot plus tail; canonical
+bytes are portable; corruption/version mismatch is rejected. Exit:
+crash/restart reproduces logical state and integrity value.
 
 ### v0.18.0 - Bounded Events
 
-- **Purpose / scope:** sequenced accepted/rejected/trade/cancel/replace and
-  top-of-book events with bounded handoff and explicit backpressure.
-- **Invariants / tests:** no accepted state transition is silently lost; event
-  order and replay are stable; exhaustion has a defined engine response.
-- **Benchmarks:** event creation, enqueue/dequeue, queue occupancy, saturation,
-  and gateway overhead with/without consumers.
-- **Exit:** model tests and machine-readable mixed workload pass.
-- **Dependencies / limits:** requires v0.8/v0.11/v0.12/v0.17; single instrument
-  only.
+Requires v0.8/v0.11/v0.12/v0.17. Sequenced accepted/rejected/trade/cancel/
+replace and top-of-book events with bounded handoff and explicit
+backpressure. No accepted state transition is silently lost; event order and
+replay are stable; exhaustion has a defined engine response.
 
 ### v0.19.0 - Multi-Instrument Routing
 
-- **Purpose / scope:** deterministic instrument-to-shard mapping, independent
-  single-writer books, and bounded command/event queues between router/shards.
-- **Invariants / tests:** routing is stable; unknown instruments reject; shards
-  cannot mutate each other; accepted queue elements are not lost/duplicated.
-- **Benchmarks:** route lookup, instrument/shard counts, cross-core handoff,
-  queue occupancy, backpressure, and mixed load imbalance.
-- **Exit:** routing properties, actual SPSC verification, and mixed workload pass.
-- **Dependencies / limits:** requires v0.12/v0.18; one book is never distributed.
+Requires v0.12/v0.18. Deterministic instrument-to-shard mapping, independent
+single-writer books, and bounded command/event queues between router and
+shards. Routing is stable; unknown instruments reject; shards cannot mutate
+each other.
 
 ### v0.20.0 - Fault Injection and Soak
 
-- **Purpose / scope:** hours of deterministic cancel/replace/fill churn, gaps,
-  reconnect, queue pressure, journal stalls, snapshots, recovery, malformed
-  input, exhaustion, routing imbalance, and shutdown races.
-- **Invariants / tests:** retain seeds; final reference state matches; accepted
-  elements are not lost/duplicated; every exhaustion path is explicit.
-- **Benchmarks:** RSS, allocations, descriptors, queue high-water marks,
-  journal/event lag, integrity, throughput, and latency drift.
-- **Exit:** no unexplained growth or divergence for the declared run.
-- **Dependencies / limits:** requires v0.11/v0.14-v0.19; not certification.
+Requires v0.11/v0.14-v0.19. Hours of deterministic churn, gaps, reconnect,
+queue pressure, journal stalls, snapshots, recovery, malformed input,
+exhaustion, routing imbalance, and shutdown races with retained seeds. No
+unexplained growth or divergence for the declared run.
 
 ## Pre-v1 Stabilization
 
@@ -341,15 +309,16 @@ retention replay.
 - Zero measured post-initialization allocation on declared hot paths.
 - Explicit overload behavior for every capacity and queue.
 - Dedicated-Linux raw evidence with no network-latency overclaim.
-- Miri, v0.12 actual-algorithm Loom or its required compensating evidence,
-  sanitizers, property/fuzz, crash, and soak qualification.
+- Miri, actual-algorithm Loom coverage, sanitizers, property/fuzz, crash, and
+  soak qualification.
 - Install, validate, drain, shutdown, backup/restore, upgrade/rollback, health,
   and incident runbooks for any reference service.
 - Explicit unsupported venue, regulatory, hardware, and deployment requirements.
 
 ## Experimental
 
-- Tuned Linux UDP batching only after v0.13; it stays outside the engine API.
+- Tuned Linux UDP batching only after the dedicated Linux qualification; it
+  stays outside the engine API.
 - Real vendor/NIC SDK shims may use optional C++ under the audited C ABI policy.
 
 ## Post-v1 Research

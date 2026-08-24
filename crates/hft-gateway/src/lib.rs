@@ -145,7 +145,7 @@ impl<
         self.risk
             .can_cancel(replace.order_id, replace.account_id)
             .map_err(GatewayError::Risk)?;
-        let released = self
+        let (_, prior_remaining) = self
             .risk
             .adjust_reservation(
                 replace.order_id,
@@ -154,17 +154,14 @@ impl<
                 replace.quantity,
             )
             .map_err(GatewayError::Risk)?;
-        let (_, prior_remaining) = released;
         match self.book.replace(replace) {
             Ok(replaced) => Ok(GatewayOutcome::Replaced(replaced)),
             Err(error) => {
+                // Unconditional rollback at the prior quantity: the prior
+                // state provably passed limits, so the rollback must not
+                // fail on a limit check at a different price.
                 self.risk
-                    .adjust_reservation(
-                        replace.order_id,
-                        replace.account_id,
-                        replace.price,
-                        prior_remaining,
-                    )
+                    .restore_reservation(replace.order_id, replace.account_id, prior_remaining)
                     .map_err(GatewayError::RiskState)?;
                 Err(GatewayError::Book(error))
             }

@@ -420,9 +420,6 @@ impl ModelBook {
                     break;
                 };
                 let traded = remaining.min(front.quantity);
-                if front.id == 44 {
-                    eprintln!("FILL44 traded={traded} left={}", front.quantity - traded);
-                }
                 fills.push(ModelFill {
                     maker_order_id: OrderId(front.id),
                     price: PriceTicks(*price),
@@ -540,12 +537,6 @@ impl ModelBook {
             return Err(RejectReason::NotOrderOwner);
         }
         let priority_kept = replace.price.0 == level_price && replace.quantity.0 < old_quantity;
-        if replace.order_id.0 == 44 {
-            eprintln!(
-                "MB44 lvl={level_price} qpos={queue_position} old={old_quantity} new={} kept={priority_kept}",
-                replace.quantity.0
-            );
-        }
         if !priority_kept && replace.price.0 != level_price {
             let opposing = if side == Side::Buy {
                 &self.asks
@@ -919,6 +910,9 @@ impl ModelEngine {
             cancel.sequence.0
         );
         self.next_sequence = self.next_sequence.wrapping_add(1);
+        if cancel.instrument_id != self.instrument {
+            return Err(ModelRejection::Book(RejectReason::InvalidInstrument));
+        }
         let Some(reservation) = self.reservations.get(&cancel.order_id.0) else {
             return Err(ModelRejection::Risk(RejectReason::UnknownOrder));
         };
@@ -1153,12 +1147,6 @@ impl ModelEngine {
 
     /// Restores a reservation total after a rolled-back book mutation.
     fn restore_reservation(&mut self, order_id: u64, prior_remaining: u64) {
-        if order_id == 44 {
-            eprintln!(
-                "RESTORE44 prior={prior_remaining} current={:?}",
-                self.reservations.get(&order_id).map(|r| r.remaining)
-            );
-        }
         // The rollback mirrors the gateway re-adjusting with the prior total.
         let current = self
             .reservations
@@ -1225,9 +1213,6 @@ impl ModelEngine {
             order_id.0
         );
         reservation.remaining -= traded;
-        if order_id.0 == 44 {
-            eprintln!("REC44 -{} res={}", traded, reservation.remaining);
-        }
         let (side, account_id, emptied) = (
             reservation.side,
             reservation.account_id,

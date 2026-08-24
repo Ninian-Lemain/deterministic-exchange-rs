@@ -50,11 +50,12 @@ dependencies = [
 
 [[package]]
 name = "hft-bench"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "hft-book",
  "hft-gateway",
  "hft-io",
+ "hft-journal",
  "hft-model",
  "hft-risk",
  "hft-session",
@@ -65,7 +66,7 @@ dependencies = [
 
 [[package]]
 name = "hft-book"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "hft-model",
  "hft-types",
@@ -73,7 +74,7 @@ dependencies = [
 
 [[package]]
 name = "hft-cli"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "hft-book",
  "hft-gateway",
@@ -85,14 +86,14 @@ dependencies = [
 
 [[package]]
 name = "hft-ffi"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "cc",
 ]
 
 [[package]]
 name = "hft-gateway"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "hft-book",
  "hft-io",
@@ -105,18 +106,27 @@ dependencies = [
 
 [[package]]
 name = "hft-io"
-version = "0.15.0"
+version = "0.16.0"
+
+[[package]]
+name = "hft-journal"
+version = "0.16.0"
+dependencies = [
+ "hft-model",
+ "hft-spsc",
+ "hft-types",
+]
 
 [[package]]
 name = "hft-model"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "hft-types",
 ]
 
 [[package]]
 name = "hft-replay"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "hft-book",
  "hft-gateway",
@@ -128,14 +138,14 @@ dependencies = [
 
 [[package]]
 name = "hft-risk"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "hft-types",
 ]
 
 [[package]]
 name = "hft-session"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "hft-gateway",
  "hft-io",
@@ -146,18 +156,18 @@ dependencies = [
 
 [[package]]
 name = "hft-spsc"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "loom",
 ]
 
 [[package]]
 name = "hft-types"
-version = "0.15.0"
+version = "0.16.0"
 
 [[package]]
 name = "hft-wire"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "hft-io",
  "hft-types",

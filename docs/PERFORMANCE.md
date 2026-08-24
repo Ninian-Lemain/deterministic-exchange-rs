@@ -492,6 +492,20 @@ the retained frames on the same reference desktop. All cells report zero
 allocation deltas, and the deterministic timeout test proves a delayed or
 duplicated input cannot re-execute a confirmed command.
 
+## v0.16.0 Bounded Command Journal
+
+The `hft-journal` crate adds versioned accepted-command records with FNV-1a
+checksums, handed through the audited SPSC ring. Two cells on the reference
+desktop:
+
+| Scenario | Mean | Note |
+| --- | ---: | --- |
+| journal_enqueue (matching side) | 147 ns | checksum + ring push |
+| journal_drain (persistence side, batch of 8) | 2227 ns/batch = 278 ns/record | verify + commit |
+
+Both cells report zero allocation deltas inside their measured regions.
+Crash-point fixtures prove exactly-once semantics across restart seams;
+corruption and truncation fail closed without advancing the committed log.
 ## Dedicated Linux Protocol
 
 Record all of the following with each result:

@@ -1,7 +1,7 @@
 {
   "schema": "hft-bench-results/1",
   "boundaries": ["component", "gateway", "network"],
-  "components": ["parser", "spsc", "queue", "book", "risk", "gateway", "session"],
+  "components": ["parser", "spsc", "queue", "book", "risk", "gateway", "session", "journal"],
   "required_strings": ["boundary", "component", "scenario"],
   "required_numbers": [
     "samples",

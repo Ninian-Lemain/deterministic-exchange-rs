@@ -2,8 +2,9 @@
 
 ## Where the project is
 
-Implemented through **v0.15.0**. The next committed milestone is
-**v0.16.0 - Bounded Command Journal**; its dependencies are met.
+Implemented through **v0.16.0**. The next committed milestone is
+**v0.17.0 - Recovery and State Integrity**; it requires v0.16 which is now
+shipped.
 
 Waiting on external prerequisites:
 

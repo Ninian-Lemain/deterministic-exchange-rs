@@ -4,6 +4,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod extra_workloads;
+pub mod journal_workloads;
 pub mod record;
 pub mod session_workloads;
 pub mod tif_workloads;
@@ -119,6 +120,8 @@ pub fn run_suite(config: SuiteConfig) -> std::vec::Vec<std::string::String> {
     tif_workloads::replace_benchmarks(config.tif_samples, &mut records);
     session_workloads::session_benchmark(config.tif_samples, &mut records);
     session_workloads::recovery_benchmark(config.tif_samples, &mut records);
+    journal_workloads::journal_benchmark(config.tif_samples, &mut records);
+    journal_workloads::journal_drain_benchmark(config.tif_samples, &mut records);
     records.iter().map(BenchRecord::to_json_line).collect()
 }
 

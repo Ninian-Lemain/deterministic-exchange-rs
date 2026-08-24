@@ -1,0 +1,17 @@
+[package]
+name = "hft-journal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+hft-spsc = { path = "../hft-spsc" }
+hft-types = { path = "../hft-types" }
+
+[dev-dependencies]
+hft-model = { path = "../hft-model" }
+
+[lints]
+workspace = true

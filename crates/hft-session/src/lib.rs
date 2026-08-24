@@ -7,6 +7,8 @@
 //! sequence, or timers.
 #![forbid(unsafe_code)]
 
+pub mod retransmit;
+
 use core::fmt;
 use hft_types::SequenceNumber;
 

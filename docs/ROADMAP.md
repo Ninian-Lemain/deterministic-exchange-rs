@@ -231,6 +231,19 @@ disconnects mid-stream, and replays the tail without gaps after re-logon.
 Benchmark cells time active admission versus duplicate rejection against
 the gateway baseline.
 
+### v0.15.0 - Session Recovery
+
+A bounded retransmission buffer retains accepted command frames in order
+alongside their sequences; confirmation drops the confirmed prefix, and
+recovery replays exactly the retained suffix. Retention exhaustion is an
+explicit error rather than silent history loss, and delayed, reordered, or
+duplicated inputs are refused by sequence gating before they can duplicate a
+command. Deterministic timeout tests drive the state machine into
+Recovering and back: the retained window replays from the first unconfirmed
+sequence, confirmation is idempotent, and benchmark cells cover active
+traffic, heartbeat keep-alive, gap entry with refill bursts, and full-
+retention replay.
+
 ## Planned Reliability
 
 > Note: v0.13 (Dedicated Linux Qualification) stays open above — it requires

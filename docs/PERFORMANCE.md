@@ -481,6 +481,17 @@ Admission costs roughly one gateway frame plus a sequence compare; refusal
 is about a third of that because the matching core is never touched. Both
 cells report zero allocation deltas.
 
+## v0.15.0 Session Recovery
+
+A bounded retransmission buffer (`hft_session::retransmit`) retains accepted
+frames in order; confirmation drops the confirmed prefix, and recovery
+replays exactly the retained suffix. Exhaustion is an explicit error. The
+suite gained a `recovery_window` cell (2,000 samples): each sample confirms
+roughly half the window untimed, then times a refill-plus-replay burst over
+the retained frames on the same reference desktop. All cells report zero
+allocation deltas, and the deterministic timeout test proves a delayed or
+duplicated input cannot re-execute a confirmed command.
+
 ## Dedicated Linux Protocol
 
 Record all of the following with each result:

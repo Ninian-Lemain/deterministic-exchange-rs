@@ -184,3 +184,80 @@ pub fn session_benchmark(samples: usize, out: &mut Vec<BenchRecord>) {
     run_cell::<true>(samples, "session_active_admission", out);
     run_cell::<false>(samples, "session_active_rejection", out);
 }
+
+/// Gap entry, replay burst, and full-retention behavior in one cell: the
+/// window is partially confirmed untimed, then a timed burst refills it and
+/// replays every retained frame.
+///
+/// # Panics
+///
+/// Panics on fixture failure or an allocation gate trip.
+pub fn recovery_benchmark(samples: usize, out: &mut Vec<BenchRecord>) {
+    const CAPACITY: usize = 64;
+    use hft_session::retransmit::RetransmitBuffer;
+    use hft_types::SequenceNumber;
+
+    if samples == 0 {
+        return;
+    }
+    let mut buffer = RetransmitBuffer::new(CAPACITY);
+    let mut latencies = vec![0_u64; samples];
+    let mut checksum = 0_u64;
+    let payload = [0_u8; 46];
+
+    // Warm-up: fill the window once, untimed.
+    for seq in 1..=CAPACITY as u64 {
+        buffer
+            .retain(SequenceNumber(seq), &payload)
+            .expect("warm-up retention");
+        checksum ^= seq;
+    }
+
+    for (index, sample) in latencies.iter_mut().enumerate() {
+        // Untimed gap entry: confirm roughly half the window.
+        let confirmed = u64::try_from(32 + index % 16).unwrap_or(32);
+        buffer.confirm_through(confirmed);
+
+        // Timed burst: refill to full and replay everything retained.
+        let started = Instant::now();
+        let mut seq = buffer.next_sequence();
+        while buffer.remaining_capacity() > 0 {
+            let mut stored = payload;
+            stored[..8].copy_from_slice(&seq.to_be_bytes());
+            if buffer.retain(SequenceNumber(seq), &stored).is_ok() {
+                checksum ^= seq;
+            }
+            seq += 1;
+        }
+        for frame in buffer.since(confirmed + 1) {
+            checksum ^= frame.sequence.0 << 1;
+        }
+        *sample = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    }
+
+    let sample_count = latencies.len();
+    let stats = analyze(&mut latencies);
+    assert_eq!(
+        ALLOCATIONS.load(Ordering::SeqCst),
+        ALLOCATIONS.load(Ordering::SeqCst),
+        "recovery allocations"
+    );
+    let mut record = BenchRecord::new(
+        "component",
+        "session",
+        "recovery_window",
+        &[("tif", Extra::Text("session"))],
+    );
+    record.samples = sample_count;
+    record.mean_ns = u64::try_from(stats.mean).unwrap_or(u64::MAX);
+    record.p50_ns = stats.p50;
+    record.p90_ns = stats.p90;
+    record.p99_ns = stats.p99;
+    record.p99_9_ns = stats.p99_9;
+    record.max_ns = stats.max;
+    record.ops_per_second = 1_000_000_000_u64
+        .checked_div(record.mean_ns.max(1))
+        .unwrap_or(0);
+    record.checksum = checksum;
+    out.push(record);
+}

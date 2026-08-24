@@ -223,6 +223,16 @@ mod tests {
 
     #[test]
     fn preserves_fifo_and_rejects_full() {
+        // Under a Loom build the endpoints use Loom primitives, which are
+        // only legal inside `loom::model`; run there too so the same
+        // assertions cover the swapped build.
+        #[cfg(feature = "loom")]
+        loom::model(run_preserves_fifo);
+        #[cfg(not(feature = "loom"))]
+        run_preserves_fifo();
+    }
+
+    fn run_preserves_fifo() {
         let mut queue = SpscQueue::<u32, 2>::try_new().expect("valid capacity");
         let (mut producer, mut consumer) = queue.split();
         assert_eq!(producer.try_push(1), Ok(()));

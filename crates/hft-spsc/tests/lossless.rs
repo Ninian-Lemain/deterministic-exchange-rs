@@ -1,3 +1,4 @@
+#![cfg(not(feature = "loom"))]
 //! Losslessness properties: accepted elements appear exactly once in FIFO
 //! order, and rejected pushes hand the value back intact.
 

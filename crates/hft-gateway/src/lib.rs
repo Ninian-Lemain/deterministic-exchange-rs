@@ -72,11 +72,7 @@ impl<
     ) -> Result<GatewayOutcome, GatewayError> {
         reports.clear();
         let message = parse_message(frame).map_err(GatewayError::Parse)?;
-        let received_sequence = match message {
-            BorrowedMessage::NewOrder(message) => message.to_owned().sequence,
-            BorrowedMessage::CancelOrder(message) => message.to_owned().sequence,
-            BorrowedMessage::ReplaceOrder(message) => message.to_owned().sequence,
-        };
+        let received_sequence = message.sequence();
         if received_sequence != self.expected_sequence {
             return Err(GatewayError::Sequence {
                 expected: self.expected_sequence,

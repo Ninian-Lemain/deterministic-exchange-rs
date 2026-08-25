@@ -115,6 +115,29 @@ impl BorrowedReplaceOrder<'_> {
     }
 }
 
+impl BorrowedMessage<'_> {
+    /// Reads the session sequence from any message kind without owning it.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if `parse_message` accepted the frame (offsets are
+    /// proven in-bounds by the length check).
+    #[must_use]
+    pub fn sequence(&self) -> SequenceNumber {
+        match self {
+            BorrowedMessage::NewOrder(msg) => {
+                SequenceNumber(u64::from_be_bytes(msg.bytes[36..44].try_into().unwrap()))
+            }
+            BorrowedMessage::CancelOrder(msg) => {
+                SequenceNumber(u64::from_be_bytes(msg.bytes[20..28].try_into().unwrap()))
+            }
+            BorrowedMessage::ReplaceOrder(msg) => {
+                SequenceNumber(u64::from_be_bytes(msg.bytes[20..28].try_into().unwrap()))
+            }
+        }
+    }
+}
+
 /// # Errors
 ///
 /// Returns a specific [`ParseError`] for an invalid header, length, type, or

@@ -117,10 +117,7 @@ impl<const LEVELS: usize, const ORDERS: usize> OrderIndex<LEVELS, ORDERS> {
             return None;
         }
         let start = Self::probe_start(order_id);
-        let mut guard = 0_u32;
         for offset in 0..Self::CAPACITY {
-            guard += 1;
-            assert!(guard < 50_000_000, "find_slot runaway");
             let flat_index = start.wrapping_add(offset) % Self::CAPACITY;
             match self.slot(flat_index) {
                 IndexSlot::Empty => return None,
@@ -189,10 +186,7 @@ impl<const LEVELS: usize, const ORDERS: usize> OrderIndex<LEVELS, ORDERS> {
         let mut hole = flat_index;
         let mut candidate_index = hole.wrapping_add(1) % Self::CAPACITY;
         // Close the probe hole without retaining deletion tombstones.
-        let mut guard = 0_u32;
         loop {
-            guard += 1;
-            assert!(guard < 50_000_000, "order index remove_at runaway");
             let candidate = *self.slot(candidate_index);
             let IndexSlot::Occupied {
                 order_id: candidate_id,

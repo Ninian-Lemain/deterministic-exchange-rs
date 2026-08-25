@@ -36,26 +36,33 @@ pub enum BorrowedMessage<'frame> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BorrowedNewOrder<'frame> {
-    bytes: &'frame [u8],
+    bytes: &'frame [u8; NEW_ORDER_LEN],
 }
 
 impl BorrowedNewOrder<'_> {
+    /// Decodes the wire frame into an owned order.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if `parse_message` accepted the frame (offsets are
+    /// proven in-bounds by the length check).
     #[must_use]
     pub fn to_owned(self) -> NewOrder {
+        let b = self.bytes;
         NewOrder {
-            time_in_force: match self.bytes[45] {
+            time_in_force: match b[45] {
                 value if value == TimeInForce::Gtc as u8 => TimeInForce::Gtc,
                 value if value == TimeInForce::Ioc as u8 => TimeInForce::Ioc,
                 value if value == TimeInForce::Fok as u8 => TimeInForce::Fok,
                 _ => TimeInForce::PostOnly,
             },
-            order_id: OrderId(read_u64(self.bytes, 4)),
-            account_id: AccountId(read_u32(self.bytes, 12)),
-            instrument_id: InstrumentId(read_u32(self.bytes, 16)),
-            price: PriceTicks(read_i64(self.bytes, 20)),
-            quantity: Quantity(read_u64(self.bytes, 28)),
-            sequence: SequenceNumber(read_u64(self.bytes, 36)),
-            side: if self.bytes[44] == Side::Buy as u8 {
+            order_id: OrderId(u64::from_be_bytes(b[4..12].try_into().unwrap())),
+            account_id: AccountId(u32::from_be_bytes(b[12..16].try_into().unwrap())),
+            instrument_id: InstrumentId(u32::from_be_bytes(b[16..20].try_into().unwrap())),
+            price: PriceTicks(i64::from_be_bytes(b[20..28].try_into().unwrap())),
+            quantity: Quantity(u64::from_be_bytes(b[28..36].try_into().unwrap())),
+            sequence: SequenceNumber(u64::from_be_bytes(b[36..44].try_into().unwrap())),
+            side: if b[44] == Side::Buy as u8 {
                 Side::Buy
             } else {
                 Side::Sell
@@ -142,6 +149,10 @@ impl BorrowedMessage<'_> {
 ///
 /// Returns a specific [`ParseError`] for an invalid header, length, type, or
 /// side before typed interpretation is allowed.
+///
+/// # Panics
+///
+/// Panics only if `try_into` fails on a slice whose length was just proven.
 pub fn parse_message<'frame>(
     frame: &'frame RxFrame<'_>,
 ) -> Result<BorrowedMessage<'frame>, ParseError> {
@@ -174,7 +185,8 @@ pub fn parse_message<'frame>(
             ) {
                 return Err(ParseError::InvalidTimeInForce);
             }
-            Ok(BorrowedMessage::NewOrder(BorrowedNewOrder { bytes }))
+            let typed: &[u8; NEW_ORDER_LEN] = bytes.try_into().expect("length proven equal above");
+            Ok(BorrowedMessage::NewOrder(BorrowedNewOrder { bytes: typed }))
         }
         CANCEL_ORDER_TYPE => {
             if declared != CANCEL_ORDER_LEN {

@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
-use hft_book::{CancelledOrder, OrderBook};
+use hft_book::{BookState, BookStateError, CancelledOrder, OrderBook};
 use hft_io::RxFrame;
-use hft_risk::RiskEngine;
+use hft_risk::{RiskEngine, RiskEngineState, RiskStateError};
 use hft_types::{
     InstrumentId, MatchSummary, OrderId, Quantity, RejectReason, ReplaceOrder, ReportBuffer,
     SequenceNumber,
@@ -26,6 +26,29 @@ pub enum GatewayOutcome {
     NewOrder(MatchSummary),
     Cancelled(CancelledOrder),
     Replaced(hft_book::ReplacedOrder),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GatewayState<const LEVELS: usize, const ORDERS_PER_LEVEL: usize> {
+    pub instrument: InstrumentId,
+    pub book: BookState<LEVELS, ORDERS_PER_LEVEL>,
+    pub risk: RiskEngineState,
+    pub expected_sequence: SequenceNumber,
+    pub maximum_received_order_id: Option<OrderId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GatewayStateError {
+    Book(BookStateError),
+    Risk(RiskStateError),
+    ExpectedSequence,
+    OrderSequence,
+    OrderWatermark,
+    RiskWatermark,
+    MissingReservation,
+    ReservationMismatch,
+    OrderLimit,
+    OrphanReservation,
 }
 
 #[derive(Debug)]
@@ -56,6 +79,108 @@ impl<
             expected_sequence: SequenceNumber(1),
             maximum_received_order_id: None,
         }
+    }
+
+    #[must_use]
+    pub fn export_state(&self) -> GatewayState<LEVELS, ORDERS_PER_LEVEL> {
+        let book = self.book.export_state();
+        GatewayState {
+            instrument: book.instrument,
+            book,
+            risk: self.risk.export_state(),
+            expected_sequence: self.expected_sequence,
+            maximum_received_order_id: self.maximum_received_order_id,
+        }
+    }
+
+    /// Rebuilds a gateway from validated logical state.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first leaf-state or cross-component invariant failure.
+    pub fn from_state(
+        state: &GatewayState<LEVELS, ORDERS_PER_LEVEL>,
+    ) -> Result<Self, GatewayStateError> {
+        let book = OrderBook::from_state(state.instrument, &state.book)
+            .map_err(GatewayStateError::Book)?;
+        let risk = RiskEngine::from_state(&state.risk).map_err(GatewayStateError::Risk)?;
+        Self::validate_cross_component_state(state)?;
+        Ok(Self {
+            risk,
+            book,
+            expected_sequence: state.expected_sequence,
+            maximum_received_order_id: state.maximum_received_order_id,
+        })
+    }
+
+    fn validate_cross_component_state(
+        state: &GatewayState<LEVELS, ORDERS_PER_LEVEL>,
+    ) -> Result<(), GatewayStateError> {
+        if state.expected_sequence.0 == 0 {
+            return Err(GatewayStateError::ExpectedSequence);
+        }
+        if state.risk.maximum_order_id > state.maximum_received_order_id {
+            return Err(GatewayStateError::RiskWatermark);
+        }
+
+        let mut book_orders = 0_usize;
+        for (levels, level_count) in [
+            (&state.book.bids, state.book.bid_level_count),
+            (&state.book.asks, state.book.ask_level_count),
+        ] {
+            for level in levels.iter().take(level_count) {
+                for order in level.orders.iter().take(level.order_count) {
+                    book_orders += 1;
+                    if order.sequence.0 >= state.expected_sequence.0 {
+                        return Err(GatewayStateError::OrderSequence);
+                    }
+                    if state
+                        .maximum_received_order_id
+                        .is_none_or(|maximum| maximum < order.order_id)
+                    {
+                        return Err(GatewayStateError::OrderWatermark);
+                    }
+                    let Some(reservation) = state
+                        .risk
+                        .reservations
+                        .iter()
+                        .find(|reservation| reservation.order_id == order.order_id)
+                    else {
+                        return Err(GatewayStateError::MissingReservation);
+                    };
+                    if reservation.account_id != order.account_id
+                        || reservation.side != order.side
+                        || reservation.quantity != order.quantity
+                    {
+                        return Err(GatewayStateError::ReservationMismatch);
+                    }
+                    let Some(account) = state
+                        .risk
+                        .accounts
+                        .iter()
+                        .find(|account| account.id == order.account_id)
+                    else {
+                        return Err(GatewayStateError::ReservationMismatch);
+                    };
+                    let price =
+                        u128::try_from(order.price.0).map_err(|_| GatewayStateError::OrderLimit)?;
+                    let notional = price
+                        .checked_mul(u128::from(order.quantity.0))
+                        .ok_or(GatewayStateError::OrderLimit)?;
+                    if order.quantity > account.limits.max_quantity
+                        || order.price < account.limits.minimum_price
+                        || order.price > account.limits.maximum_price
+                        || notional > account.limits.max_notional
+                    {
+                        return Err(GatewayStateError::OrderLimit);
+                    }
+                }
+            }
+        }
+        if book_orders != state.risk.reservations.len() {
+            return Err(GatewayStateError::OrphanReservation);
+        }
+        Ok(())
     }
 
     /// Parses from the borrowed RX frame, then normalizes the validated order
@@ -278,6 +403,60 @@ mod tests {
             })
         );
         assert_eq!(gateway.expected_sequence(), SequenceNumber(1));
+    }
+
+    #[test]
+    fn state_round_trip_preserves_gateway_digest() {
+        let mut gateway = gateway();
+        let mut reports = ReportBuffer::<4>::new();
+        gateway
+            .process_frame(
+                &RxFrame::from_bytes(&encode_new_order(order(1, 1, Side::Buy))),
+                &mut reports,
+            )
+            .expect("resting order");
+
+        let state = gateway.export_state();
+        let restored = Gateway::<2, 8, 4, 4>::from_state(&state).expect("valid state");
+        assert_eq!(restored.export_state(), state);
+        assert_eq!(restored.stable_digest(), gateway.stable_digest());
+    }
+
+    #[test]
+    fn state_restore_rejects_missing_risk_reservation() {
+        let mut gateway = gateway();
+        let mut reports = ReportBuffer::<4>::new();
+        gateway
+            .process_frame(
+                &RxFrame::from_bytes(&encode_new_order(order(1, 1, Side::Buy))),
+                &mut reports,
+            )
+            .expect("resting order");
+
+        let mut state = gateway.export_state();
+        state.risk.reservations.clear();
+        assert!(matches!(
+            Gateway::<2, 8, 4, 4>::from_state(&state),
+            Err(GatewayStateError::Risk(_) | GatewayStateError::MissingReservation)
+        ));
+    }
+
+    #[test]
+    fn state_restore_rejects_order_outside_account_limits() {
+        let mut gateway = gateway();
+        let mut reports = ReportBuffer::<4>::new();
+        gateway
+            .process_frame(
+                &RxFrame::from_bytes(&encode_new_order(order(1, 1, Side::Buy))),
+                &mut reports,
+            )
+            .expect("resting order");
+        let mut state = gateway.export_state();
+        state.risk.accounts[0].limits.max_quantity = Quantity(4);
+        assert!(matches!(
+            Gateway::<2, 8, 4, 4>::from_state(&state),
+            Err(GatewayStateError::OrderLimit)
+        ));
     }
 
     #[test]

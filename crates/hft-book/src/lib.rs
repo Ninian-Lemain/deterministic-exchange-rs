@@ -337,6 +337,91 @@ pub struct ReplacedOrder {
     pub priority_lost: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BookOrderState {
+    pub order_id: OrderId,
+    pub account_id: AccountId,
+    pub side: Side,
+    pub price: PriceTicks,
+    pub quantity: Quantity,
+    pub sequence: SequenceNumber,
+}
+
+const EMPTY_BOOK_ORDER_STATE: BookOrderState = BookOrderState {
+    order_id: OrderId(0),
+    account_id: AccountId(0),
+    side: Side::Buy,
+    price: PriceTicks(0),
+    quantity: Quantity(0),
+    sequence: SequenceNumber(0),
+};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BookLevelState<const ORDERS: usize> {
+    pub side: Side,
+    pub price: PriceTicks,
+    pub order_count: usize,
+    pub orders: [BookOrderState; ORDERS],
+}
+
+impl<const ORDERS: usize> BookLevelState<ORDERS> {
+    #[must_use]
+    pub const fn empty(side: Side, price: PriceTicks) -> Self {
+        Self {
+            side,
+            price,
+            order_count: 0,
+            orders: [EMPTY_BOOK_ORDER_STATE; ORDERS],
+        }
+    }
+}
+
+const fn empty_book_level_state<const ORDERS: usize>() -> BookLevelState<ORDERS> {
+    BookLevelState {
+        side: Side::Buy,
+        price: PriceTicks(0),
+        order_count: 0,
+        orders: [EMPTY_BOOK_ORDER_STATE; ORDERS],
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BookState<const LEVELS: usize, const ORDERS: usize> {
+    pub instrument: InstrumentId,
+    pub bid_level_count: usize,
+    pub bids: [BookLevelState<ORDERS>; LEVELS],
+    pub ask_level_count: usize,
+    pub asks: [BookLevelState<ORDERS>; LEVELS],
+}
+
+impl<const LEVELS: usize, const ORDERS: usize> BookState<LEVELS, ORDERS> {
+    #[must_use]
+    pub const fn empty(instrument: InstrumentId) -> Self {
+        Self {
+            instrument,
+            bid_level_count: 0,
+            bids: [empty_book_level_state(); LEVELS],
+            ask_level_count: 0,
+            asks: [empty_book_level_state(); LEVELS],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BookStateError {
+    Instrument,
+    LevelCapacity,
+    OrderCapacity,
+    Side,
+    Price,
+    Quantity,
+    Sequence,
+    LevelOrder,
+    DuplicateOrderId,
+    Crossed,
+    NonCanonical,
+}
+
 /// Sorted index of occupied level slots plus the pool of free level slots for
 /// one side. Bids sort by price descending (best bid first); asks sort
 /// ascending (best ask first). Price lookup is O(log n) by binary search,
@@ -535,6 +620,235 @@ impl<const LEVELS: usize, const ORDERS_PER_LEVEL: usize> OrderBook<LEVELS, ORDER
             bid_levels: LevelIndex::new(),
             ask_levels: LevelIndex::new(),
         }
+    }
+
+    #[must_use]
+    pub fn export_state(&self) -> BookState<LEVELS, ORDERS_PER_LEVEL> {
+        let mut state = BookState::empty(self.instrument);
+        self.export_side(Side::Buy, &mut state.bids, &mut state.bid_level_count);
+        self.export_side(Side::Sell, &mut state.asks, &mut state.ask_level_count);
+        state
+    }
+
+    fn export_side(
+        &self,
+        side: Side,
+        output: &mut [BookLevelState<ORDERS_PER_LEVEL>; LEVELS],
+        output_len: &mut usize,
+    ) {
+        for &(price, level_index) in self.side_index(side).iter() {
+            let Some(level) = self.side_levels(side)[level_index].as_ref() else {
+                continue;
+            };
+            let destination = &mut output[*output_len];
+            destination.side = side;
+            destination.price = price;
+            level.for_each_live(|order| {
+                destination.orders[destination.order_count] = BookOrderState {
+                    order_id: order.id,
+                    account_id: order.account_id,
+                    side,
+                    price: order.price,
+                    quantity: order.quantity,
+                    sequence: order.sequence,
+                };
+                destination.order_count += 1;
+            });
+            *output_len += 1;
+        }
+    }
+
+    /// Builds a book from canonical logical state.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first format, capacity, ordering, identity, or book
+    /// invariant failure. The returned book is either complete or absent.
+    pub fn from_state(
+        instrument: InstrumentId,
+        state: &BookState<LEVELS, ORDERS_PER_LEVEL>,
+    ) -> Result<Self, BookStateError> {
+        if state.instrument != instrument {
+            return Err(BookStateError::Instrument);
+        }
+        Self::validate_state(state)?;
+        let mut book = Self::new(instrument);
+        for level in state.bids.iter().take(state.bid_level_count) {
+            book.restore_level(level)?;
+        }
+        for level in state.asks.iter().take(state.ask_level_count) {
+            book.restore_level(level)?;
+        }
+        Ok(book)
+    }
+
+    fn validate_state(state: &BookState<LEVELS, ORDERS_PER_LEVEL>) -> Result<(), BookStateError> {
+        if state.bid_level_count > LEVELS || state.ask_level_count > LEVELS {
+            return Err(BookStateError::LevelCapacity);
+        }
+        Self::validate_side(&state.bids, state.bid_level_count, Side::Buy)?;
+        Self::validate_side(&state.asks, state.ask_level_count, Side::Sell)?;
+        if state.bids[state.bid_level_count..]
+            .iter()
+            .chain(&state.asks[state.ask_level_count..])
+            .any(|level| *level != empty_book_level_state())
+        {
+            return Err(BookStateError::NonCanonical);
+        }
+        if state
+            .bids
+            .first()
+            .filter(|_| state.bid_level_count > 0)
+            .zip(state.asks.first().filter(|_| state.ask_level_count > 0))
+            .is_some_and(|(bid, ask)| bid.price.0 >= ask.price.0)
+        {
+            return Err(BookStateError::Crossed);
+        }
+        Self::validate_unique_ids(state)
+    }
+
+    fn validate_unique_ids(
+        state: &BookState<LEVELS, ORDERS_PER_LEVEL>,
+    ) -> Result<(), BookStateError> {
+        for (levels, level_count) in [
+            (&state.bids, state.bid_level_count),
+            (&state.asks, state.ask_level_count),
+        ] {
+            for level in levels.iter().take(level_count) {
+                for order in level.orders.iter().take(level.order_count) {
+                    let mut occurrences = 0_usize;
+                    for (candidate_levels, candidate_count) in [
+                        (&state.bids, state.bid_level_count),
+                        (&state.asks, state.ask_level_count),
+                    ] {
+                        for candidate_level in candidate_levels.iter().take(candidate_count) {
+                            occurrences += candidate_level
+                                .orders
+                                .iter()
+                                .take(candidate_level.order_count)
+                                .filter(|candidate| candidate.order_id == order.order_id)
+                                .count();
+                        }
+                    }
+                    if occurrences != 1 {
+                        return Err(BookStateError::DuplicateOrderId);
+                    }
+                    let sequence_occurrences = state
+                        .bids
+                        .iter()
+                        .take(state.bid_level_count)
+                        .chain(state.asks.iter().take(state.ask_level_count))
+                        .flat_map(|candidate_level| {
+                            candidate_level
+                                .orders
+                                .iter()
+                                .take(candidate_level.order_count)
+                        })
+                        .filter(|candidate| candidate.sequence == order.sequence)
+                        .count();
+                    if sequence_occurrences != 1 {
+                        return Err(BookStateError::Sequence);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_side(
+        levels: &[BookLevelState<ORDERS_PER_LEVEL>; LEVELS],
+        level_count: usize,
+        side: Side,
+    ) -> Result<(), BookStateError> {
+        let mut prior_price = None;
+        for level in levels.iter().take(level_count) {
+            if level.side != side {
+                return Err(BookStateError::Side);
+            }
+            if level.price.0 <= 0 {
+                return Err(BookStateError::Price);
+            }
+            if level.order_count == 0 || level.order_count > ORDERS_PER_LEVEL {
+                return Err(BookStateError::OrderCapacity);
+            }
+            if prior_price.is_some_and(|prior: PriceTicks| match side {
+                Side::Buy => prior.0 <= level.price.0,
+                Side::Sell => prior.0 >= level.price.0,
+            }) {
+                return Err(BookStateError::LevelOrder);
+            }
+            for order in level.orders.iter().take(level.order_count) {
+                if order.side != side {
+                    return Err(BookStateError::Side);
+                }
+                if order.price != level.price {
+                    return Err(BookStateError::Price);
+                }
+                if order.quantity.0 == 0 {
+                    return Err(BookStateError::Quantity);
+                }
+                if order.sequence.0 == 0 {
+                    return Err(BookStateError::Sequence);
+                }
+            }
+            if level.orders[..level.order_count]
+                .windows(2)
+                .any(|pair| pair[0].sequence >= pair[1].sequence)
+            {
+                return Err(BookStateError::Sequence);
+            }
+            if level.orders[level.order_count..]
+                .iter()
+                .any(|order| *order != EMPTY_BOOK_ORDER_STATE)
+            {
+                return Err(BookStateError::NonCanonical);
+            }
+            prior_price = Some(level.price);
+        }
+        Ok(())
+    }
+
+    fn restore_level(
+        &mut self,
+        state: &BookLevelState<ORDERS_PER_LEVEL>,
+    ) -> Result<(), BookStateError> {
+        let descending = state.side == Side::Buy;
+        let level_index = self
+            .side_index_mut(state.side)
+            .insert(state.price, descending)
+            .ok_or(BookStateError::LevelCapacity)?;
+        self.side_levels_mut(state.side)[level_index] = Some(PriceLevel::new(state.price));
+        for order in state.orders.iter().take(state.order_count) {
+            let resting = RestingOrder {
+                id: order.order_id,
+                account_id: order.account_id,
+                index_slot: 0,
+                price: order.price,
+                quantity: order.quantity,
+                sequence: order.sequence,
+                prev: NIL,
+                next: NIL,
+            };
+            let slot = self.side_levels_mut(state.side)[level_index]
+                .as_mut()
+                .and_then(|level| level.push_tail(resting))
+                .ok_or(BookStateError::OrderCapacity)?;
+            let location = OrderLocation {
+                side: state.side,
+                level_index,
+                slot,
+            };
+            let index_slot = self
+                .index
+                .insert(order.order_id, location)
+                .map_err(|_| BookStateError::DuplicateOrderId)?;
+            let live = self.side_levels_mut(state.side)[level_index]
+                .as_mut()
+                .and_then(|level| level.get_live_mut(slot))
+                .ok_or(BookStateError::OrderCapacity)?;
+            live.index_slot = index_slot;
+        }
+        Ok(())
     }
 
     fn side_levels(&self, side: Side) -> &[Option<PriceLevel<ORDERS_PER_LEVEL>>; LEVELS] {
@@ -2112,5 +2426,76 @@ mod tests {
         let summary = book.submit(po, &mut reports).expect("rests on empty side");
         assert_eq!(summary.state, OrderState::Accepted);
         assert_eq!(book.order_count(), 1);
+    }
+
+    #[test]
+    fn logical_state_round_trip_preserves_fifo_and_digest() {
+        let mut book = OrderBook::<4, 4>::new(InstrumentId(1));
+        let mut reports = ReportBuffer::<4>::new();
+        for input in [
+            order(1, 99, 2, Side::Buy),
+            order(2, 99, 3, Side::Buy),
+            order(3, 101, 4, Side::Sell),
+        ] {
+            book.submit(input, &mut reports).expect("rest order");
+            reports.clear();
+        }
+
+        let state = book.export_state();
+        let restored = OrderBook::from_state(InstrumentId(1), &state).expect("restore state");
+
+        assert_eq!(restored.export_state(), state);
+        assert_eq!(restored.stable_digest(), book.stable_digest());
+    }
+
+    #[test]
+    fn logical_state_rejects_duplicate_and_crossed_orders() {
+        let mut book = OrderBook::<4, 4>::new(InstrumentId(1));
+        let mut reports = ReportBuffer::<4>::new();
+        book.submit(order(1, 99, 2, Side::Buy), &mut reports)
+            .expect("bid");
+        reports.clear();
+        book.submit(order(2, 101, 2, Side::Sell), &mut reports)
+            .expect("ask");
+        let mut duplicate = book.export_state();
+        duplicate.asks[0].orders[0].order_id = OrderId(1);
+        assert!(matches!(
+            OrderBook::from_state(InstrumentId(1), &duplicate),
+            Err(BookStateError::DuplicateOrderId)
+        ));
+
+        let mut crossed = book.export_state();
+        crossed.bids[0].price = PriceTicks(101);
+        crossed.bids[0].orders[0].price = PriceTicks(101);
+        assert!(matches!(
+            OrderBook::from_state(InstrumentId(1), &crossed),
+            Err(BookStateError::Crossed)
+        ));
+    }
+
+    #[test]
+    fn logical_state_rejects_fifo_and_global_sequence_reuse() {
+        let mut book = OrderBook::<4, 4>::new(InstrumentId(1));
+        let mut reports = ReportBuffer::<4>::new();
+        book.submit(order(1, 99, 2, Side::Buy), &mut reports)
+            .expect("first bid");
+        book.submit(order(2, 99, 2, Side::Buy), &mut reports)
+            .expect("second bid");
+        book.submit(order(3, 98, 2, Side::Buy), &mut reports)
+            .expect("third bid");
+
+        let mut reversed = book.export_state();
+        reversed.bids[0].orders.swap(0, 1);
+        assert!(matches!(
+            OrderBook::from_state(InstrumentId(1), &reversed),
+            Err(BookStateError::Sequence)
+        ));
+
+        let mut duplicate = book.export_state();
+        duplicate.bids[1].orders[0].sequence = duplicate.bids[0].orders[0].sequence;
+        assert!(matches!(
+            OrderBook::from_state(InstrumentId(1), &duplicate),
+            Err(BookStateError::Sequence)
+        ));
     }
 }

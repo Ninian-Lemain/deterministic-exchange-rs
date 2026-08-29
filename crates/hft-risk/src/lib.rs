@@ -20,6 +20,50 @@ pub enum RegistrationError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AccountRiskState {
+    pub id: AccountId,
+    pub limits: RiskLimits,
+    pub settled_position: i128,
+    pub reserved_buys: u128,
+    pub reserved_sells: u128,
+    pub open_orders: u32,
+    pub killed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReservationRiskState {
+    pub order_id: OrderId,
+    pub account_id: AccountId,
+    pub side: Side,
+    pub quantity: Quantity,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RiskEngineState {
+    pub accounts: Vec<AccountRiskState>,
+    pub reservations: Vec<ReservationRiskState>,
+    pub maximum_order_id: Option<OrderId>,
+    pub killed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RiskStateError {
+    AccountCapacity,
+    ReservationCapacity,
+    DuplicateAccount,
+    DuplicateOrder,
+    NonCanonical,
+    InvalidLimits,
+    UnknownAccount,
+    InvalidWatermark,
+    ExposureMismatch,
+    OpenOrderMismatch,
+    PositionLimit,
+    ArithmeticOverflow,
+    InvalidQuantity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct AccountState {
     id: AccountId,
     limits: RiskLimits,
@@ -256,6 +300,106 @@ impl<const ACCOUNTS: usize, const ORDERS: usize> RiskEngine<ACCOUNTS, ORDERS> {
         }
     }
 
+    #[must_use]
+    pub fn export_state(&self) -> RiskEngineState {
+        let mut accounts: Vec<_> = self
+            .accounts
+            .iter()
+            .flatten()
+            .map(|account| AccountRiskState {
+                id: account.id,
+                limits: account.limits,
+                settled_position: account.settled_position,
+                reserved_buys: account.reserved_buys,
+                reserved_sells: account.reserved_sells,
+                open_orders: account.open_orders,
+                killed: account.killed,
+            })
+            .collect();
+        accounts.sort_unstable_by_key(|account| account.id);
+
+        let mut reservations: Vec<_> = self
+            .reservations
+            .iter()
+            .filter_map(|slot| match slot {
+                ReservationSlot::Live(reservation) => Some(ReservationRiskState {
+                    order_id: reservation.order_id,
+                    account_id: reservation.account_id,
+                    side: reservation.side,
+                    quantity: reservation.quantity,
+                }),
+                ReservationSlot::Free { .. } => None,
+            })
+            .collect();
+        reservations.sort_unstable_by_key(|reservation| reservation.order_id);
+
+        RiskEngineState {
+            accounts,
+            reservations,
+            maximum_order_id: self.maximum_order_id,
+            killed: self.killed,
+        }
+    }
+
+    /// Rebuilds risk state from logical records without retaining storage
+    /// slots or index positions from the source engine.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first capacity, identity, limit, ownership, watermark, or
+    /// exposure error. No engine is returned unless the complete state is valid.
+    pub fn from_state(state: &RiskEngineState) -> Result<Self, RiskStateError> {
+        let (accounts, reservations) = validate_state::<ACCOUNTS, ORDERS>(state)?;
+        let mut engine = Self::new();
+        engine.killed = state.killed;
+        engine.maximum_order_id = state.maximum_order_id;
+        for (slot, account) in accounts.into_iter().enumerate() {
+            engine
+                .account_index
+                .insert(u64::from(account.id.0), slot)
+                .map_err(|error| match error {
+                    ProbeError::Full => RiskStateError::AccountCapacity,
+                    ProbeError::Duplicate => RiskStateError::DuplicateAccount,
+                })?;
+            engine.accounts[slot] = Some(AccountState {
+                id: account.id,
+                limits: account.limits,
+                settled_position: account.settled_position,
+                reserved_buys: account.reserved_buys,
+                reserved_sells: account.reserved_sells,
+                open_orders: account.open_orders,
+                killed: account.killed,
+            });
+        }
+        for (slot, reservation) in reservations.into_iter().enumerate() {
+            let index_slot = engine
+                .reservation_index
+                .insert(reservation.order_id.0, slot)
+                .map_err(|error| match error {
+                    ProbeError::Full => RiskStateError::ReservationCapacity,
+                    ProbeError::Duplicate => RiskStateError::DuplicateOrder,
+                })?;
+            engine.reservations[slot] = ReservationSlot::Live(Reservation {
+                order_id: reservation.order_id,
+                account_id: reservation.account_id,
+                index_slot,
+                side: reservation.side,
+                quantity: reservation.quantity,
+            });
+        }
+        engine.reservation_free_head = if state.reservations.len() == ORDERS {
+            NIL
+        } else {
+            state.reservations.len()
+        };
+        for slot in state.reservations.len()..ORDERS {
+            engine.reservations[slot] = ReservationSlot::Free {
+                next_free: if slot + 1 < ORDERS { slot + 1 } else { NIL },
+            };
+        }
+        Ok(engine)
+    }
+
     fn account_slot(&self, id: AccountId) -> Option<usize> {
         self.account_index.lookup(u64::from(id.0))
     }
@@ -270,7 +414,6 @@ impl<const ACCOUNTS: usize, const ORDERS: usize> RiskEngine<ACCOUNTS, ORDERS> {
         }
         Some((slot, reservation))
     }
-
     /// Removes a live reservation from the index and returns its slot to the
     /// free list. Infallible for a reservation resolved by `live_reservation`.
     fn release_reservation(&mut self, slot: usize, reservation: Reservation) {
@@ -780,6 +923,116 @@ impl<const ACCOUNTS: usize, const ORDERS: usize> RiskEngine<ACCOUNTS, ORDERS> {
             Some((projected, account.open_orders))
         })
     }
+}
+
+fn validate_state<const ACCOUNTS: usize, const ORDERS: usize>(
+    state: &RiskEngineState,
+) -> Result<(Vec<AccountRiskState>, Vec<ReservationRiskState>), RiskStateError> {
+    if state.accounts.len() > ACCOUNTS {
+        return Err(RiskStateError::AccountCapacity);
+    }
+    if state.reservations.len() > ORDERS {
+        return Err(RiskStateError::ReservationCapacity);
+    }
+    let accounts = state.accounts.clone();
+    for pair in accounts.windows(2) {
+        if pair[0].id == pair[1].id {
+            return Err(RiskStateError::DuplicateAccount);
+        }
+        if pair[0].id > pair[1].id {
+            return Err(RiskStateError::NonCanonical);
+        }
+    }
+    if accounts.iter().any(|account| {
+        account.limits.max_quantity.0 == 0
+            || account.limits.max_open_orders == 0
+            || account.limits.minimum_price.0 > account.limits.maximum_price.0
+    }) {
+        return Err(RiskStateError::InvalidLimits);
+    }
+    let reservations = state.reservations.clone();
+    for pair in reservations.windows(2) {
+        if pair[0].order_id == pair[1].order_id {
+            return Err(RiskStateError::DuplicateOrder);
+        }
+        if pair[0].order_id > pair[1].order_id {
+            return Err(RiskStateError::NonCanonical);
+        }
+    }
+    if reservations
+        .iter()
+        .any(|reservation| reservation.quantity.0 == 0)
+    {
+        return Err(RiskStateError::InvalidQuantity);
+    }
+    if reservations.last().is_some_and(|reservation| {
+        state
+            .maximum_order_id
+            .is_none_or(|maximum| maximum < reservation.order_id)
+    }) {
+        return Err(RiskStateError::InvalidWatermark);
+    }
+    if reservations.iter().any(|reservation| {
+        accounts
+            .binary_search_by_key(&reservation.account_id, |account| account.id)
+            .is_err()
+    }) {
+        return Err(RiskStateError::UnknownAccount);
+    }
+    for account in &accounts {
+        validate_account_state(account, &reservations)?;
+    }
+    Ok((accounts, reservations))
+}
+
+fn validate_account_state(
+    account: &AccountRiskState,
+    reservations: &[ReservationRiskState],
+) -> Result<(), RiskStateError> {
+    let mut reserved_buys = 0_u128;
+    let mut reserved_sells = 0_u128;
+    let mut open_orders = 0_u32;
+    for reservation in reservations
+        .iter()
+        .filter(|reservation| reservation.account_id == account.id)
+    {
+        match reservation.side {
+            Side::Buy => {
+                reserved_buys = reserved_buys
+                    .checked_add(u128::from(reservation.quantity.0))
+                    .ok_or(RiskStateError::ArithmeticOverflow)?;
+            }
+            Side::Sell => {
+                reserved_sells = reserved_sells
+                    .checked_add(u128::from(reservation.quantity.0))
+                    .ok_or(RiskStateError::ArithmeticOverflow)?;
+            }
+        }
+        open_orders = open_orders
+            .checked_add(1)
+            .ok_or(RiskStateError::ArithmeticOverflow)?;
+    }
+    if reserved_buys != account.reserved_buys || reserved_sells != account.reserved_sells {
+        return Err(RiskStateError::ExposureMismatch);
+    }
+    if open_orders != account.open_orders || open_orders > account.limits.max_open_orders {
+        return Err(RiskStateError::OpenOrderMismatch);
+    }
+    let buys = i128::try_from(reserved_buys).map_err(|_| RiskStateError::ArithmeticOverflow)?;
+    let sells = i128::try_from(reserved_sells).map_err(|_| RiskStateError::ArithmeticOverflow)?;
+    let worst_long = account
+        .settled_position
+        .checked_add(buys)
+        .ok_or(RiskStateError::ArithmeticOverflow)?;
+    let worst_short = account
+        .settled_position
+        .checked_sub(sells)
+        .ok_or(RiskStateError::ArithmeticOverflow)?;
+    let maximum = i128::from(account.limits.max_abs_position.0);
+    if worst_long > maximum || worst_short < -maximum {
+        return Err(RiskStateError::PositionLimit);
+    }
+    Ok(())
 }
 
 impl<const ACCOUNTS: usize, const ORDERS: usize> Default for RiskEngine<ACCOUNTS, ORDERS> {
@@ -1292,5 +1545,99 @@ mod tests {
                 "account {account} drained"
             );
         }
+    }
+
+    #[test]
+    fn logical_state_round_trip_rebuilds_indexes() {
+        let mut risk = RiskEngine::<4, 8>::new();
+        risk.register_account(AccountId(9), wide_limits())
+            .expect("register account 9");
+        risk.register_account(AccountId(2), wide_limits())
+            .expect("register account 2");
+        let mut sell = order(7, Side::Sell, 4);
+        sell.account_id = AccountId(2);
+        risk.check_and_reserve(sell).expect("reserve sell");
+        let mut buy = order(11, Side::Buy, 3);
+        buy.account_id = AccountId(9);
+        risk.check_and_reserve(buy).expect("reserve buy");
+        risk.record_fill(OrderId(11), Quantity(1))
+            .expect("partial fill");
+        risk.set_account_kill_switch(AccountId(2), true)
+            .expect("kill account");
+        risk.set_kill_switch(true);
+
+        let state = risk.export_state();
+        assert_eq!(
+            state
+                .accounts
+                .iter()
+                .map(|account| account.id)
+                .collect::<Vec<_>>(),
+            [AccountId(2), AccountId(9)]
+        );
+        assert_eq!(
+            state
+                .reservations
+                .iter()
+                .map(|reservation| reservation.order_id)
+                .collect::<Vec<_>>(),
+            [OrderId(7), OrderId(11)]
+        );
+
+        let restored = RiskEngine::<4, 8>::from_state(&state).expect("restore state");
+        assert_eq!(restored.export_state(), state);
+        assert_risk_consistent(&restored);
+    }
+
+    #[test]
+    fn logical_state_rejects_inconsistent_exposure_and_watermark() {
+        let mut risk = RiskEngine::<2, 4>::new();
+        risk.register_account(AccountId(7), wide_limits())
+            .expect("register");
+        risk.check_and_reserve(order(3, Side::Buy, 2))
+            .expect("reserve");
+        let state = risk.export_state();
+
+        let mut bad_exposure = state.clone();
+        bad_exposure.accounts[0].reserved_buys += 1;
+        assert_eq!(
+            RiskEngine::<2, 4>::from_state(&bad_exposure).map(|_| ()),
+            Err(RiskStateError::ExposureMismatch)
+        );
+
+        let mut bad_watermark = state;
+        bad_watermark.maximum_order_id = Some(OrderId(2));
+        assert_eq!(
+            RiskEngine::<2, 4>::from_state(&bad_watermark).map(|_| ()),
+            Err(RiskStateError::InvalidWatermark)
+        );
+    }
+
+    #[test]
+    fn logical_state_rejects_noncanonical_records_and_zero_quantity() {
+        let mut risk = RiskEngine::<2, 4>::new();
+        risk.register_account(AccountId(9), wide_limits())
+            .expect("account nine");
+        risk.register_account(AccountId(2), wide_limits())
+            .expect("account two");
+        let mut state = risk.export_state();
+        state.accounts.swap(0, 1);
+        assert_eq!(
+            RiskEngine::<2, 4>::from_state(&state).map(|_| ()),
+            Err(RiskStateError::NonCanonical)
+        );
+
+        let mut risk = RiskEngine::<2, 4>::new();
+        risk.register_account(AccountId(7), wide_limits())
+            .expect("account");
+        risk.check_and_reserve(order(3, Side::Buy, 2))
+            .expect("reservation");
+        let mut state = risk.export_state();
+        state.reservations[0].quantity = Quantity(0);
+        state.accounts[0].reserved_buys = 0;
+        assert_eq!(
+            RiskEngine::<2, 4>::from_state(&state).map(|_| ()),
+            Err(RiskStateError::InvalidQuantity)
+        );
     }
 }

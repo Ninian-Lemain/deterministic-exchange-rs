@@ -1,202 +1,359 @@
-//! Journal invariants: records occur exactly once and in order; corruption,
-//! truncation, and saturation fail closed; a crash between ring handoff and
-//! commit loses only the uncommitted suffix, and restart resumes with no gap
-//! and no duplicate.
-//!
-//! Skipped on Loom builds: the ring's primitives panic outside a model; the
-//! Loom unit tests in hft-spsc cover the algorithm there.
-
 use hft_journal::{
-    JournalError, JournalReader, JournalRecord, JournalWriter, RING_CAPACITY, ReadError,
+    DecodeError, DurableSink, FlushPolicy, JournalError, JournalReader, JournalRecord,
+    JournalWriter, PersistError, PersistenceWorker, RECORD_SIZE, RING_CAPACITY, ReadError,
+    RecoveryError, open_append, record_checksum, recover,
 };
 use hft_spsc::SpscQueue;
 use hft_types::SequenceNumber;
+use std::io::{self, Cursor};
 
 fn payload(id: u64) -> [u8; 46] {
     let mut bytes = [0_u8; 46];
     bytes[..8].copy_from_slice(&id.to_be_bytes());
-    bytes[8] = 0x4a;
-    let tail = id.wrapping_mul(0x5851_5f64).to_be_bytes();
-    bytes[40..46].copy_from_slice(&tail[2..]);
     bytes
 }
 
-fn plant_records(queue: &mut SpscQueue<JournalRecord, RING_CAPACITY>, records: &[JournalRecord]) {
-    let (mut producer, _) = queue.split();
-    for record in records {
-        producer.try_push(*record).expect("plant fits");
-    }
+fn skip_loom_queue_test() -> bool {
+    hft_spsc::IS_LOOM_BUILD
 }
 
-#[test]
-fn records_commit_once_in_order_with_intact_payloads() {
-    if hft_spsc::IS_LOOM_BUILD {
-        eprintln!("skipped: loom build");
-        return;
-    }
-    let mut queue = SpscQueue::<JournalRecord, RING_CAPACITY>::try_new().unwrap();
-    let first_sequence = 1_u64;
-    {
-        let mut writer = JournalWriter::new(&mut queue, first_sequence);
-        for id in 1..=100_u64 {
-            writer.enqueue(&payload(id)).unwrap();
+#[derive(Default)]
+struct FaultSink {
+    bytes: Vec<u8>,
+    max_write: usize,
+    interrupt_once: bool,
+    fail_after: Option<usize>,
+    flushes: usize,
+    fail_flush: bool,
+}
+
+impl DurableSink for FaultSink {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.interrupt_once {
+            self.interrupt_once = false;
+            return Err(io::Error::from(io::ErrorKind::Interrupted));
         }
-    }
-
-    let mut reader = JournalReader::new(&mut queue, first_sequence);
-    for id in 1..=100_u64 {
-        let record = reader.read().unwrap();
-        assert_eq!(record.sequence.0, id);
-        assert_eq!(record.slice(), &payload(id)[..]);
-        reader.commit(record);
-    }
-    assert!(matches!(reader.read(), Err(ReadError::Empty)));
-
-    for (offset, record) in reader.committed().iter().enumerate() {
-        assert_eq!(record.sequence.0, offset as u64 + 1);
-        assert_eq!(record.slice(), &payload(offset as u64 + 1)[..]);
-        assert!(record.verify());
-    }
-}
-
-#[test]
-fn corruption_fails_closed_without_committing() {
-    if hft_spsc::IS_LOOM_BUILD {
-        eprintln!("skipped: loom build");
-        return;
-    }
-    let mut queue = SpscQueue::<JournalRecord, RING_CAPACITY>::try_new().unwrap();
-
-    let good1 = JournalRecord::new(SequenceNumber(1), &payload(1));
-    let mut bad2 = JournalRecord::new(SequenceNumber(2), &payload(2));
-    bad2.checksum ^= 1;
-    let good3 = JournalRecord::new(SequenceNumber(3), &payload(3));
-    plant_records(&mut queue, &[good1, bad2, good3]);
-
-    let mut reader = JournalReader::new(&mut queue, 1);
-    let record = reader.read().unwrap();
-    reader.commit(record);
-
-    match reader.read() {
-        Err(ReadError::ChecksumMismatch { sequence }) => {
-            assert_eq!(sequence.0, 2);
+        if self
+            .fail_after
+            .is_some_and(|limit| self.bytes.len() >= limit)
+        {
+            return Err(io::Error::from(io::ErrorKind::Other));
         }
-        other => panic!("expected checksum mismatch, got {other:?}"),
+        let count = bytes.len().min(self.max_write.max(1));
+        self.bytes.extend_from_slice(&bytes[..count]);
+        Ok(count)
     }
-    assert_eq!(reader.committed().len(), 1);
-}
 
-#[test]
-fn out_of_order_record_fails_closed() {
-    if hft_spsc::IS_LOOM_BUILD {
-        eprintln!("skipped: loom build");
-        return;
-    }
-    let mut queue = SpscQueue::<JournalRecord, RING_CAPACITY>::try_new().unwrap();
-    let wrong = JournalRecord::new(SequenceNumber(7), &payload(7));
-    plant_records(&mut queue, &[wrong]);
-
-    let mut reader = JournalReader::new(&mut queue, 1);
-    match reader.read() {
-        Err(ReadError::SequenceMismatch { expected, received }) => {
-            assert_eq!(expected.0, 1);
-            assert_eq!(received.0, 7);
+    fn flush(&mut self) -> io::Result<()> {
+        if self.fail_flush {
+            return Err(io::Error::from(io::ErrorKind::Other));
         }
-        other => panic!("expected sequence mismatch, got {other:?}"),
+        self.flushes += 1;
+        Ok(())
     }
 }
 
 #[test]
-fn saturation_is_explicit_and_recovery_continues_after_drain() {
-    if hft_spsc::IS_LOOM_BUILD {
-        eprintln!("skipped: loom build");
+fn encoding_is_stable_and_rejects_bad_fields() {
+    assert_eq!(record_checksum(b"123456789"), 0xe306_9283);
+    let record = JournalRecord::new(SequenceNumber(9), b"abc").expect("valid record");
+    let bytes = record.encode();
+    assert_eq!(bytes.len(), RECORD_SIZE);
+    assert_eq!(&bytes[0..4], &[0x4a, 0x52, 1, 0]);
+    assert_eq!(&bytes[4..12], &9_u64.to_be_bytes());
+    assert_eq!(&bytes[12..14], &3_u16.to_be_bytes());
+    assert_eq!(JournalRecord::decode(&bytes), Ok(record));
+
+    let mut bad_version = bytes;
+    bad_version[2] = 2;
+    assert!(matches!(
+        JournalRecord::decode(&bad_version),
+        Err(DecodeError::UnsupportedVersion { found: 2 })
+    ));
+    let mut bad_len = bytes;
+    bad_len[12..14].copy_from_slice(&47_u16.to_be_bytes());
+    assert!(matches!(
+        JournalRecord::decode(&bad_len),
+        Err(DecodeError::PayloadLength { found: 47 })
+    ));
+    let mut corrupt = bytes;
+    corrupt[20] ^= 1;
+    assert!(matches!(
+        JournalRecord::decode(&corrupt),
+        Err(DecodeError::ChecksumMismatch { .. })
+    ));
+}
+
+#[test]
+fn on_shutdown_policy_defers_flush() {
+    if skip_loom_queue_test() {
         return;
     }
-    let mut queue = SpscQueue::<JournalRecord, RING_CAPACITY>::try_new().unwrap();
+    let mut queue = SpscQueue::<JournalRecord, RING_CAPACITY>::try_new().expect("queue");
     let (producer, consumer) = queue.split();
     let mut writer = JournalWriter::from_producer(producer, 1);
-    let mut reader = JournalReader::from_consumer(consumer, 1);
+    writer.enqueue(b"one").expect("enqueue");
+    let reader = JournalReader::from_consumer(consumer, 1);
+    let sink = FaultSink {
+        max_write: RECORD_SIZE,
+        ..FaultSink::default()
+    };
+    let mut worker =
+        PersistenceWorker::<_, 4>::new(reader, sink, FlushPolicy::OnShutdown).expect("worker");
+    assert_eq!(worker.drain_batch().expect("drain"), 1);
+    worker.shutdown().expect("shutdown");
+    assert_eq!(worker.into_sink().expect("healthy").flushes, 1);
+}
 
-    for _ in 1..=RING_CAPACITY as u64 {
-        writer.enqueue(&payload(1)).expect("ring fills exactly");
+#[test]
+fn oversized_payload_and_sequence_overflow_publish_nothing() {
+    if skip_loom_queue_test() {
+        return;
     }
+    let mut queue = SpscQueue::<JournalRecord, RING_CAPACITY>::try_new().expect("queue");
+    let (producer, mut consumer) = queue.split();
+    let mut writer = JournalWriter::from_producer(producer, u64::MAX);
     assert_eq!(
-        writer.enqueue(&payload(RING_CAPACITY as u64 + 1)),
-        Err(JournalError::Saturated),
-        "overflow must be refused, not dropped"
+        writer.enqueue(&[0; 47]),
+        Err(JournalError::SequenceOverflow)
+    );
+    assert_eq!(writer.enqueue(b"ok"), Err(JournalError::SequenceOverflow));
+    assert!(consumer.try_pop().is_none());
+
+    let mut queue = SpscQueue::<JournalRecord, RING_CAPACITY>::try_new().expect("queue");
+    let (producer, mut consumer) = queue.split();
+    let mut writer = JournalWriter::from_producer(producer, 1);
+    assert_eq!(
+        writer.enqueue(&[0; 47]),
+        Err(JournalError::PayloadTooLarge { len: 47 })
+    );
+    assert_eq!(writer.next_sequence(), 1);
+    assert!(consumer.try_pop().is_none());
+}
+
+#[test]
+fn reader_latches_sequence_failure() {
+    if skip_loom_queue_test() {
+        return;
+    }
+    let mut queue = SpscQueue::<JournalRecord, RING_CAPACITY>::try_new().expect("queue");
+    let (mut producer, consumer) = queue.split();
+    producer
+        .try_push(JournalRecord::new(SequenceNumber(2), b"gap").expect("record"))
+        .expect("space");
+    producer
+        .try_push(JournalRecord::new(SequenceNumber(1), b"later").expect("record"))
+        .expect("space");
+    let mut reader = JournalReader::from_consumer(consumer, 1);
+    assert!(matches!(
+        reader.read(),
+        Err(ReadError::SequenceMismatch { .. })
+    ));
+    assert_eq!(reader.read(), Err(ReadError::Poisoned));
+    assert!(reader.is_poisoned());
+}
+
+#[test]
+fn persistence_handles_short_and_interrupted_writes_then_flushes() {
+    if skip_loom_queue_test() {
+        return;
+    }
+    let mut queue = SpscQueue::<JournalRecord, RING_CAPACITY>::try_new().expect("queue");
+    let (producer, consumer) = queue.split();
+    let mut writer = JournalWriter::from_producer(producer, 1);
+    for id in 1..=3 {
+        writer.enqueue(&payload(id)).expect("enqueue");
+    }
+    let sink = FaultSink {
+        max_write: 7,
+        interrupt_once: true,
+        ..FaultSink::default()
+    };
+    let reader = JournalReader::from_consumer(consumer, 1);
+    let mut worker =
+        PersistenceWorker::<_, 2>::new(reader, sink, FlushPolicy::EveryBatch).expect("worker");
+    assert_eq!(worker.drain_batch().expect("first batch"), 2);
+    assert_eq!(worker.drain_batch().expect("second batch"), 1);
+    worker.shutdown().expect("shutdown");
+    let sink = worker.into_sink().expect("healthy sink");
+    assert_eq!(sink.bytes.len(), 3 * RECORD_SIZE);
+    assert_eq!(sink.flushes, 3);
+    let recovered = recover(&mut Cursor::new(sink.bytes), 1).expect("recovery");
+    assert_eq!(recovered.records, 3);
+    assert_eq!(recovered.next_sequence, 4);
+}
+
+#[test]
+fn persistence_failure_poisoning_is_permanent() {
+    if skip_loom_queue_test() {
+        return;
+    }
+    let mut queue = SpscQueue::<JournalRecord, RING_CAPACITY>::try_new().expect("queue");
+    let (producer, consumer) = queue.split();
+    let mut writer = JournalWriter::from_producer(producer, 1);
+    writer.enqueue(b"one").expect("enqueue");
+    let sink = FaultSink {
+        max_write: 8,
+        fail_after: Some(8),
+        ..FaultSink::default()
+    };
+    let reader = JournalReader::from_consumer(consumer, 1);
+    let mut worker =
+        PersistenceWorker::<_, 1>::new(reader, sink, FlushPolicy::EveryBatch).expect("worker");
+    assert!(matches!(worker.drain_batch(), Err(PersistError::Io(_))));
+    assert!(matches!(worker.drain_batch(), Err(PersistError::Poisoned)));
+    assert!(matches!(worker.shutdown(), Err(PersistError::Poisoned)));
+    assert!(matches!(worker.into_sink(), Err(PersistError::Poisoned)));
+}
+
+#[test]
+fn flush_failure_poisoning_is_permanent() {
+    if skip_loom_queue_test() {
+        return;
+    }
+    let mut queue = SpscQueue::<JournalRecord, RING_CAPACITY>::try_new().expect("queue");
+    let (producer, consumer) = queue.split();
+    let mut writer = JournalWriter::from_producer(producer, 1);
+    writer.enqueue(b"one").expect("enqueue");
+    let sink = FaultSink {
+        max_write: RECORD_SIZE,
+        fail_flush: true,
+        ..FaultSink::default()
+    };
+    let reader = JournalReader::from_consumer(consumer, 1);
+    let mut worker =
+        PersistenceWorker::<_, 1>::new(reader, sink, FlushPolicy::EveryBatch).expect("worker");
+    assert!(matches!(worker.drain_batch(), Err(PersistError::Io(_))));
+    assert!(matches!(worker.drain_batch(), Err(PersistError::Poisoned)));
+}
+
+#[test]
+fn recovery_rejects_truncation_corruption_duplicates_and_gaps() {
+    let first = JournalRecord::new(SequenceNumber(1), b"one")
+        .expect("record")
+        .encode();
+    let second = JournalRecord::new(SequenceNumber(2), b"two")
+        .expect("record")
+        .encode();
+    let mut valid = Vec::from(first);
+    valid.extend_from_slice(&second);
+    assert_eq!(
+        recover(&mut Cursor::new(&valid), 1)
+            .expect("valid")
+            .next_sequence,
+        3
     );
 
-    for _ in 1..=(RING_CAPACITY / 2) as u64 {
-        reader.drain_one().unwrap();
-    }
-    writer.enqueue(&payload(RING_CAPACITY as u64 + 1)).unwrap();
+    assert!(matches!(
+        recover(&mut Cursor::new(&valid[..RECORD_SIZE + 11]), 1),
+        Err(RecoveryError::Truncated { bytes: 11 })
+    ));
+    let mut corrupt = valid.clone();
+    corrupt[RECORD_SIZE + 30] ^= 1;
+    assert!(matches!(
+        recover(&mut Cursor::new(corrupt), 1),
+        Err(RecoveryError::Decode { .. })
+    ));
 
-    let resume = (RING_CAPACITY / 2 + 1) as u64;
-    for id in resume..=(RING_CAPACITY as u64 + 1) {
-        let record = reader.read().unwrap();
-        assert_eq!(record.sequence.0, id);
-        reader.commit(record);
+    let mut duplicate = Vec::from(first);
+    duplicate.extend_from_slice(&first);
+    assert!(matches!(
+        recover(&mut Cursor::new(duplicate), 1),
+        Err(RecoveryError::Sequence { .. })
+    ));
+    let gap = JournalRecord::new(SequenceNumber(3), b"three")
+        .expect("record")
+        .encode();
+    let mut missing = Vec::from(first);
+    missing.extend_from_slice(&gap);
+    assert!(matches!(
+        recover(&mut Cursor::new(missing), 1),
+        Err(RecoveryError::Sequence { .. })
+    ));
+}
+
+#[test]
+fn crash_points_recover_an_ordered_prefix_or_fail_closed() {
+    let first = JournalRecord::new(SequenceNumber(1), b"one")
+        .expect("record")
+        .encode();
+    let second = JournalRecord::new(SequenceNumber(2), b"two")
+        .expect("record")
+        .encode();
+
+    for (bytes, records, next_sequence) in [
+        (&[][..], 0, 1),
+        (&first[..], 1, 2),
+        (&[first.as_slice(), second.as_slice()].concat()[..], 2, 3),
+    ] {
+        let recovered = recover(&mut Cursor::new(bytes), 1).expect("ordered prefix");
+        assert_eq!(recovered.records, records);
+        assert_eq!(recovered.next_sequence, next_sequence);
     }
+
+    for partial_len in [1, 13, RECORD_SIZE - 1] {
+        let mut partial = Vec::from(first);
+        partial.extend_from_slice(&second[..partial_len]);
+        assert!(matches!(
+            recover(&mut Cursor::new(partial), 1),
+            Err(RecoveryError::Truncated { bytes }) if bytes == partial_len
+        ));
+    }
+}
+
+#[test]
+fn saturation_does_not_consume_sequence() {
+    if skip_loom_queue_test() {
+        return;
+    }
+    let mut queue = SpscQueue::<JournalRecord, RING_CAPACITY>::try_new().expect("queue");
+    let (producer, mut consumer) = queue.split();
+    let mut writer = JournalWriter::from_producer(producer, 1);
+    for _ in 0..RING_CAPACITY {
+        writer.enqueue(b"x").expect("space");
+    }
+    assert_eq!(writer.enqueue(b"full"), Err(JournalError::Saturated));
+    assert_eq!(writer.next_sequence(), RING_CAPACITY as u64 + 1);
+    assert!(consumer.try_pop().is_some());
     assert_eq!(
-        reader.committed().len(),
-        RING_CAPACITY / 2 + (RING_CAPACITY / 2) + 1
+        writer.enqueue(b"resume").expect("space").0,
+        RING_CAPACITY as u64 + 1
     );
 }
 
 #[test]
-fn crash_between_handoff_and_commit_loses_only_uncommitted_suffix() {
-    if hft_spsc::IS_LOOM_BUILD {
-        eprintln!("skipped: loom build");
+fn file_restart_derives_next_sequence() {
+    if skip_loom_queue_test() {
         return;
     }
+    let mut path = std::env::temp_dir();
+    path.push(format!("hft-journal-{}-restart.bin", std::process::id()));
+    let _ = std::fs::remove_file(&path);
 
-    // ---- first life ----
-    let committed_before_crash;
-    {
-        let mut queue = SpscQueue::<JournalRecord, RING_CAPACITY>::try_new().unwrap();
-        {
-            let mut writer = JournalWriter::new(&mut queue, 1);
-            for id in 1..=5_u64 {
-                writer.enqueue(&payload(id)).unwrap();
-            }
-        }
-        let mut reader = JournalReader::new(&mut queue, 1);
-        for _ in 1..=3 {
-            let record = reader.read().unwrap();
-            reader.commit(record);
-        }
-        committed_before_crash = reader.committed().to_vec();
-    }
-    assert_eq!(committed_before_crash.len(), 3);
+    let result = (|| -> Result<(), String> {
+        let (file, empty) = open_append(&path, 1).map_err(|error| format!("open: {error:?}"))?;
+        assert_eq!(empty.next_sequence, 1);
+        let mut queue = SpscQueue::<JournalRecord, RING_CAPACITY>::try_new()
+            .map_err(|error| format!("queue: {error:?}"))?;
+        let (producer, consumer) = queue.split();
+        let mut writer = JournalWriter::from_producer(producer, empty.next_sequence);
+        writer.enqueue(b"one").map_err(|error| error.to_string())?;
+        writer.enqueue(b"two").map_err(|error| error.to_string())?;
+        let reader = JournalReader::from_consumer(consumer, empty.next_sequence);
+        let mut worker = PersistenceWorker::<_, 8>::new(reader, file, FlushPolicy::EveryBatch)
+            .map_err(|error| error.to_string())?;
+        worker
+            .shutdown()
+            .map_err(|error| format!("shutdown: {error:?}"))?;
+        drop(worker);
 
-    // ---- restart ----
-    let last_committed = committed_before_crash.len() as u64;
-    let mut queue = SpscQueue::<JournalRecord, RING_CAPACITY>::try_new().unwrap();
-    {
-        let mut writer = JournalWriter::new(&mut queue, last_committed + 1);
-        for seq in (last_committed + 1)..=5_u64 {
-            writer.enqueue(&payload(seq)).unwrap();
-        }
-    }
-    let mut reader = JournalReader::new(&mut queue, last_committed + 1);
-    for seq in (last_committed + 1)..=5_u64 {
-        let record = reader.read().unwrap();
-        assert_eq!(record.sequence.0, seq);
-        reader.commit(record);
-    }
+        let (_file, recovered) =
+            open_append(&path, 1).map_err(|error| format!("restart: {error:?}"))?;
+        assert_eq!(recovered.records, 2);
+        assert_eq!(recovered.next_sequence, 3);
+        Ok(())
+    })();
 
-    // Merged history: pre-crash commits plus post-restart commits give
-    // the full sequence, each exactly once, payloads intact.
-    let mut seen = std::collections::HashSet::new();
-    let merged: Vec<&JournalRecord> = committed_before_crash
-        .iter()
-        .chain(reader.committed().iter())
-        .collect();
-    for (offset, record) in merged.iter().enumerate() {
-        let expected_id = offset as u64 + 1;
-        assert_eq!(record.sequence.0, expected_id, "no gaps");
-        assert!(seen.insert(record.sequence.0), "no duplicates");
-        assert_eq!(record.slice(), &payload(expected_id)[..]);
-    }
-    assert_eq!(seen.len(), 5);
+    std::fs::remove_file(&path).expect("remove fixture");
+    result.expect("file restart");
 }

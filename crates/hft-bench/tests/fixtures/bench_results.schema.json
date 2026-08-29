@@ -33,6 +33,9 @@
     "commands",
     "new_frames",
     "cancel_frames",
-    "tif"
+    "tif",
+    "algorithm",
+    "cpu_crc",
+    "batch"
   ]
 }

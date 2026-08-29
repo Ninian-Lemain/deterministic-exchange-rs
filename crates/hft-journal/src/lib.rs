@@ -1,131 +1,190 @@
-//! Bounded command journal: versioned accepted-command records handed from
-//! the matching thread to a persistence consumer through the audited SPSC
-//! ring. The matching side only enqueues — no storage calls, no locks, no
-//! allocation after construction. Every record carries its sequence and an
-//! FNV-1a checksum; the consumer verifies both before committing, so
-//! corruption or truncation fails closed instead of persisting bad history.
+//! Bounded handoff and durable storage for accepted commands.
 #![forbid(unsafe_code)]
 
 use core::fmt;
 use hft_spsc::{Consumer, Producer, SpscQueue};
 use hft_types::SequenceNumber;
+use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::Path;
 
-/// Maximum journal payload: one wire frame.
 pub const MAX_PAYLOAD: usize = 46;
-
-/// Ring capacity for the persistence handoff (fixed, power of two).
+pub const RECORD_SIZE: usize = 64;
 pub const RING_CAPACITY: usize = 1024;
-
-const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-
-/// Batched FNV-1a over 62 bytes using 8 interleaved lanes to break the
-/// serial multiply dependency chain (~4 cycles/byte → ~40 cycles total).
-#[must_use]
-pub fn record_checksum(sequence: u64, payload: &[u8]) -> u64 {
-    let seq = sequence.to_be_bytes();
-    let len_bytes = (payload.len() as u64).to_be_bytes();
-
-    // 8 lanes, one per byte column of the u64 chunks.
-    let mut lanes = [FNV_OFFSET; 8];
-
-    // Mix sequence (8 bytes = 1 u64 chunk).
-    for col in 0..8 {
-        lanes[col] ^= u64::from(seq[col]);
-        lanes[col] = lanes[col].wrapping_mul(FNV_PRIME);
-    }
-
-    // Mix payload in 5 full u64 chunks + 1 partial (6 bytes).
-    for chunk in payload.chunks_exact(8) {
-        for col in 0..8 {
-            lanes[col] ^= u64::from(chunk[col]);
-            lanes[col] = lanes[col].wrapping_mul(FNV_PRIME);
-        }
-    }
-    let rem = &payload[(payload.len() / 8) * 8..];
-    for (col, byte) in rem.iter().enumerate() {
-        lanes[col] ^= u64::from(*byte);
-        lanes[col] = lanes[col].wrapping_mul(FNV_PRIME);
-    }
-
-    // Mix length (8 bytes).
-    for col in 0..8 {
-        lanes[col] ^= u64::from(len_bytes[col]);
-        lanes[col] = lanes[col].wrapping_mul(FNV_PRIME);
-    }
-
-    // Fold 8 lanes into one.
-    let mut hash = FNV_OFFSET;
-    for lane in lanes {
-        hash ^= lane;
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    hash
-}
-
-/// One versioned accepted-command record. Exactly 64 bytes = 1 cache line.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct JournalRecord {
-    pub sequence: SequenceNumber,
-    pub checksum: u64,
-    pub len: u16,
-    pub payload: [u8; MAX_PAYLOAD],
-}
-
-impl JournalRecord {
-    /// Builds a record and stamps its checksum.
-    #[must_use]
-    pub fn new(sequence: SequenceNumber, payload: &[u8]) -> Self {
-        let len = payload.len().min(MAX_PAYLOAD);
-        let mut stored = [0_u8; MAX_PAYLOAD];
-        stored[..len].copy_from_slice(&payload[..len]);
-        Self {
-            checksum: record_checksum(sequence.0, &stored[..len]),
-            sequence,
-            len: u16::try_from(len).unwrap_or(u16::MAX),
-            payload: stored,
-        }
-    }
-
-    #[must_use]
-    pub fn slice(&self) -> &[u8] {
-        &self.payload[..Into::<usize>::into(self.len)]
-    }
-
-    /// Recomputes and compares the checksum over stored fields.
-    #[must_use]
-    pub fn verify(&self) -> bool {
-        self.checksum == record_checksum(self.sequence.0, self.slice())
-    }
-}
+pub const FORMAT_VERSION: u8 = 1;
+const MAGIC: u16 = 0x4a52;
+const CHECKSUM_OFFSET: usize = 14;
+const PAYLOAD_OFFSET: usize = 18;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum JournalError {
-    /// The SPSC ring is full: backpressure is explicit, nothing is dropped.
     Saturated,
-    /// Sequence space exhausted.
     SequenceOverflow,
+    PayloadTooLarge { len: usize },
 }
 
 impl fmt::Display for JournalError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            JournalError::Saturated => f.write_str("journal ring saturated"),
-            JournalError::SequenceOverflow => f.write_str("journal sequence exhausted"),
+            Self::Saturated => f.write_str("journal ring saturated"),
+            Self::SequenceOverflow => f.write_str("journal sequence exhausted"),
+            Self::PayloadTooLarge { len } => {
+                write!(f, "journal payload length {len} exceeds {MAX_PAYLOAD}")
+            }
         }
     }
 }
 
-/// Matching-thread side: stamps records and hands them to the ring.
-/// Construction pins the starting sequence; `enqueue` is allocation-free.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JournalRecord {
+    sequence: SequenceNumber,
+    checksum: u32,
+    len: u16,
+    magic: u16,
+    payload: [u8; MAX_PAYLOAD],
+    version: u8,
+    flags: u8,
+}
+
+const _: () = assert!(core::mem::size_of::<JournalRecord>() == RECORD_SIZE);
+const _: () = assert!(core::mem::align_of::<JournalRecord>() == 8);
+
+impl JournalRecord {
+    /// Builds one record without truncating its payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JournalError::PayloadTooLarge`] when the payload does not fit.
+    pub fn new(sequence: SequenceNumber, payload: &[u8]) -> Result<Self, JournalError> {
+        if payload.len() > MAX_PAYLOAD {
+            return Err(JournalError::PayloadTooLarge { len: payload.len() });
+        }
+        let mut stored = [0_u8; MAX_PAYLOAD];
+        stored[..payload.len()].copy_from_slice(payload);
+        let mut record = Self {
+            sequence,
+            payload: stored,
+            checksum: 0,
+            len: u16::try_from(payload.len())
+                .map_err(|_| JournalError::PayloadTooLarge { len: payload.len() })?,
+            magic: MAGIC,
+            version: FORMAT_VERSION,
+            flags: 0,
+        };
+        record.checksum = record_checksum(&record.bytes_without_checksum());
+        Ok(record)
+    }
+
+    #[must_use]
+    pub const fn sequence(&self) -> SequenceNumber {
+        self.sequence
+    }
+
+    #[must_use]
+    pub fn slice(&self) -> Option<&[u8]> {
+        self.payload.get(..usize::from(self.len))
+    }
+
+    #[must_use]
+    pub fn verify(&self) -> bool {
+        self.magic == MAGIC
+            && self.version == FORMAT_VERSION
+            && self.flags == 0
+            && self.slice().is_some()
+            && self.checksum == record_checksum(&self.bytes_without_checksum())
+    }
+
+    #[must_use]
+    pub fn encode(&self) -> [u8; RECORD_SIZE] {
+        let mut bytes = self.bytes_without_checksum();
+        bytes[CHECKSUM_OFFSET..PAYLOAD_OFFSET].copy_from_slice(&self.checksum.to_be_bytes());
+        bytes
+    }
+
+    /// Decodes and verifies one complete disk record.
+    ///
+    /// # Errors
+    ///
+    /// Returns a format or checksum error for any invalid field.
+    pub fn decode(bytes: &[u8; RECORD_SIZE]) -> Result<Self, DecodeError> {
+        let magic = u16::from_be_bytes([bytes[0], bytes[1]]);
+        if magic != MAGIC {
+            return Err(DecodeError::BadMagic { found: magic });
+        }
+        let version = bytes[2];
+        if version != FORMAT_VERSION {
+            return Err(DecodeError::UnsupportedVersion { found: version });
+        }
+        let flags = bytes[3];
+        if flags != 0 {
+            return Err(DecodeError::UnsupportedFlags { found: flags });
+        }
+        let sequence = SequenceNumber(u64::from_be_bytes(
+            bytes[4..12]
+                .try_into()
+                .map_err(|_| DecodeError::Malformed)?,
+        ));
+        let len = u16::from_be_bytes([bytes[12], bytes[13]]);
+        if usize::from(len) > MAX_PAYLOAD {
+            return Err(DecodeError::PayloadLength { found: len });
+        }
+        let checksum = u32::from_be_bytes(
+            bytes[CHECKSUM_OFFSET..PAYLOAD_OFFSET]
+                .try_into()
+                .map_err(|_| DecodeError::Malformed)?,
+        );
+        let mut payload = [0_u8; MAX_PAYLOAD];
+        payload.copy_from_slice(&bytes[PAYLOAD_OFFSET..]);
+        let record = Self {
+            sequence,
+            checksum,
+            len,
+            magic,
+            payload,
+            version,
+            flags,
+        };
+        if !record.verify() {
+            return Err(DecodeError::ChecksumMismatch { sequence });
+        }
+        Ok(record)
+    }
+
+    fn bytes_without_checksum(&self) -> [u8; RECORD_SIZE] {
+        let mut bytes = [0_u8; RECORD_SIZE];
+        bytes[0..2].copy_from_slice(&self.magic.to_be_bytes());
+        bytes[2] = self.version;
+        bytes[3] = self.flags;
+        bytes[4..12].copy_from_slice(&self.sequence.0.to_be_bytes());
+        bytes[12..14].copy_from_slice(&self.len.to_be_bytes());
+        bytes[PAYLOAD_OFFSET..].copy_from_slice(&self.payload);
+        bytes
+    }
+}
+
+/// CRC32C boundary for record creation and verification.
+#[must_use]
+pub fn record_checksum(bytes: &[u8]) -> u32 {
+    crc32c::crc32c(bytes)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DecodeError {
+    Malformed,
+    BadMagic { found: u16 },
+    UnsupportedVersion { found: u8 },
+    UnsupportedFlags { found: u8 },
+    PayloadLength { found: u16 },
+    ChecksumMismatch { sequence: SequenceNumber },
+}
+
 pub struct JournalWriter<'queue> {
     producer: Producer<'queue, JournalRecord, RING_CAPACITY>,
     next_sequence: u64,
 }
 
 impl<'queue> JournalWriter<'queue> {
-    /// Builds from one half of an already-split ring, so the writer and the
-    /// persistence reader can coexist across phases or threads.
     #[must_use]
     pub fn from_producer(
         producer: Producer<'queue, JournalRecord, RING_CAPACITY>,
@@ -137,17 +196,13 @@ impl<'queue> JournalWriter<'queue> {
         }
     }
 
-    /// Pins the first sequence the journal will stamp.
     #[must_use]
     pub fn new(
         queue: &'queue mut SpscQueue<JournalRecord, RING_CAPACITY>,
         first_sequence: u64,
     ) -> Self {
         let (producer, _) = queue.split();
-        Self {
-            producer,
-            next_sequence: first_sequence,
-        }
+        Self::from_producer(producer, first_sequence)
     }
 
     #[must_use]
@@ -155,73 +210,61 @@ impl<'queue> JournalWriter<'queue> {
         self.next_sequence
     }
 
-    /// Enqueues one accepted command. Allocation-free; fails closed on a
-    /// saturated ring without consuming or corrupting state.
+    /// Builds and publishes one record without storage access or allocation.
     ///
     /// # Errors
     ///
-    /// [`JournalError::Saturated`] when the ring is full,
-    /// [`JournalError::SequenceOverflow`] when the sequence space ends.
+    /// Returns an explicit length, capacity, or sequence error before changing
+    /// the producer sequence.
     pub fn enqueue(&mut self, payload: &[u8]) -> Result<SequenceNumber, JournalError> {
-        let sequence = self.next_sequence;
-        let record = JournalRecord::new(SequenceNumber(sequence), payload);
-        match self.producer.try_push(record) {
-            Ok(()) => {
-                if sequence == u64::MAX {
-                    return Err(JournalError::SequenceOverflow);
-                }
-                self.next_sequence = sequence + 1;
-                Ok(SequenceNumber(sequence))
-            }
-            Err(same_record) => {
-                debug_assert_eq!(same_record.sequence.0, sequence);
-                debug_assert_eq!(same_record.checksum, record.checksum);
-                Err(JournalError::Saturated)
-            }
-        }
+        let next = self
+            .next_sequence
+            .checked_add(1)
+            .ok_or(JournalError::SequenceOverflow)?;
+        let sequence = SequenceNumber(self.next_sequence);
+        let record = JournalRecord::new(sequence, payload)?;
+        self.producer
+            .try_push(record)
+            .map_err(|_| JournalError::Saturated)?;
+        self.next_sequence = next;
+        Ok(sequence)
     }
 }
 
-/// A verified record ready to be committed by the persistence layer.
-#[derive(Clone, Copy, Debug)]
-pub struct ParsedRecord {
-    pub sequence: SequenceNumber,
-    pub len: usize,
-    pub payload: [u8; MAX_PAYLOAD],
-}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ParsedRecord(JournalRecord);
 
 impl ParsedRecord {
     #[must_use]
+    pub const fn sequence(&self) -> SequenceNumber {
+        self.0.sequence
+    }
+    #[must_use]
     pub fn slice(&self) -> &[u8] {
-        &self.payload[..Into::<usize>::into(self.len)]
+        self.0.slice().unwrap_or(&[])
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReadError {
-    /// No record pending right now.
     Empty,
-    /// Stored checksum does not cover the stored bytes.
-    ChecksumMismatch { sequence: SequenceNumber },
-    /// Record breaks the strict in-order invariant.
+    ChecksumMismatch {
+        sequence: SequenceNumber,
+    },
     SequenceMismatch {
         expected: SequenceNumber,
         received: SequenceNumber,
     },
+    Poisoned,
 }
 
-/// Persistence-consumer side: verifies records against sequence order and
-/// checksum, then commits them into a bounded durable log. `commit` is the
-/// explicit flush point — popped-but-uncommitted records are lost on crash,
-/// which the fixtures use to pin exactly-once semantics across restarts.
 pub struct JournalReader<'queue> {
     consumer: Consumer<'queue, JournalRecord, RING_CAPACITY>,
-    log: std::vec::Vec<JournalRecord>,
     expected_sequence: u64,
+    poisoned: bool,
 }
 
 impl<'queue> JournalReader<'queue> {
-    /// Builds from one half of an already-split ring.
     #[must_use]
     pub fn from_consumer(
         consumer: Consumer<'queue, JournalRecord, RING_CAPACITY>,
@@ -229,83 +272,293 @@ impl<'queue> JournalReader<'queue> {
     ) -> Self {
         Self {
             consumer,
-            log: std::vec::Vec::with_capacity(RING_CAPACITY),
             expected_sequence: first_expected,
+            poisoned: false,
         }
     }
-
     #[must_use]
     pub fn new(
         queue: &'queue mut SpscQueue<JournalRecord, RING_CAPACITY>,
         first_expected: u64,
     ) -> Self {
         let (_, consumer) = queue.split();
-        Self {
-            consumer,
-            log: std::vec::Vec::with_capacity(RING_CAPACITY),
-            expected_sequence: first_expected,
-        }
+        Self::from_consumer(consumer, first_expected)
     }
-
-    /// Pops and verifies exactly one record.
+    /// Reads one ordered record. Validation failures poison the reader.
     ///
     /// # Errors
     ///
-    /// [`ReadError::Empty`] when the ring has nothing pending,
-    /// [`ReadError::ChecksumMismatch`] on corruption,
-    /// [`ReadError::SequenceMismatch`] on a broken order invariant.
+    /// Returns [`ReadError::Empty`] if no record is ready. Invalid records
+    /// return a terminal error and all later reads return `Poisoned`.
     pub fn read(&mut self) -> Result<ParsedRecord, ReadError> {
-        let Some(record) = self.consumer.try_pop() else {
-            return Err(ReadError::Empty);
-        };
+        if self.poisoned {
+            return Err(ReadError::Poisoned);
+        }
+        let record = self.consumer.try_pop().ok_or(ReadError::Empty)?;
         if !record.verify() {
+            self.poisoned = true;
             return Err(ReadError::ChecksumMismatch {
                 sequence: record.sequence,
             });
         }
         if record.sequence.0 != self.expected_sequence {
+            self.poisoned = true;
             return Err(ReadError::SequenceMismatch {
                 expected: SequenceNumber(self.expected_sequence),
                 received: record.sequence,
             });
         }
-        self.expected_sequence += 1;
-        Ok(ParsedRecord {
-            sequence: record.sequence,
-            len: usize::from(record.len),
-            payload: record.payload,
-        })
+        self.expected_sequence = self.expected_sequence.checked_add(1).ok_or_else(|| {
+            self.poisoned = true;
+            ReadError::Poisoned
+        })?;
+        Ok(ParsedRecord(record))
     }
-
-    /// Commits a verified record to the durable log (the flush point).
-    pub fn commit(&mut self, record: ParsedRecord) {
-        self.log.push(JournalRecord {
-            checksum: record_checksum(record.sequence.0, record.slice()),
-            sequence: record.sequence,
-            len: u16::try_from(record.len).unwrap_or(u16::MAX),
-            payload: record.payload,
-        });
-    }
-
-    /// Combined verify-and-commit convenience.
-    ///
-    /// # Errors
-    ///
-    /// Same as [`Self::read`].
-    pub fn drain_one(&mut self) -> Result<(), ReadError> {
-        let record = self.read()?;
-        self.commit(record);
-        Ok(())
-    }
-
-    /// The durable log as of the last commit.
-    #[must_use]
-    pub fn committed(&self) -> &[JournalRecord] {
-        &self.log
-    }
-
     #[must_use]
     pub const fn expected_sequence(&self) -> u64 {
         self.expected_sequence
     }
+    #[must_use]
+    pub const fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+}
+
+pub trait DurableSink {
+    /// Writes some bytes to the sink.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying storage error.
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize>;
+    /// Makes all prior writes durable according to the sink contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying storage error.
+    fn flush(&mut self) -> io::Result<()>;
+}
+
+impl DurableSink for File {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        Write::write(self, bytes)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Write::flush(self)?;
+        self.sync_data()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FlushPolicy {
+    EveryBatch,
+    OnShutdown,
+}
+
+#[derive(Debug)]
+pub enum PersistError {
+    Read(ReadError),
+    Io(io::Error),
+    Poisoned,
+}
+
+pub struct PersistenceWorker<'queue, S, const BATCH: usize> {
+    reader: JournalReader<'queue>,
+    sink: S,
+    policy: FlushPolicy,
+    poisoned: bool,
+}
+
+impl<'queue, S: DurableSink, const BATCH: usize> PersistenceWorker<'queue, S, BATCH> {
+    /// Creates a persistence worker with a fixed stack batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidInput` when `BATCH` is zero.
+    pub fn new(reader: JournalReader<'queue>, sink: S, policy: FlushPolicy) -> io::Result<Self> {
+        if BATCH == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "journal batch must be nonzero",
+            ));
+        }
+        Ok(Self {
+            reader,
+            sink,
+            policy,
+            poisoned: false,
+        })
+    }
+    /// Persists at most `BATCH` records.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first validation or storage error and poisons the worker.
+    pub fn drain_batch(&mut self) -> Result<usize, PersistError> {
+        if self.poisoned {
+            return Err(PersistError::Poisoned);
+        }
+        let mut batch = [[0_u8; RECORD_SIZE]; BATCH];
+        let mut count = 0;
+        while count < BATCH {
+            match self.reader.read() {
+                Ok(record) => {
+                    batch[count] = record.0.encode();
+                    count += 1;
+                }
+                Err(ReadError::Empty) => break,
+                Err(error) => return self.fail(PersistError::Read(error)),
+            }
+        }
+        for record in &batch[..count] {
+            if let Err(error) = write_all(&mut self.sink, record) {
+                return self.fail(PersistError::Io(error));
+            }
+        }
+        if count != 0 && self.policy == FlushPolicy::EveryBatch {
+            if let Err(error) = self.sink.flush() {
+                return self.fail(PersistError::Io(error));
+            }
+        }
+        Ok(count)
+    }
+    /// Drains the queue and flushes the sink.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first validation or storage error.
+    pub fn shutdown(&mut self) -> Result<(), PersistError> {
+        loop {
+            if self.drain_batch()? == 0 {
+                break;
+            }
+        }
+        if let Err(error) = self.sink.flush() {
+            return self.fail(PersistError::Io(error));
+        }
+        Ok(())
+    }
+    /// Returns the sink only when no terminal error occurred.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Poisoned` after any persistence failure.
+    pub fn into_sink(self) -> Result<S, PersistError> {
+        if self.poisoned {
+            Err(PersistError::Poisoned)
+        } else {
+            Ok(self.sink)
+        }
+    }
+    fn fail<T>(&mut self, error: PersistError) -> Result<T, PersistError> {
+        self.poisoned = true;
+        Err(error)
+    }
+}
+
+fn write_all(sink: &mut impl DurableSink, mut bytes: &[u8]) -> io::Result<()> {
+    while !bytes.is_empty() {
+        match sink.write(bytes) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "journal write returned zero",
+                ));
+            }
+            Ok(written) if written <= bytes.len() => bytes = &bytes[written..],
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "journal sink returned an invalid write count",
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+pub enum RecoveryError {
+    Io(io::Error),
+    Truncated {
+        bytes: usize,
+    },
+    Decode {
+        offset: u64,
+        source: DecodeError,
+    },
+    Sequence {
+        expected: SequenceNumber,
+        received: SequenceNumber,
+    },
+    SequenceOverflow,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Recovery {
+    pub records: u64,
+    pub next_sequence: u64,
+}
+
+/// Scans a journal without accepting a corrupt or partial tail.
+///
+/// # Errors
+///
+/// Returns the first I/O, format, checksum, truncation, or sequence error.
+pub fn recover<R: Read>(reader: &mut R, first_sequence: u64) -> Result<Recovery, RecoveryError> {
+    let mut bytes = [0_u8; RECORD_SIZE];
+    let mut expected = first_sequence;
+    let mut records = 0_u64;
+    loop {
+        let mut filled = 0;
+        while filled < RECORD_SIZE {
+            match reader.read(&mut bytes[filled..]) {
+                Ok(0) if filled == 0 => {
+                    return Ok(Recovery {
+                        records,
+                        next_sequence: expected,
+                    });
+                }
+                Ok(0) => return Err(RecoveryError::Truncated { bytes: filled }),
+                Ok(read) => filled += read,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(RecoveryError::Io(error)),
+            }
+        }
+        let offset = records.saturating_mul(RECORD_SIZE as u64);
+        let record = JournalRecord::decode(&bytes)
+            .map_err(|source| RecoveryError::Decode { offset, source })?;
+        if record.sequence.0 != expected {
+            return Err(RecoveryError::Sequence {
+                expected: SequenceNumber(expected),
+                received: record.sequence,
+            });
+        }
+        expected = expected
+            .checked_add(1)
+            .ok_or(RecoveryError::SequenceOverflow)?;
+        records = records
+            .checked_add(1)
+            .ok_or(RecoveryError::SequenceOverflow)?;
+    }
+}
+
+/// Opens a file for append after a successful complete recovery scan.
+///
+/// # Errors
+///
+/// Returns the first open, scan, or seek error.
+pub fn open_append(path: &Path, first_sequence: u64) -> Result<(File, Recovery), RecoveryError> {
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .append(true)
+        .create(true)
+        .open(path)
+        .map_err(RecoveryError::Io)?;
+    file.seek(SeekFrom::Start(0)).map_err(RecoveryError::Io)?;
+    let recovery = recover(&mut file, first_sequence)?;
+    file.seek(SeekFrom::End(0)).map_err(RecoveryError::Io)?;
+    Ok((file, recovery))
 }

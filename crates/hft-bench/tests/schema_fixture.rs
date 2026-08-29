@@ -255,7 +255,7 @@ fn validate_record(line: &str, schema: &Schema) -> (String, String) {
         other => panic!("params must be an object, found {other:?}"),
     }
 
-    // Sample sanity: non-empty with ordered percentiles and zero allocation.
+    // Recovery runs off the hot path and reports its allocation cost.
     let (p50, p90, p99, p99_9, max) = (
         number(&record, "p50_ns"),
         number(&record, "p90_ns"),
@@ -268,8 +268,10 @@ fn validate_record(line: &str, schema: &Schema) -> (String, String) {
         p50 <= p90 && p90 <= p99 && p99 <= p99_9 && p99_9 <= max,
         "percentile order: {line}"
     );
-    assert_eq!(count(&record, "allocations"), 0, "allocations: {line}");
-    assert_eq!(count(&record, "deallocations"), 0, "deallocations: {line}");
+    if component != "recovery" {
+        assert_eq!(count(&record, "allocations"), 0, "allocations: {line}");
+        assert_eq!(count(&record, "deallocations"), 0, "deallocations: {line}");
+    }
 
     (component, scenario)
 }
@@ -318,6 +320,9 @@ fn suite_records_match_the_schema_fixture() {
         ("risk", "settle"),
         ("risk", "reject"),
         ("risk", "account_lookup"),
+        ("recovery", "canonical_snapshot_encode"),
+        ("recovery", "verified_snapshot_restore"),
+        ("recovery", "snapshot_tail_replay"),
     ];
     for (component_name, scenario_name) in expected {
         assert!(

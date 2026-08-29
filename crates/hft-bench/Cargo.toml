@@ -12,6 +12,7 @@ hft-gateway = { path = "../hft-gateway" }
 hft-io = { path = "../hft-io" }
 hft-model = { path = "../hft-model" }
 hft-risk = { path = "../hft-risk" }
+hft-recovery = { path = "../hft-recovery" }
 hft-journal = { path = "../hft-journal" }
 hft-session = { path = "../hft-session" }
 hft-spsc = { path = "../hft-spsc" }

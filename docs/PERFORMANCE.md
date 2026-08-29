@@ -1,522 +1,362 @@
-# Performance Methodology
+# Performance Evidence
 
-## Allocation Gate
+This document records what the benchmark suite measures and how to interpret
+the results. Every timing currently published here is a Windows desktop smoke
+result. No qualified Linux latency result exists yet.
 
-`hft-bench` initializes and warms the gateway, snapshots allocation and
-deallocation counters, processes 200,000 messages, then asserts both deltas are
-zero. Input frames and report storage are stack/preallocated values.
+## What Is Measured
 
-## Timing Smoke Harness
+`hft-bench` measures fixed in-memory operations and emits one JSON record per
+line using schema `hft-bench-results/1`. The suite covers:
 
-Every scenario runs a fixed warm-up (64 iterations, or the first 1,000 gateway
-messages) before any sample is recorded, so frequency ramp-up, first-touch
-stack pages, and branch training stay out of the reported distribution. Each
-scenario keeps its fixture in a steady state: every timed operation is balanced
-by an untimed operation that restores the starting book/risk shape, so sample
-1,900 measures the same workload as sample 1. Teardown (a replenishing rest or
-a cancel) is never inside the timed region.
+- packet parsing
+- gateway packet-to-report processing
+- cancellation at fixed book shapes
+- FIFO removal and fill at fixed depths
+- risk operations at fixed occupancy
+- price discovery and level creation
+- match-plan construction and application
+- IOC, FOK, post-only, and replace paths
+- SPSC push and pop traffic
+- session admission and retransmission
+- journal record creation, enqueue, verification, in-memory persistence, and recovery scanning
 
-All benches report p50, p90, p99, p99.9, max, and mean from sorted per-sample
-arrays. The mean is outlier-sensitive and reported only for continuity; the
-percentiles are the robust shape. On a shared desktop the maximum still
-captures occasional scheduler preemptions (tens of microseconds to ~1 ms); no
-harness change can remove those without core isolation, and none should try;
-the max is kept visible rather than trimmed. Per-sample `Instant` overhead is
-included throughout. This is useful for catching gross regressions, not
-establishing a service-level objective.
+Each record names its measurement boundary as component, gateway, or network.
+The current suite has component and gateway cells. It has no measured network
+path.
 
-The local smoke environment used Windows 11 Pro build 26200, an Intel N95 (four
-cores/four threads), about 16 GB RAM, Rust 1.96.0/LLVM 22.1.2, x86_64 MSVC,
-release fat LTO, one codegen unit, aborting panics, 100,000 order pairs, and
-2,000 per-message samples after one warm-up pair. Five consecutive runs on
-2026-08-14 each processed 200,000 messages. Aggregate means were
-128/106/76/68/68 ns per message (76 ns median); p50 and p90 were 100 ns, median
-p99/p99.9 were 200/300 ns, and maxima ranged from 300 ns to 73.4 us. Every run
-reported queue maximum occupancy 64, one explicit backpressure event, a stable
-digest, and zero allocation and deallocation deltas. `Instant` resolution,
-sampling overhead, and an unisolated desktop scheduler dominate these figures;
-Windows results are intentionally not production latency claims.
+## What Is Not Measured
 
-## v0.2.0 Indexed Cancellation
+The published numbers do not include a NIC, kernel network stack, wire transit,
+production load balancer, durable journal write, filesystem flush, recovery
+scan, replication, or standby promotion. They are not end-to-end exchange
+latency and do not define a service objective.
 
-The cancellation harness compares v0.1.0's linear whole-book search with
-v0.2.0's fixed-capacity open-addressed index. Each run constructs 1,024 fresh
-books. Each book contains 512 sell price levels with one order per level, then
-cancels all orders from highest to lowest price. Setup is outside the timed
-region, leaving 524,288 measured cancellations per run. The first run is
-discarded as warm-up and the table reports the median of the next seven.
+Windows desktop results include timer quantization, scheduler preemption,
+frequency changes, and background work. They are useful for finding large
+regressions and invalid workloads. They are not dedicated hardware evidence.
 
-| Metric | v0.1.0 linear scan | v0.2.0 indexed | Difference |
-| --- | ---: | ---: | ---: |
-| Median timed duration | 696.869 ms | 13.871 ms | 98.0% lower |
-| Median latency | 1,329 ns/cancel | 26 ns/cancel | 98.0% lower |
-| Median throughput | 752,347 cancels/s | 37,796,329 cancels/s | 50.2x |
-| Allocation / deallocation delta | 0 / 0 | 0 / 0 | Unchanged |
-| `OrderBook<512, 1>` size | 65,544 bytes | 131,080 bytes | +65,536 bytes |
+## Methodology
 
-Command: `cargo build --release -p hft-bench`, followed by eight direct runs of
-`target/release/hft-bench.exe` for each implementation. The baseline was commit
-`1b3cf4b`; the indexed result used the v0.2.0 release candidate. Environment:
-Intel N95, Windows 11 Pro build 26200, Rust 1.96.0/LLVM 22.1.2,
-`x86_64-pc-windows-msvc`, fat LTO, one codegen unit, and aborting panics.
+The release profile uses fat LTO, one codegen unit, and aborting panics. Most
+component cells record individual operations with `Instant`. Per-sample timer
+cost is included.
 
-The result isolates in-memory lookup and cancellation. It excludes book setup,
-wire parsing, risk, the gateway, kernel, NIC, and network transit. The index
-removes the whole-book scan at the cost of 64 KiB for this book shape. A cancel
-can still shift later orders within its price level; v0.3.0 will address that
-separately. Desktop scheduling and frequency changes remain sources of noise.
+Each workload warms its fixture before sampling. Destructive operations use an
+untimed repair step so later samples measure the same state as earlier samples.
+The gateway skips its first 1,000 messages before recording samples.
 
-## v0.3.0 Stable-Slot FIFO Levels
+The reporter records sample count, mean, p50, p90, p99, p99.9, max, throughput,
+allocation deltas, workload parameters, and a checksum. The maximum is not
+trimmed. On the desktop it often records scheduler interference rather than
+engine work.
 
-The FIFO harness compares v0.2.0's dense array levels (shift on removal) with
-v0.3.0's intrusive doubly linked levels (head, tail, free-list, stable slot
-handles). Each cell rebuilds a fresh single-level book of the stated depth
-2,000 times and times one operation per rebuild, keeping setup outside the
-timed region. The table reports p50 of the 2,000 samples; per-sample
-`Instant` overhead is included and quantizes readings to 100 ns on this
-desktop.
+The benchmark process uses a counting allocator. It snapshots allocation and
+deallocation counters around each declared measured region and fails if either
+counter changes. Fixtures, sample arrays, input frames, and report storage are
+created before the allocation gate.
 
-| Scenario | Depth | v0.2.0 array p50 | v0.3.0 stable-slot p50 |
-| --- | ---: | ---: | ---: |
-| Head cancel | 1 | 100 ns | 100 ns |
-| Head cancel | 4 | 200 ns | 100 ns |
-| Head cancel | 16 | 300 ns | 100 ns |
-| Head cancel | 64 | 400 ns | 100 ns |
-| Head cancel | 512 | 3,300 ns | 100 ns |
-| Middle cancel | 1 | 100 ns | 100 ns |
-| Middle cancel | 4 | 100 ns | 100 ns |
-| Middle cancel | 16 | 100 ns | 100 ns |
-| Middle cancel | 64 | 400 ns | 100 ns |
-| Middle cancel | 512 | 1,400 ns | 100 ns |
-| Tail cancel | 1 | 100 ns | 100 ns |
-| Tail cancel | 4 | 100 ns | 100 ns |
-| Tail cancel | 16 | 200 ns | 100 ns |
-| Tail cancel | 64 | 100 ns | 100 ns |
-| Tail cancel | 512 | 100 ns | 100 ns |
-| Head fill | 1 | 100 ns | 100 ns |
-| Head fill | 4 | 200 ns | 100 ns |
-| Head fill | 16 | 100 ns | 100 ns |
-| Head fill | 64 | 600 ns | 100 ns |
-| Head fill | 512 | 3,100 ns | 100 ns |
+Workload checksums prevent dead-code removal and catch logical drift. Timing
+alone is never accepted as proof that a workload exercised its named path.
 
-Allocation and deallocation deltas were zero in every cell of both
-implementations, and the standard 200,000-message gateway workload produced
-the identical logical digest `64321af91735b704` before and after. Depth-512
-throughput rose from 219,365 to 12,453,300 head cancels/s and from 229,578 to
-7,125,044 head fills/s (mean-of-samples basis).
+## Reference Environments
 
-Memory cost: `OrderBook<1, 512>` grew from 114,728 to 131,160 bytes (+14%)
-and the v0.2.0 shape `OrderBook<512, 1>` from 131,080 to 172,040 bytes
-(+31%); each slot now carries `prev`/`next` links and a live/free tag. The
-v0.2.0 depth-one cancellation shape regressed from 26 ns to 41 ns mean per
-cancel (37.3M to 23.9M cancels/s): unlinking relinks two pointers where a
-one-element shift was free. Branch and cache-miss counters require the
-dedicated Linux protocol; Windows desktop timing remains non-production
-evidence.
+### Windows desktop smoke environment
 
-Command: `cargo build --release -p hft-bench`, direct runs of
-`target/release/hft-bench.exe`. Environment: Intel N95, Windows 11 Pro build
-26200, Rust 1.96.0/LLVM 22.1.2, `x86_64-pc-windows-msvc`, fat LTO, one
-codegen unit, aborting panics. Depths 1, 4, 16, 64, and the 512-order
-maximum; 2,000 samples per cell; p50/p90/p99/p99.9/max recorded for every
-cell.
+The recorded reference environment is:
 
-## v0.4.0 Indexed Risk State
+- Intel N95 with four cores and four threads
+- Windows 11 Pro build 26200
+- about 16 GB RAM
+- Rust 1.96.0 with LLVM 22.1.2
+- `x86_64-pc-windows-msvc`
+- fat LTO
+- one codegen unit
+- aborting panics
 
-The risk harness compares v0.3.0's linear-scan risk state with v0.4.0's
-fixed-capacity open-addressed indices for accounts and reservations. Each
-operation runs 256 timed samples against a `RiskEngine::<64, 1024>` at
-stated occupancy. Reservation occupancy sweeps are 102, 512, and 921 (Ã¢â€°Ë†10%,
-50%, 90% of capacity). Account occupancy sweeps are 6, 32, and 57 (Ã¢â€°Ë†10%,
-50%, 90% of capacity). All samples are timed with `Instant`; per-sample
-overhead is included.
+The desktop is shared and unisolated. `Instant` commonly quantizes short cells
+to 100 ns. Hardware performance counters were not collected.
 
-| Operation | Occupancy | v0.3.0 linear mean | v0.4.0 indexed mean | Change |
-| --- | ---: | ---: | ---: | ---: |
-| risk_check | 102 | 190 ns | 79 ns | 2.4x |
-| risk_check | 512 | 1,196 ns | 79 ns | 15.1x |
-| risk_check | 921 | 1,631 ns | 65 ns | 25.1x |
-| reservation_lookup | 102 | 166 ns | 137 ns | 1.2x |
-| reservation_lookup | 512 | 635 ns | 52 ns | 12.2x |
-| reservation_lookup | 921 | 1,081 ns | 50 ns | 21.6x |
-| fill | 102 | 160 ns | 182 ns | ~same |
-| fill | 512 | 644 ns | 71 ns | 9.1x |
-| fill | 921 | 2,033 ns | 71 ns | 28.6x |
-| cancel | 102 | 322 ns | 61 ns | 5.3x |
-| cancel | 512 | 1,367 ns | 54 ns | 25.3x |
-| cancel | 921 | 2,892 ns | 55 ns | 52.6x |
-| settle | 102 | 171 ns | 95 ns | 1.8x |
-| settle | 512 | 617 ns | 255 ns | 2.4x |
-| settle | 921 | 1,017 ns | 55 ns | 18.5x |
-| reject | 102 | 164 ns | 67 ns | 2.4x |
-| reject | 512 | 644 ns | 63 ns | 10.2x |
-| reject | 921 | 1,323 ns | 61 ns | 21.7x |
-| account_lookup | 6 | 94 ns | 56 ns | 1.7x |
-| account_lookup | 32 | 121 ns | 54 ns | 2.2x |
-| account_lookup | 57 | 150 ns | 54 ns | 2.8x |
+The v0.16 journal audit also ran on a Lenovo 83J3 with an AMD Ryzen 7 7735HS,
+8 cores, 16 threads, 29.3 GB RAM, Windows 11 Home build 26200, Rust 1.96.0,
+and LLVM 22.1.2. Hyper-V was active. These results are desktop smoke evidence.
 
-The indexed implementation adds no measurable allocation at any occupancy.
-The gateway 200,000-message workload produced the identical logical digest
-`64321af91735b704`. Memory cost: `RiskEngine::<64, 1024>` grew from 25,632
-bytes (linear arrays + no index overhead) to 93,216 bytes (doubled probe
-planes + `ReservationSlot` enum + free-list). The 67 KiB increase is
-preallocated and fixed; the O(1) lookup removes the occupancy-proportional
-scan at 90% reservation occupancy.
+### Qualified Linux environment
 
-Command: `cargo build --release -p hft-bench`, direct runs of
-`target/release/hft-bench.exe`. Environment: Intel N95, Windows 11 Pro build
-26200, Rust 1.96.0/LLVM 22.1.2, `x86_64-pc-windows-msvc`, fat LTO, one
-codegen unit, aborting panics. 256 samples per operation; mean and max
-recorded. Desktop scheduling and frequency changes remain sources of noise.
+No environment has qualified yet. A result belongs in this section only when
+the host manifest records CPU, topology, SMT, NUMA placement, microcode, kernel,
+mitigations, governor, frequency behavior, isolated CPUs, process affinity, IRQ
+affinity, memory, page size, huge pages, compiler, target flags, linker, LTO,
+codegen units, workload, seed, sample count, capacity, and batch size.
 
-Correction (v0.6.0): the v0.4.0 harness closed its reservations in the fill
-loop and then measured cancel and settle against those already-closed order
-IDs, so the v0.4.0 cancel/settle cells above recorded `UnknownOrder`
-rejections rather than live operations, and the occupancy-102 fill cell
-underflowed its ID arithmetic. The harness was fixed in v0.6.0 (freshly
-populated engine per operation, one live reservation per sample); the
-corrected absolute numbers are in the v0.6.0 section. The v0.3.0 linear-scan
-baseline column remains valid for the relative comparison.
+Docker can reproduce build and profiling tools. It does not make the host CPU
+isolated and does not turn a shared machine into dedicated hardware.
 
-## v0.5.0 Price-Level Discovery
+## Current Desktop Smoke Summary
 
-The price harness measures discovery latency across four book shapes: dense
-64-level/32-active, sparse 128/16, dense 128/64, and dense 128/120. Each
-scenario builds a book, populates ask levels, then times a single-unit buy
-submission that must locate the best ask. The `discovery` operation isolates the
-best-price path without clearing the book.
+This table keeps the strongest current reference results near the top. Values
+come from the documented Windows runs. Timer resolution limits comparisons
+between cells near 100 ns.
 
-| Operation | Scenario | Mean latency | Max latency |
-| --- | --- | ---: | ---: |
-| submit_cross | dense_64_32 | 64 ns | 900 ns |
-| discovery | dense_64_32 | 77 ns | 2,300 ns |
-| level_create | dense_64_32 | 119 ns | 800 ns |
-| submit_cross | sparse_128_16 | 62 ns | 700 ns |
-| discovery | sparse_128_16 | 76 ns | 800 ns |
-| level_create | sparse_128_16 | 228 ns | 20,900 ns |
-| submit_cross | dense_128_64 | 66 ns | 1,100 ns |
-| discovery | dense_128_64 | 86 ns | 10,900 ns |
-| level_create | dense_128_64 | 214 ns | 12,600 ns |
-| submit_cross | dense_128_120 | 72 ns | 1,900 ns |
-| discovery | dense_128_120 | 76 ns | 1,800 ns |
-| level_create | dense_128_120 | 217 ns | 13,600 ns |
+| Boundary | Workload | Desktop smoke result |
+| --- | --- | ---: |
+| Gateway | Pair rest and fill | 136 ns mean per message |
+| Gateway | Seeded mixed session | 231 ns mean per command |
+| Component | Indexed cancel, 512 levels | 49 ns median per cancel |
+| Component | SPSC push and pop walk | 43 ns mean |
+| Component | Post-only crossing check | 48 to 110 ns mean |
+| Component | Replace lifecycle | 48 to 93 ns mean |
+| Component | Session active admission | 144 ns mean |
+| Component | Session duplicate rejection | 41 ns mean |
+| Component | Journal enqueue on the current AMD host | 48 ns mean |
 
-Discovery latency is flat at 76-86 ns across all shapes, confirming O(1)
-best-price lookup via the sorted-level index. Level creation costs 119-228 ns
-(maintaining sort order on insert). Zero allocations in every cell. The gateway
-200,000-message workload produced the identical logical digest
+All listed cells reported zero allocation and deallocation deltas in their
+measured regions. The gateway pair workload retained digest
 `64321af91735b704`.
 
-Command: `cargo build --release -p hft-bench`, direct runs of
-`target/release/hft-bench.exe`. Environment: Intel N95, Windows 11 Pro build
-26200, Rust 1.96.0/LLVM 22.1.2, `x86_64-pc-windows-msvc`, fat LTO, one
-codegen unit, aborting panics. 2,000 samples per cell; mean and max recorded.
-Desktop scheduling and frequency changes remain sources of noise.
+## Matching and Cancellation
 
-## v0.6.0 Match-Plan Benchmark
+The current cancel path uses a fixed open-addressed order index and stable slot
+handles. The historical comparisons show why both changes remain in the design.
 
-The match-plan harness measures the full submit path (plan build, plan apply,
-and optional rest) across five scenarios on an `OrderBook<128, 8>` with an
-8-report buffer: a non-crossing taker that rests, a single-fill taker, a
-multi-fill taker crossing eight makers, a taker rejected by report capacity
-preflight, and a taker rejected for trying to rest into a full best-priced
-level. Each scenario times 2,000 submissions against a persistent book.
+| Change | Shape | Before | After | Fixed memory cost |
+| --- | --- | ---: | ---: | ---: |
+| Indexed order lookup | 512 levels, one order each | 1,329 ns median | 26 ns median | +65,536 bytes |
+| Stable-slot head cancel | one level, depth 512 | 3,300 ns p50 | 100 ns p50 | book shape +14% |
+| Stable-slot middle cancel | one level, depth 512 | 1,400 ns p50 | 100 ns p50 | included above |
+| Stable-slot head fill | one level, depth 512 | 3,100 ns p50 | 100 ns p50 | included above |
 
-| Scenario | Traversals | Mean latency | Max latency |
+These are Windows desktop smoke comparisons from v0.2 and v0.3. The indexed
+lookup run measured 524,288 cancellations after one discarded warmup run. The
+stable-slot cells used 2,000 samples per depth. Setup was outside the timed
+region. Stable slots made the depth-one cancel slightly slower and increased
+book size because each slot stores links and live state.
+
+The match-plan harness measures non-crossing rest, single fill, eight-level
+fill, report-capacity rejection, and full-level rejection. A later suite audit
+found that the original multi-fill fixture only crossed one maker. Results from
+that old cell are invalid. The corrected fixture asserts eight reports and
+restores makers outside the timed region.
+
+## Risk
+
+Fixed open-addressed indexes replaced occupancy-dependent account and
+reservation scans. The valid historical comparison is the lookup scaling. The
+original v0.4 fill, cancel, and settle cells are not retained as performance
+evidence because they reused closed reservation IDs and measured rejection.
+
+| Operation | Occupancy | Linear mean | Indexed mean |
 | --- | ---: | ---: | ---: |
-| non_crossing | 0 | 141 ns | 25,300 ns |
-| single_fill | 1 | 146 ns | 24,200 ns |
-| multi_fill | 8 | 115 ns | 3,800 ns |
-| report_full | 9 | 114 ns | 200 ns |
-| deep_rejection | 1 | 72 ns | 100 ns |
+| risk check | 102 | 190 ns | 79 ns |
+| risk check | 512 | 1,196 ns | 79 ns |
+| risk check | 921 | 1,631 ns | 65 ns |
+| reservation lookup | 102 | 166 ns | 137 ns |
+| reservation lookup | 512 | 635 ns | 52 ns |
+| reservation lookup | 921 | 1,081 ns | 50 ns |
+| account lookup | 6 | 94 ns | 56 ns |
+| account lookup | 32 | 121 ns | 54 ns |
+| account lookup | 57 | 150 ns | 54 ns |
 
-Report capacity and full-level rejections are preflighted, so the rejected
-cells mutate nothing and report zero fills. Zero allocations in every cell.
-The gateway 200,000-message workload produced the identical logical digest
-`64321af91735b704`.
+These are Windows desktop smoke means. `RiskEngine::<64, 1024>` grew from
+25,632 to 93,216 bytes. The added 67 KiB is fixed at construction. Corrected
+live fill, cancel, and settle cells later measured 69 to 150 ns mean across 10%
+to 90% reservation occupancy, with large run-to-run desktop variance.
 
-The v0.6.0 refactor also changed neighboring hot paths, and the same release
-run remeasured them:
+## Price Discovery
 
-| Benchmark | v0.5.0-era mean | v0.6.0 mean | Driver |
-| --- | ---: | ---: | --- |
-| cancel_bench (512 levels, 1 order each) | 546 ns | 56-89 ns | binary-search level removal |
-| price level_create (128 levels, 120 active) | 418 ns | 75-147 ns | indexed level allocation |
-| price discovery (128 levels, 120 active) | 145 ns | 73-157 ns | crossing walk stops at the price limit |
+The sorted level index keeps best-price discovery independent of active level
+count for the measured book shapes. A free-slot pool removed the remaining
+linear scan from level creation.
 
-For the risk harness (now measuring live operations after the correction
-above), fill, cancel, and settle each measured 69-150 ns mean at 10-90%
-reservation occupancy across runs; account lookup measured 103-114 ns mean.
-
-Run-to-run variance on this loaded desktop is large (scenario means shifted up
-to 2x between consecutive runs, and individual maxima reach hundreds of
-microseconds under scheduler interference). The first table reports the
-least-interfered cell across three consecutive runs; only zero-allocation
-deltas and the unchanged digest are treated as gates.
-
-Command: `cargo build --release -p hft-bench`, direct runs of
-`target/release/hft-bench.exe`. Environment: Intel N95, Windows 11 Pro build
-26200, Rust 1.96.0/LLVM 22.1.2, `x86_64-pc-windows-msvc`, fat LTO, one
-codegen unit, aborting panics. 2,000 samples per cell; mean and max recorded.
-Desktop scheduling and frequency changes remain sources of noise.
-
-## v0.6.1 Benchmark Harness Hardening
-
-The harness itself was audited and reworked; the engine is unchanged.
-
-- Every scenario runs a fixed warm-up (64 iterations; the gateway loop skips
-  sampling its first 1,000 messages) so frequency ramp-up, first-touch stack
-  pages, and branch training stay out of the reported distribution. The gateway
-  message sequence is unchanged, so the final digest stays comparable.
-- Every scenario now holds its fixture in a steady state: each timed operation
-  is balanced by an untimed teardown (a replenishing rest or a cancel) that
-  restores the starting shape. Previously `submit_cross` depleted all makers
-  after `active` samples and then measured resting rejections, `level_create`
-  filled the book after ~120 samples and then measured
-  `PriceLevelCapacity` rejections, and the gateway loop sampled its coldest
-  first iterations.
-- `risk_check` at 921 occupancy now budgets samples against the remaining
-  order capacity (78 samples; the monotonic-ID rule forbids reuse), instead of
-  silently measuring `OrderCapacity` rejections past slot 1,024.
-- All benches report p50/p90/p99/p99.9/max alongside the mean. The mean is
-  outlier-sensitive; the percentiles are the robust shape. The maximum is kept
-  visible: on this shared desktop it captures occasional scheduler preemptions
-  (single samples of 10 us-1 ms) that no harness change can remove without core
-  isolation.
-
-Representative run (Intel N95, Windows 11 Pro build 26200, Rust 1.96.0/LLVM
-22.1.2, `x86_64-pc-windows-msvc`, fat LTO, one codegen unit, aborting panics;
-2,000 samples per book cell, 256 per risk cell):
-
-| Workload | p50 | p90 | p99 | p99.9 | Mean |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Gateway packet-to-report (200,000 messages) | 300 ns | 400 ns | 400 ns | 400 ns | 194 ns/msg |
-| Indexed cancel, 512-level book | n/a | n/a | n/a | n/a | 63-90 ns/cancel |
-| risk_check / fill / cancel / settle, 90% reservation occupancy | 100-200 ns | 200 ns | 200 ns | 200-300 ns | 125-144 ns |
-| Account lookup, 90% account occupancy | 100 ns | 100 ns | 200 ns | 200 ns | 101 ns |
-| Best-price discovery, 120 active levels | 100 ns | 200 ns | 200 ns | 200 ns | 110 ns |
-| Level create + remove steady state, 120 active levels | 100 ns | 200 ns | 200 ns | 200 ns | 135 ns |
-| Submit crossing one level, 120 active levels | 200 ns | 300 ns | 300 ns | 300 ns | 248 ns |
-| Match plan: non-crossing rest | 200 ns | 200 ns | 300 ns | 900 ns | 314 ns |
-| Match plan: single fill | 200 ns | 200 ns | 300 ns | 400 ns | 215 ns |
-| Match plan: 8-level multi-fill | 200 ns | 200 ns | 300 ns | 300 ns | 206 ns |
-| Match plan: report-capacity rejection | 200 ns | 200 ns | 300 ns | 300 ns | 273 ns |
-| Match plan: full-level rejection | 100 ns | 200 ns | 200 ns | 200 ns | 125 ns |
-
-All cells measured zero allocation and deallocation deltas, and the gateway
-workload produced the unchanged logical digest `64321af91735b704`. Where a
-range is shown, it spans consecutive runs on the noisy desktop; percentile
-shapes were stable across runs.
-
-Command: `cargo build --release -p hft-bench`, direct runs of
-`target/release/hft-bench.exe`. Environment: Intel N95, Windows 11 Pro build
-26200, Rust 1.96.0/LLVM 22.1.2, `x86_64-pc-windows-msvc`, fat LTO, one
-codegen unit, aborting panics. 2,000 samples per cell; mean and max recorded.
-Desktop scheduling and frequency changes remain sources of noise.
-
-## v0.7.0 Regression Check
-
-No engine changes; this release adds seeded property and reference-model test
-coverage. The full release suite was rerun on the same desktop environment:
-the gateway workload produced the unchanged logical digest
-`64321af91735b704`, queue occupancy 64 with one backpressure event, and zero
-allocation/deallocation deltas in every scenario.
-
-## v0.8.0 Reproducible Benchmark Suite
-
-The harness now prints one JSON record per line (`hft-bench-results/1`).
-Each record carries an explicit boundary (component, gateway, or network),
-samples, mean, p50/p90/p99/p99.9/max, ops/s, allocation and deallocation
-deltas, and a workload checksum. The schema fixture at
-`crates/hft-bench/tests/fixtures/bench_results.schema.json` is validated in
-CI against a reduced-suite run that also asserts roadmap workload coverage.
-Every scenario warms up untimed, keeps its fixture in a steady state, and
-fails on any allocation inside its measured region.
-
-New workloads: alternating new-order/cancel frame parsing, an SPSC push/pop
-random walk with occupancy high-water and backpressure counts, a seeded
-20,000-command mixed gateway session whose checksum is the final digest, and
-deep-book takers consuming 1/8/64 levels per sample with untimed replenish.
-Risk cells now emit real checksums instead of a constant.
-
-Two findings from validating this suite:
-
-- The multi-fill match-plan fixture had rested deep makers, so its taker
-  filled once at the best price while the output label claimed eight fills;
-  it now rests single-unit makers across eight levels with untimed
-  replenishment and asserts eight reports per taker. Pre-v0.8 numbers for
-  that cell are not comparable.
-- Long seeded sessions exposed a release-only engine defect: both
-  open-addressed indexes invoked their back-shift update closures inside
-  `debug_assert!`, so release binaries stranded moved handles, leaked index
-  entries until a table filled, then spun forever removing from it. The
-  closures now run unconditionally, with regression tests at the risk and
-  book levels. The first complete fixed run reproduces the pre-existing
-  gateway digest `64321af91735b704`.
-
-Representative full pass on the reference desktop: gateway pair-rest-fill
-mean 136 ns/message (2,000 samples), cancel sweep 512x1 median 49 ns/cancel,
-mixed seeded session mean 231 ns/command, deep-book traversal cost scaling
-with the cycled depth. Cycles, instructions, branch, and cache-miss counters
-are unavailable on this host and are deferred to the dedicated Linux
-qualification protocol below.
-
-## v0.9.0 IOC and FOK
-
-Protocol v2 adds a time-in-force byte to new orders; the engine gained IOC
-(never rests, remainder discarded and reported) and FOK (all-or-reject via
-plan preflight). The suite gained eight book-level cells comparing TIF paths
-on the same desktop environment:
-
-| Scenario | Mean | Note |
-| --- | ---: | --- |
-| ioc_empty | 90 ns | no crossing, zero fills |
-| ioc_partial | 116 ns | fills 3 of 5, discards rest |
-| ioc_full | 100 ns | equals gtc_full |
-| fok_reject | 60 ns | preflight reject, no mutation |
-| fok_single | 102 ns | single maker |
-| fok_multi | 334 ns | sweeps eight levels |
-| gtc_full | 101 ns | comparison cell |
-| gtc_partial_rests | 133 ns | rests remainder as a bid |
-
-FOK rejection is the cheapest path because the plan walk stops at the first
-shortfall without touching book or risk state. Every cell reports zero
-allocation deltas, and seeded property sessions now mix all three time-in-
-force values through the gateway/model equivalence, snapshot, and replay
-gates.
-## v0.10.0 Post-Only
-
-Post-only rejection uses the best-price entry of the sorted-level index, so
-the crossing check is O(1) regardless of book depth; a rejected order
-mutates nothing, and an accepted one rests through the normal GTC path. The
-suite gained four cells (2,000 samples each, same desktop environment):
-
-| Scenario | Levels | Mean |
+| Active shape | Discovery mean | Level create mean |
 | --- | ---: | ---: |
-| post_only_cross_shallow | 1 | 110 ns |
-| post_only_cross_deep | 64 | 48 ns |
-| post_only_noncross_shallow | 1 | 108 ns |
-| post_only_noncross_deep | 64 | 48 ns |
+| 32 of 64 levels | 77 ns | 119 ns |
+| 16 of 128 levels | 76 ns | 228 ns |
+| 64 of 128 levels | 86 ns | 214 ns |
+| 120 of 128 levels | 76 ns | 217 ns |
 
-Crossing rejects and resting submits both sit in the same low-100-ns band as
-their v0.9.0 GTC/IOC equivalents; the shallow/deep spread is within this
-host's run-to-run jitter rather than a depth cost, since both paths touch
-only the first sorted entry. All cells report zero allocation deltas.
-Seeded property sessions now include post-only orders end to end.
+These are v0.5 Windows desktop smoke means with 2,000 samples per cell. Later
+steady-state runs measured 73 to 157 ns for discovery and 75 to 147 ns for
+level creation. The wide ranges are kept because the host was not isolated.
 
-## v0.11.0 Replace Lifecycle
+## Gateway and Wire Parsing
 
-Protocol type 3 adds owned replaces. Same-price quantity reductions patch the
-resting slot in place (priority kept); price changes and increases remove and
-re-add at the destination tail after a capacity preflight, and any repriced
-order that would cross rejects before mutation. Risk reservations adjust
-first and are restored exactly on book rejection.
+The gateway packet-to-report cell parses two fixed frames, enforces session
+sequence, applies risk, matches, writes reports, and updates the stable digest.
+It excludes kernel and network work.
 
-Book-side cells time `OrderBook::replace` on a fresh one-maker fixture per
-sample; the risk cell times `RiskEngine::adjust_reservation` alternating
-between two fixed totals (2,000 samples each, same desktop environment):
+A five-run Windows smoke set processed 200,000 messages per run. Reported means
+were 128, 106, 76, 68, and 68 ns per message. Median p50 and p90 were 100 ns.
+Median p99 and p99.9 were 200 and 300 ns. Maxima ranged from 300 ns to 73.4 us.
+Every run recorded zero allocation deltas, queue occupancy 64, one explicit
+backpressure event, and the same digest.
 
-| Scenario | Mean |
-| --- | ---: |
-| replace_reduce | 48 ns |
-| replace_increase | 93 ns |
-| replace_reprice | 89 ns |
-| replace_reject_unknown | 86 ns |
-| replace_risk_adjust (risk only) | 56 ns |
+The reproducible suite later added alternating new-order and cancel parsing, a
+20,000-command seeded gateway mix, and deep-book takers that cross 1, 8, or 64
+levels. Each cell records a checksum and asserts the expected work.
 
-In-place reductions are roughly half the cost of priority-losing moves, and
-the isolated risk adjustment shows the reservation side is comparable to a
-cancel release. All cells report zero allocation deltas; seeded property
-sessions now include replaces with per-step model equivalence, snapshot
-invariants, and replay equality over the full byte stream.
+## Order Policies and Replace
 
-## v0.12.0 SPSC Loom Coverage and Miri Qualification
+All values below are Windows desktop smoke means.
 
-The queue's atomics and slot cells now swap to Loom primitives under
-`--features loom`, so the shipped algorithm itself runs inside the model;
-the previous stand-in `ModelQueue` test was deleted. Two actual-algorithm
-Loom tests run in CI: a capacity-two FIFO handoff across every
-publication/consumption interleaving (~22 s of schedule enumeration), and a
-capacity-one backpressure/wrap scenario proving the rejected payload is
-returned bit-intact.
+| Area | Scenario | Mean |
+| --- | --- | ---: |
+| IOC | empty book | 90 ns |
+| IOC | partial fill | 116 ns |
+| FOK | preflight rejection | 60 ns |
+| FOK | eight-level fill | 334 ns |
+| Post-only | crossing check | 48 to 110 ns |
+| Post-only | non-crossing rest | 48 to 108 ns |
+| Replace | reduce in place | 48 ns |
+| Replace | increase | 93 ns |
+| Replace | reprice | 89 ns |
+| Replace | unknown order rejection | 86 ns |
+| Risk | reservation adjustment | 56 ns |
 
-Miri now covers the whole crate (`cargo miri test -p hft-spsc`, CI),
-including the 10,000-value cross-thread transfer reduced to 100 iterations
-under Miri and the seeded lossless schedules reduced to 64 steps. As
-evidence that ordering is enforced, weakening the tail publication to
-`Relaxed` makes Miri report `Data race detected ... MaybeUninit<u64>`
-immediately, while the same build stays logically correct under Loom
-(Loom checks protocol-level races on its own primitives, not plain-memory
-visibility).
+IOC never rests its remainder. FOK preflights full execution before mutation.
+Post-only checks crossing without walking all levels. Replace reductions keep
+priority. Increases and price changes remove and reinsert the order.
 
-No engine code changed in this release other than extracting the shared
-`push_impl`/`pop_impl` cores used by both the endpoints and the Loom tests.
-The SPSC benchmark cell is unchanged within noise before/after the refactor:
+## SPSC
 
-| push_pop_walk | Before | After |
-| --- | ---: | ---: |
-| mean | 43 ns | 43 ns |
-| max occupancy | 85 | 85 |
-| backpressure events | 0 | 0 |
-| allocations / deallocations | 0 / 0 | 0 / 0 |
-## v0.14.0 Session State Machine
+The queue benchmark runs a seeded push and pop walk and records occupancy and
+backpressure. The Windows smoke mean remained 43 ns before and after the Loom
+test refactor. Maximum occupancy was 85, with no backpressure in that workload
+and zero allocation deltas.
 
-The new `hft-session` crate owns the connection lifecycle (disconnected,
-connecting, logon, active, recovering, logout, failed) with a deterministic
-virtual clock: every deadline check takes `now` from the caller. Commands
-are admitted only in Active or Recovering; gaps and duplicates fail closed
-without touching state, sequence, or timers; a heartbeat timeout drops to
-Recovering with a second window armed, and a second consecutive timeout
-fails the session.
+Loom runs the shipped queue algorithm across publication, consumption,
+wraparound, and full-queue interleavings. Miri covers the crate with reduced
+iteration counts. Weakening Release publication makes Miri report a data race.
+These checks support the memory-ordering argument. They are not latency tests.
 
-Benchmark cells time session-plus-gateway end to end against the gateway
-baseline on the reference desktop:
+## Session and Recovery Window
 
-| Scenario | Mean |
-| --- | ---: |
-| session_active_admission (session + gateway frame) | 144 ns |
-| session_active_rejection (duplicate refused pre-gateway) | 41 ns |
+The session cells time active admission through the gateway and duplicate
+rejection before the gateway. Windows desktop smoke means were 144 ns and
+41 ns. Both measured zero allocation deltas.
 
-Admission costs roughly one gateway frame plus a sequence compare; refusal
-is about a third of that because the matching core is never touched. Both
-cells report zero allocation deltas.
+The retransmission benchmark retains accepted frames in a bounded window,
+confirms a prefix outside the timed region, then times refill and replay of the
+remaining suffix. It measures in-memory session recovery. It does not measure a
+durable journal restart.
 
-## v0.15.0 Session Recovery
+## Journal
 
-A bounded retransmission buffer (`hft_session::retransmit`) retains accepted
-frames in order; confirmation drops the confirmed prefix, and recovery
-replays exactly the retained suffix. Exhaustion is an explicit error. The
-suite gained a `recovery_window` cell (2,000 samples): each sample confirms
-roughly half the window untimed, then times a refill-plus-replay burst over
-the retained frames on the same reference desktop. All cells report zero
-allocation deltas, and the deterministic timeout test proves a delayed or
-duplicated input cannot re-execute a confirmed command.
+The journal uses a 64-byte versioned record with a sequence, payload length,
+CRC32C, and fixed payload storage. The matching side creates the record and
+publishes it to a bounded SPSC queue. Persistence runs on the consumer side.
+`EveryBatch` calls `sync_data` after each nonempty batch. `OnShutdown` defers
+that call until clean shutdown.
 
-## v0.16.0 Bounded Command Journal
+The current AMD Windows smoke run used SSE4.2 CRC32C. Every cell below recorded
+zero allocation and deallocation deltas.
 
-The `hft-journal` crate adds versioned accepted-command records with FNV-1a
-checksums, handed through the audited SPSC ring. Two cells on the reference
-desktop:
+| Component cell | Samples | Mean | p50 | p90 | p99 | p99.9 | Max |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Previous FNV-derived checksum | 2,000 | 50 ns | 100 ns | 100 ns | 100 ns | 100 ns | 100 ns |
+| Selected CRC32C checksum | 2,000 | 38 ns | 0 ns | 100 ns | 100 ns | 100 ns | 100 ns |
+| Complete record creation | 2,000 | 51 ns | 100 ns | 100 ns | 100 ns | 100 ns | 200 ns |
+| Record verification | 2,000 | 44 ns | 0 ns | 100 ns | 100 ns | 100 ns | 100 ns |
+| Enqueue | 2,000 | 48 ns | 0 ns | 100 ns | 100 ns | 100 ns | 100 ns |
+| In-memory persistence, batch 1 | 1,023 | 62 ns/record | 100 ns | 100 ns | 100 ns | 100 ns | 100 ns |
+| In-memory persistence, batch 8 | 127 | 33 ns/record | 37 ns | 37 ns | 37 ns | 37 ns | 37 ns |
+| In-memory persistence, batch 32 | 31 | 32 ns/record | 31 ns | 34 ns | 37 ns | 37 ns | 37 ns |
+| Recovery scan, 512 records | 2,000 | 23 ns/record | 23 ns | 23 ns | 24 ns | 34 ns | 37 ns |
+| Full-queue refusal | 2,000 | 45 ns | 0 ns | 100 ns | 100 ns | 100 ns | 100 ns |
 
-| Scenario | Mean | Note |
-| --- | ---: | --- |
-| journal_enqueue (matching side) | 147 ns | checksum + ring push |
-| journal_drain (persistence side, batch of 8) | 2227 ns/batch = 278 ns/record | verify + commit |
+The CRC comparison includes function dispatch and the complete covered byte
+range. It does not justify a claim below the desktop timer resolution. The
+selected CRC was still faster in the mean on this run and has standard error
+detection behavior.
 
-Both cells report zero allocation deltas inside their measured regions.
-Crash-point fixtures prove exactly-once semantics across restart seams;
-corruption and truncation fail closed without advancing the committed log.
-## Dedicated Linux Protocol
+The persistence batch cells use a fixed in-memory sink. They measure record
+verification, encoding, batching, and sink copies. They do not measure disk or
+flush latency. No filesystem timing is published. File recovery, short writes,
+flush failures, corrupt tails, truncated tails, duplicates, and gaps are
+correctness fixtures only.
 
-Record all of the following with each result:
+## Allocation Policy
 
-- CPU model/microcode, memory speed, NIC/firmware, topology, and NUMA placement.
-- Kernel, mitigations, IRQ routing, isolated CPUs, affinity, and CPU governor.
-- Rust/compiler revision, target CPU flags, linker, LTO, and codegen units.
-- Backend, ring sizes, batch size, prefault/mlock/hugepage settings, warm-up,
-  sample count, and offered load.
-- Throughput, p50/p90/p99/p99.9/max, queue occupancy/backpressure, branch and
-  cache misses, context switches, page faults, and allocation deltas.
+Zero allocation means zero measured heap allocation and deallocation after
+fixture construction and warmup for the named benchmark boundary. It does not
+mean that process startup, benchmark setup, persistence, or every library API
+is allocation-free.
 
-Use `perf stat`/`perf record` on pinned Linux cores. CI hosted-runner latency is
-informational and must never block a release.
+Fixed storage makes memory costs explicit. Index planes, stable slot links,
+report buffers, retransmission windows, and SPSC slots consume memory before
+the measured path starts. Performance comparisons report those costs when the
+layout changed.
+
+## Historical Changes
+
+| Release | Change | Evidence outcome |
+| --- | --- | --- |
+| v0.2 | Order ID index | 1,329 to 26 ns median cancel at 512 levels |
+| v0.3 | Stable FIFO slots | Depth-512 head cancel 3,300 to 100 ns p50 |
+| v0.4 | Risk indexes | Lookup stopped scaling linearly with occupancy |
+| v0.5 | Sorted price index | 76 to 86 ns discovery across tested shapes |
+| v0.6 | Match preflight and indexed level lifecycle | Rejection became mutation-free |
+| v0.6.1 | Warmup and steady-state repair | Removed cold and depleted fixture samples |
+| v0.8 | JSON suite and workload checksums | Found an invalid multi-fill fixture and a release-only index defect |
+| v0.9 | IOC and FOK | Added policy-specific component cells |
+| v0.10 | Post-only | Added shallow and deep crossing checks |
+| v0.11 | Replace | Split reduce, increase, reprice, rejection, and risk work |
+| v0.12 | Shipped-algorithm Loom tests | Queue smoke mean stayed at 43 ns |
+| v0.14 | Session state machine | Split active admission from early rejection |
+| v0.15 | Retransmission window | Added bounded in-memory replay workload |
+| v0.16 | Bounded command journal | Added versioned records, persistence, recovery, and fault fixtures |
+
+Historical absolute timings are desktop smoke evidence. Changes to fixtures or
+measurement boundaries make some cells unsuitable for direct comparison. The
+invalid v0.4 destructive risk cells and pre-v0.8 multi-fill result are retained
+only as benchmark mistakes, not performance results.
+
+## Known Limitations
+
+- No qualified Linux host result exists.
+- No hardware counter data is published.
+- No network benchmark is published.
+- `Instant` resolution is close to many component timings.
+- The Windows host is shared and unisolated.
+- Journal filesystem write and flush latency is not measured.
+- Means from different historical harness versions are not always comparable.
+- Maximum latency on the desktop often reflects scheduler interference.
+
+## Reproduction
+
+Run the full release suite:
+
+```text
+cargo run --release -p hft-bench
+```
+
+Run the reduced schema and allocation smoke test:
+
+```text
+cargo test -p hft-bench --test suite_smoke
+cargo test -p hft-bench --test schema_fixture
+```
+
+Before recording results, run the repository validation commands:
+
+```text
+cargo fmt --all --check
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
+```
+
+A Linux qualification run must capture the environment beside the raw JSON and
+use pinned benchmark processes. Collect cycles, instructions, branches, branch
+misses, cache references, cache misses, context switches, CPU migrations, and
+page faults with `perf stat`. Use `perf record` for profile evidence. Do not
+publish container timings as dedicated host results.
+
+The checked qualification tooling is under `scripts/linux`:
+
+```text
+scripts/linux/capture_environment.sh results/environment.txt
+scripts/linux/check_qualification.sh --cpu 4
+scripts/linux/run_qualification.sh --cpu 4 --output results
+docker build -f scripts/linux/Dockerfile -t hft-linux-tooling .
+```

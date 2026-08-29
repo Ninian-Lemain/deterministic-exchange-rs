@@ -242,15 +242,17 @@ sequence, confirmation is idempotent, and benchmark cells cover active
 traffic, heartbeat keep-alive, gap entry with refill bursts, and full-
 retention replay.
 
-## Next
-
 ### v0.16.0 - Bounded Command Journal
 
-Dependencies met (v0.12/v0.15). Versioned accepted-command records with
-sequence/checksum, bounded SPSC persistence handoff, flush policy, and
-explicit backpressure. Records occur once and in order; corruption,
-truncation, and saturation fail closed; the matching thread performs no
-storage syscall. Exit: crash-point fixtures and allocation checks pass.
+A 64-byte versioned command record carries its sequence, payload length, and
+CRC32C. The matching side only builds and publishes records through the bounded
+SPSC queue. The persistence worker owns storage writes, fixed-size batching,
+short-write handling, and `EveryBatch` or `OnShutdown` flush policy. Storage or
+validation failure poisons the worker. Recovery rejects corrupt, truncated,
+duplicate, missing, unsupported, or out-of-order records. Crash fixtures scan
+encoded prefixes and partial tails. Matching-side record creation, checksum,
+enqueue, verification, batching, recovery, and saturation cells check allocation
+deltas.
 
 ## Waiting on dedicated hardware
 
@@ -258,7 +260,10 @@ storage syscall. Exit: crash-point fixtures and allocation checks pass.
 
 Requires a dedicated Linux host (pinned CPU, governor, isolation, IRQs) so
 `perf` counters and an environment manifest can be published as raw evidence.
-Cannot be produced from a shared desktop; nothing below depends on it.
+The scripts under `scripts/linux` capture the environment, reject unsuitable
+hosts, pin CPU and NUMA placement, collect perf data, and hash raw results.
+This Windows laptop and Docker Desktop do not qualify. Nothing below depends on
+v0.13.
 
 ## Planned Reliability
 

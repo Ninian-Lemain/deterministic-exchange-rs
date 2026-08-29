@@ -131,3 +131,17 @@ session, replay, and journal code forbid unsafe Rust.
 
 Keeping these boundaries small makes the invariants testable. It also keeps
 Miri, sanitizer runs, and the unsafe allowlist focused on code that needs them.
+
+## Snapshots Store Logical State
+
+Copying fixed-capacity arenas would preserve slot placement, tombstones, and
+free-list history. Those details are not part of exchange state. The snapshot
+stores accounts, reservations, price levels, and FIFO orders in canonical
+order. Restore validates those records and rebuilds indexes and free lists.
+Two engines with the same logical state therefore produce the same bytes even
+when their allocation histories differ.
+
+The snapshot sequence is the boundary between state and the journal tail.
+Recovery accepts only the next journal sequence and checks that each record
+matches the sequence inside its wire payload. Rejected business commands still
+consume a valid sequence. Corrupt framing and sequence errors stop recovery.

@@ -21,11 +21,20 @@ Inbound work crosses cores only as a normalized fixed-size SPSC value.
 
 ## Recovery Boundary
 
-The current replay engine proves deterministic in-process state evolution but
-does not yet provide durable journal/snapshot recovery or a retransmission
-protocol. A production adapter must stop order admission on sequence loss,
-obtain authoritative recovery data, replay it, verify the state digest, and only
-then reopen the shard.
+`hft-recovery` restores a versioned snapshot and a contiguous journal tail.
+The snapshot stores logical gateway, risk, and book state with its capacity
+shape, applied sequence, and SHA-256 digest. Restore rejects corrupt,
+truncated, unsupported, noncanonical, or capacity-incompatible state. Tail
+replay rejects overlap, gaps, partial records, corrupt records, and a mismatch
+between the journal sequence and wire payload sequence.
+
+Snapshot publication accepts only a new generation path. It syncs the file and,
+on Unix, its parent directory. The API distinguishes failure before publication
+from failure after the destination became visible. The repository does not yet
+provide generation naming, manifest replacement, snapshot retention, or
+automatic selection of the latest valid snapshot. An adapter must stop order
+admission, select an authoritative snapshot and tail, restore them, verify the
+result, and only then reopen the shard.
 
 ## Linux Qualification Checklist
 

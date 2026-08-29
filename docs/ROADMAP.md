@@ -2,9 +2,8 @@
 
 ## Where the project is
 
-Implemented through **v0.16.0**. The next committed milestone is
-**v0.17.0 - Recovery and State Integrity**; it requires v0.16 which is now
-shipped.
+Implemented through **v0.17.0**. The next committed milestone is
+**v0.18.0 Bounded Events**.
 
 Waiting on external prerequisites:
 
@@ -267,13 +266,14 @@ v0.13.
 
 ## Planned Reliability
 
-### v0.17.0 - Recovery and State Integrity
+### v0.17.0 Recovery and State Integrity
 
-Requires v0.16. Canonical versioned state, snapshot plus journal tail,
-compatibility fixtures, and strong off-hot-path hash; the fast 64-bit digest
-stays development-only. Full replay equals snapshot plus tail; canonical
-bytes are portable; corruption/version mismatch is rejected. Exit:
-crash/restart reproduces logical state and integrity value.
+Implemented. Book, risk, and gateway state export canonical logical records.
+The versioned big-endian snapshot uses SHA-256 integrity and records its
+capacity shape and applied sequence. Restore rebuilds indexes and free lists,
+then replays a contiguous journal tail. Compatibility fixtures fix the v1 byte
+format. Tests reject corruption, truncation, unsupported versions, capacity
+mismatch, noncanonical state, tail overlap, gaps, and payload sequence mismatch.
 
 ### v0.18.0 - Bounded Events
 

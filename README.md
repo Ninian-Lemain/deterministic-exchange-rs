@@ -11,7 +11,7 @@ RX frame lease -> lifetime-bound binary parsing -> session sequencing ->
 indexed pre-trade risk -> price-time matching/cancel -> execution reports ->
 replay digest.
 
-Current version: **v0.16.0** (v0.13 dedicated-Linux qualification pending hardware), under active development and not production
+Current version: **v0.17.0** (v0.13 dedicated-Linux qualification pending hardware), under active development and not production
 ready. The project implements exchange-infrastructure mechanics by hand:
 deterministic state transitions, fixed memory layouts, conservative
 pre-trade risk, explicit backpressure, price-time priority, session
@@ -160,6 +160,7 @@ the full inventory and native-boundary policy.
 | `hft-book` | Price-time matching: stable-slot FIFO levels, sorted-level indices, `OrderId` index, match plans | None |
 | `hft-gateway` | Transaction coordination and report accounting | None |
 | `hft-replay` | Ordered replay and stable final-state digest | None in engine |
+| `hft-recovery` | Canonical snapshots, SHA-256 verification, and journal tail restore | Cold path |
 | `hft-ffi` | Optional vendor C ABI ownership wrapper | Vendor-defined |
 | `hft-bench` | Allocation assertion and timing smoke harness | Zero measured delta |
 | `hft-cli` | Cold-path operational entry point | Out of scope |
@@ -234,7 +235,7 @@ single subsystem did. The full write-up is in
   invariants are now `debug_assert`/`expect` with the invariant named; stale
   external handles reject before any mutation.
 - **Honest scope beats impressive scope.** No venue certification, no
-  recovery journal, no kernel bypass. Naming those as roadmap items keeps
+  snapshot rotation policy, no kernel bypass. Naming those as roadmap items keeps
   the slice that does exist verifiable.
 
 ## Capability Matrix
@@ -250,6 +251,7 @@ single subsystem did. The full write-up is in
 | Sorted-level discovery | Implemented | O(1) best price; binary-search level maintenance; slot reuse |
 | Matching transaction plan | Implemented | Single plan traversal; preflighted atomic rejection; no rollback path |
 | Deterministic replay | Implemented | Stable final-state digest test |
+| Snapshot and journal recovery | Implemented | Canonical v1 fixture, SHA-256 verification, full replay equivalence |
 | Session sequence enforcement | Implemented | Duplicates/gaps fail closed without advancing |
 | Owner-authorized cancel | Implemented | FIFO-preserving removal and exact risk release |
 | Cache-aware SPSC | Implemented | Release/Acquire docs, stress test, Loom model |
@@ -261,9 +263,9 @@ single subsystem did. The full write-up is in
 
 ## Current Limitations
 
-- No external venue traffic, persistence, IOC/FOK/post-only/replace order
-  semantics, recovery journal, sequence retransmission protocol,
-  authentication, or venue-certified session protocol is implemented.
+- No external venue traffic, automatic snapshot rotation, snapshot manifest,
+  sequence retransmission protocol, authentication, or venue-certified session
+  protocol is implemented.
 - Order IDs are monotonically increasing per gateway session. Reuse and
   out-of-order IDs fail closed.
 - The book rejects when report, order, per-price FIFO, or price-level

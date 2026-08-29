@@ -20,6 +20,7 @@ line using schema `hft-bench-results/1`. The suite covers:
 - SPSC push and pop traffic
 - session admission and retransmission
 - journal record creation, enqueue, verification, in-memory persistence, and recovery scanning
+- canonical snapshot encoding, verified restore, and journal tail replay
 
 Each record names its measurement boundary as component, gateway, or network.
 The current suite has component and gateway cells. It has no measured network
@@ -28,8 +29,8 @@ path.
 ## What Is Not Measured
 
 The published numbers do not include a NIC, kernel network stack, wire transit,
-production load balancer, durable journal write, filesystem flush, recovery
-scan, replication, or standby promotion. They are not end-to-end exchange
+production load balancer, durable journal write, filesystem flush, snapshot
+publication, replication, or standby promotion. They are not end-to-end exchange
 latency and do not define a service objective.
 
 Windows desktop results include timer quantization, scheduler preemption,
@@ -51,10 +52,10 @@ allocation deltas, workload parameters, and a checksum. The maximum is not
 trimmed. On the desktop it often records scheduler interference rather than
 engine work.
 
-The benchmark process uses a counting allocator. It snapshots allocation and
-deallocation counters around each declared measured region and fails if either
-counter changes. Fixtures, sample arrays, input frames, and report storage are
-created before the allocation gate.
+The benchmark process uses a counting allocator. Hot-path cells fail if an
+allocation or deallocation occurs after warmup. Recovery is cold-path work, so
+its cells record allocation totals instead. Fixtures, sample arrays, input
+frames, and report storage are created before timing.
 
 Workload checksums prevent dead-code removal and catch logical drift. Timing
 alone is never accepted as proof that a workload exercised its named path.
@@ -109,10 +110,30 @@ between cells near 100 ns.
 | Component | Session active admission | 144 ns mean |
 | Component | Session duplicate rejection | 41 ns mean |
 | Component | Journal enqueue on the current AMD host | 48 ns mean |
+| Component | Snapshot encode on the current AMD host | 2.2 us p50 |
+| Component | Verified snapshot restore on the current AMD host | 5.5 us p50 |
+| Component | Snapshot plus eight-command tail on the current AMD host | 9.0 us p50 |
 
-All listed cells reported zero allocation and deallocation deltas in their
-measured regions. The gateway pair workload retained digest
-`64321af91735b704`.
+The hot-path cells reported zero allocation and deallocation deltas. The three
+recovery cells allocated 12, 4, and 8 times per sample respectively. The
+gateway pair workload retained digest `64321af91735b704`.
+
+## Snapshot Recovery
+
+The v0.17 recovery run used the current AMD Windows host described above with
+2,000 samples per cell. The gateway state occupied 37,824 bytes. Its canonical
+snapshot was 820 bytes and contained eight applied commands. Tail replay added
+eight 64-byte journal records.
+
+| Workload | Mean | p50 | p99 | p99.9 | Max | Allocations/sample |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Canonical snapshot encode | 2.188 us | 2.2 us | 2.3 us | 5.9 us | 17.1 us | 12 |
+| Verified snapshot restore | 5.501 us | 5.5 us | 5.8 us | 11.5 us | 24.5 us | 4 |
+| Snapshot plus journal tail | 9.163 us | 9.0 us | 13.3 us | 18.6 us | 24.9 us | 8 |
+
+These cells time in-memory encoding, SHA-256 verification, state rebuild, and
+tail replay. They do not time file open, write, flush, directory sync, or
+snapshot selection after restart.
 
 ## Matching and Cancellation
 
@@ -305,6 +326,7 @@ layout changed.
 | v0.14 | Session state machine | Split active admission from early rejection |
 | v0.15 | Retransmission window | Added bounded in-memory replay workload |
 | v0.16 | Bounded command journal | Added versioned records, persistence, recovery, and fault fixtures |
+| v0.17 | Canonical state recovery | Added snapshot encoding, verified restore, and journal tail replay cells |
 
 Historical absolute timings are desktop smoke evidence. Changes to fixtures or
 measurement boundaries make some cells unsuitable for direct comparison. The

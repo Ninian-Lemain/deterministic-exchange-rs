@@ -2,8 +2,19 @@
 
 ## Unreleased
 
+### Added
+
+- Added canonical logical state export and restore for the book, risk engine,
+  and gateway.
+- Added a versioned big-endian snapshot format with SHA-256 integrity and fixed
+  compatibility bytes.
+- Added snapshot plus journal tail recovery with sequence, capacity, and state
+  validation.
+- Added recovery benchmarks for encoding, verified restore, and tail replay.
+
 ### Changed
 
+- Marked v0.17 recovery and state integrity as implemented.
 - Rewrote the README and the learnings document in a direct technical voice
   and removed typographic dashes from prose. No code changed.
 

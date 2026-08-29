@@ -13,13 +13,14 @@ members = [
     "crates/hft-replay",
     "crates/hft-session",
     "crates/hft-journal",
+    "crates/hft-recovery",
     "crates/hft-bench",
     "crates/hft-cli",
 ]
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.16.0"
+version = "0.17.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/Ninian-Lemain/deterministic-exchange-rs"

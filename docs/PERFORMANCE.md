@@ -21,6 +21,7 @@ line using schema `hft-bench-results/1`. The suite covers:
 - session admission and retransmission
 - journal record creation, enqueue, verification, in-memory persistence, and recovery scanning
 - canonical snapshot encoding, verified restore, and journal tail replay
+- bounded event admission, batch publication, and full-ring refusal
 
 Each record names its measurement boundary as component, gateway, or network.
 The current suite has component and gateway cells. It has no measured network
@@ -113,6 +114,8 @@ between cells near 100 ns.
 | Component | Snapshot encode on the current AMD host | 2.2 us p50 |
 | Component | Verified snapshot restore on the current AMD host | 5.5 us p50 |
 | Component | Snapshot plus eight-command tail on the current AMD host | 9.0 us p50 |
+| Gateway | Event admission through batch pop on the current AMD host | 100 ns p50 |
+| Gateway | Full event ring refusal on the current AMD host | 40 ns mean |
 
 The hot-path cells reported zero allocation and deallocation deltas. The three
 recovery cells allocated 12, 4, and 8 times per sample respectively. The
@@ -134,6 +137,21 @@ eight 64-byte journal records.
 These cells time in-memory encoding, SHA-256 verification, state rebuild, and
 tail replay. They do not time file open, write, flush, directory sync, or
 snapshot selection after restart.
+
+## Bounded Events
+
+The v0.18 event run used the current AMD Windows host with 2,000 samples per
+cell. The admitted cell includes gateway processing, a two-event batch publish,
+and consumer pop. Untimed cancellation restores the fixture. The refusal cell
+keeps a capacity-one ring full and retries the same next command.
+
+| Workload | Mean | p50 | p99 | p99.9 | Max | Allocations |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Accepted command and batch pop | 119 ns | 100 ns | 200 ns | 200 ns | 200 ns | 0 |
+| Full event ring refusal | 40 ns | 0 ns | 100 ns | 100 ns | 100 ns | 0 |
+
+These cells measure an in-process SPSC handoff. They do not include event wire
+encoding, network publication, storage, or a second process.
 
 ## Matching and Cancellation
 
@@ -327,6 +345,7 @@ layout changed.
 | v0.15 | Retransmission window | Added bounded in-memory replay workload |
 | v0.16 | Bounded command journal | Added versioned records, persistence, recovery, and fault fixtures |
 | v0.17 | Canonical state recovery | Added snapshot encoding, verified restore, and journal tail replay cells |
+| v0.18 | Bounded command events | Added admitted batch handoff and full-ring refusal cells |
 
 Historical absolute timings are desktop smoke evidence. Changes to fixtures or
 measurement boundaries make some cells unsuitable for direct comparison. The

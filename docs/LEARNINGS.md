@@ -145,3 +145,15 @@ The snapshot sequence is the boundary between state and the journal tail.
 Recovery accepts only the next journal sequence and checks that each record
 matches the sequence inside its wire payload. Rejected business commands still
 consume a valid sequence. Corrupt framing and sequence errors stop recovery.
+
+## Publish One Command Per Queue Slot
+
+Publishing trades and acknowledgements as separate queue entries permits a full
+ring to expose only part of a command. Rolling back matching state would not
+remove events already observed by the consumer. The event ring therefore stores
+one fixed-capacity batch per command. Capacity is checked before mutation and
+the producer publishes the batch with one tail update.
+
+Event IDs do not use a separate counter. The protocol sequence identifies the
+command and an ordinal identifies its events. Snapshot restore can reproduce
+the same IDs without extending the v1 snapshot format.

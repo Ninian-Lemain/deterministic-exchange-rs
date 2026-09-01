@@ -2,8 +2,8 @@
 
 ## Where the project is
 
-Implemented through **v0.17.0**. The next committed milestone is
-**v0.18.0 Bounded Events**.
+Implemented through **v0.18.0**. The next committed milestone is
+**v0.19.0 Multi-Instrument Routing**.
 
 Waiting on external prerequisites:
 
@@ -277,10 +277,13 @@ mismatch, noncanonical state, tail overlap, gaps, and payload sequence mismatch.
 
 ### v0.18.0 - Bounded Events
 
-Requires v0.8/v0.11/v0.12/v0.17. Sequenced accepted/rejected/trade/cancel/
-replace and top-of-book events with bounded handoff and explicit
-backpressure. No accepted state transition is silently lost; event order and
-replay are stable; exhaustion has a defined engine response.
+Implemented. Each sequence-valid command publishes one fixed-capacity batch
+containing accepted, rejected, trade, cancel, replace, and changed top-of-book
+events. Event IDs use the command sequence and batch ordinal. One SPSC slot
+holds the whole command result. A full queue rejects admission before the
+gateway advances its sequence or mutates state. Tests cover event order,
+multi-level fills, business rejections, retry after backpressure, replay
+equality, and snapshot-tail event equality.
 
 ### v0.19.0 - Multi-Instrument Routing
 

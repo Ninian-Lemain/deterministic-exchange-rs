@@ -18,7 +18,11 @@
 7. Owner-authorized cancellation uses a fixed-capacity `OrderId` index, removes
    the resting remainder without disturbing peer FIFO, and releases exactly
    that remaining risk reservation.
-8. Replay hashes stable logical state, independent of array slot placement.
+8. `hft-events` builds one fixed-capacity event batch for the command. It emits
+   the terminal result, trades in execution order, and the final top-of-book
+   change.
+9. The producer publishes the complete batch in one SPSC slot. Replay hashes
+   stable logical state, independent of array slot placement.
 
 ## Ownership
 
@@ -29,12 +33,16 @@
   linear probing, remain at or below 50% live load, and never grow on the heap.
 - `SpscQueue::split` requires an exclusive queue borrow and yields exactly one
   producer and consumer.
+- One event producer owns gateway admission. A full event queue is detected
+  before sequence advancement or state mutation.
 - Vendor sessions uniquely own one opaque handle and destroy it once.
 
 ## Capacity and Backpressure
 
 - RX memory backend: `QueueError::Full`.
 - SPSC: returns the original value when full.
+- Event SPSC: one slot holds a complete command batch. Full means the command
+  remains unconsumed and may be retried.
 - Risk accounts and orders: explicit account/order capacity rejection.
 - Book: explicit price-level, per-level FIFO, and report capacity rejection.
 - Order index: fixed at four slots per configured per-side order capacity;

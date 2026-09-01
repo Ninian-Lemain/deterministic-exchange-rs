@@ -18,6 +18,21 @@ Inbound work crosses cores only as a normalized fixed-size SPSC value.
 - Unauthorized/unknown cancel: rejection; book and risk unchanged.
 - SPSC full: producer retains the value and observes explicit backpressure.
 - RX ring full: backend rejects rather than overwriting an unread frame.
+- Event ring full: the command is not admitted, its sequence is not consumed,
+  and gateway state is unchanged.
+
+## Event Boundary
+
+One queue entry contains every event produced by one command. Consumers never
+observe a partial command result. Event order within a batch is terminal event,
+trade events in book execution order, then changed top-of-book. A
+sequence-valid business rejection emits one rejection event. Parse and sequence
+errors emit no event.
+
+The caller must retain a backpressured frame and retry it after the consumer
+reclaims queue capacity. Treat `EventCapacityInvariant` and
+`PublicationInvariant` as fatal engine defects. They can occur only if the
+configured batch bound or the single-producer capacity contract is broken.
 
 ## Recovery Boundary
 

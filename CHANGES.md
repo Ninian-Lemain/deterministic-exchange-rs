@@ -4,6 +4,11 @@
 
 ### Added
 
+- Added sequenced accepted, rejected, trade, cancel, replace, and top-of-book
+  events.
+- Added fixed-capacity command event batches with SPSC publication and explicit
+  pre-mutation backpressure.
+- Added full replay and snapshot-tail event equality tests.
 - Added canonical logical state export and restore for the book, risk engine,
   and gateway.
 - Added a versioned big-endian snapshot format with SHA-256 integrity and fixed

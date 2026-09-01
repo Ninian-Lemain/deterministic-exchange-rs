@@ -3,6 +3,7 @@
 //! warm-up separated from sampling, allocation gates, and stable checksums.
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod event_workloads;
 pub mod extra_workloads;
 pub mod journal_workloads;
 pub mod record;
@@ -125,6 +126,7 @@ pub fn run_suite(config: SuiteConfig) -> std::vec::Vec<std::string::String> {
     journal_workloads::journal_benchmark(config.tif_samples, &mut records);
     journal_workloads::journal_drain_benchmark(config.tif_samples, &mut records);
     recovery_workloads::recovery_benchmarks(config.tif_samples, &mut records);
+    event_workloads::event_benchmarks(config.tif_samples, &mut records);
     records.iter().map(BenchRecord::to_json_line).collect()
 }
 

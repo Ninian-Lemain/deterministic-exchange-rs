@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 hft-book = { path = "../hft-book" }
+hft-events = { path = "../hft-events" }
 hft-gateway = { path = "../hft-gateway" }
 hft-io = { path = "../hft-io" }
 hft-model = { path = "../hft-model" }

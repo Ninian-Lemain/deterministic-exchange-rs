@@ -323,6 +323,8 @@ fn suite_records_match_the_schema_fixture() {
         ("recovery", "canonical_snapshot_encode"),
         ("recovery", "verified_snapshot_restore"),
         ("recovery", "snapshot_tail_replay"),
+        ("events", "admitted_push_pop"),
+        ("events", "full_queue_backpressure"),
     ];
     for (component_name, scenario_name) in expected {
         assert!(

@@ -9,7 +9,7 @@ pub enum Extra {
 }
 
 /// Maximum named parameters carried inline without heap allocation.
-pub const PARAM_SLOTS: usize = 4;
+pub const PARAM_SLOTS: usize = 5;
 
 /// One benchmark cell: identity, latency distribution, throughput, allocation
 /// deltas, and a deterministic checksum of observed effects.
@@ -153,6 +153,7 @@ mod tests {
             scenario: "head_cancel",
             params: [
                 ("depth", Extra::U64(16)),
+                ("", Extra::U64(0)),
                 ("", Extra::U64(0)),
                 ("", Extra::U64(0)),
                 ("", Extra::U64(0)),

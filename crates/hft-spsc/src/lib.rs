@@ -187,6 +187,17 @@ pub struct Producer<'queue, T, const N: usize> {
 }
 
 impl<T, const N: usize> Producer<'_, T, N> {
+    /// Returns whether one value can be published without backpressure.
+    ///
+    /// A `true` result remains valid until this producer publishes a value.
+    /// The consumer can only reclaim more capacity.
+    pub fn has_capacity(&mut self) -> bool {
+        if self.tail.wrapping_sub(self.cached_head) == N {
+            self.cached_head = self.queue.head.0.load(Ordering::Acquire);
+        }
+        self.tail.wrapping_sub(self.cached_head) != N
+    }
+
     /// # Errors
     ///
     /// Returns ownership of `value` when the bounded queue is full.
@@ -230,6 +241,28 @@ mod tests {
         loom::model(run_preserves_fifo);
         #[cfg(not(feature = "loom"))]
         run_preserves_fifo();
+    }
+
+    #[test]
+    fn capacity_check_tracks_full_reclaim_and_wrap() {
+        #[cfg(feature = "loom")]
+        loom::model(run_capacity_check_tracks_full_reclaim_and_wrap);
+        #[cfg(not(feature = "loom"))]
+        run_capacity_check_tracks_full_reclaim_and_wrap();
+    }
+
+    fn run_capacity_check_tracks_full_reclaim_and_wrap() {
+        let mut queue = SpscQueue::<u64, 1>::try_new().expect("valid capacity");
+        let (mut producer, mut consumer) = queue.split();
+
+        for value in 0..4 {
+            assert!(producer.has_capacity());
+            assert_eq!(producer.try_push(value), Ok(()));
+            assert!(!producer.has_capacity());
+            assert_eq!(consumer.try_pop(), Some(value));
+            assert!(producer.has_capacity());
+        }
+        assert_eq!(consumer.try_pop(), None);
     }
 
     fn run_preserves_fifo() {

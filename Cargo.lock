@@ -107,9 +107,10 @@ dependencies = [
 
 [[package]]
 name = "hft-bench"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "hft-book",
+ "hft-events",
  "hft-gateway",
  "hft-io",
  "hft-journal",
@@ -124,7 +125,7 @@ dependencies = [
 
 [[package]]
 name = "hft-book"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "hft-model",
  "hft-types",
@@ -132,7 +133,7 @@ dependencies = [
 
 [[package]]
 name = "hft-cli"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "hft-book",
  "hft-gateway",
@@ -143,15 +144,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "hft-events"
+version = "0.18.0"
+dependencies = [
+ "hft-book",
+ "hft-gateway",
+ "hft-io",
+ "hft-recovery",
+ "hft-risk",
+ "hft-spsc",
+ "hft-types",
+ "hft-wire",
+]
+
+[[package]]
 name = "hft-ffi"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "cc",
 ]
 
 [[package]]
 name = "hft-gateway"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "hft-book",
  "hft-io",
@@ -164,11 +179,11 @@ dependencies = [
 
 [[package]]
 name = "hft-io"
-version = "0.17.0"
+version = "0.18.0"
 
 [[package]]
 name = "hft-journal"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "crc32c",
  "hft-model",
@@ -178,14 +193,14 @@ dependencies = [
 
 [[package]]
 name = "hft-model"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "hft-types",
 ]
 
 [[package]]
 name = "hft-recovery"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "hft-book",
  "hft-gateway",
@@ -199,7 +214,7 @@ dependencies = [
 
 [[package]]
 name = "hft-replay"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "hft-book",
  "hft-gateway",
@@ -211,14 +226,14 @@ dependencies = [
 
 [[package]]
 name = "hft-risk"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "hft-types",
 ]
 
 [[package]]
 name = "hft-session"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "hft-gateway",
  "hft-io",
@@ -229,18 +244,18 @@ dependencies = [
 
 [[package]]
 name = "hft-spsc"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "loom",
 ]
 
 [[package]]
 name = "hft-types"
-version = "0.17.0"
+version = "0.18.0"
 
 [[package]]
 name = "hft-wire"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "hft-io",
  "hft-types",

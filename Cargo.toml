@@ -9,6 +9,7 @@ members = [
     "crates/hft-book",
     "crates/hft-model",
     "crates/hft-gateway",
+    "crates/hft-events",
     "crates/hft-ffi",
     "crates/hft-replay",
     "crates/hft-session",
@@ -20,7 +21,7 @@ members = [
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.17.0"
+version = "0.18.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/Ninian-Lemain/deterministic-exchange-rs"

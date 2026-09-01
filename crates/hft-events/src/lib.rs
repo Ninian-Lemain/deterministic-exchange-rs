@@ -1,0 +1,737 @@
+#![forbid(unsafe_code)]
+
+use hft_book::TopLevel;
+use hft_gateway::{Gateway, GatewayError, GatewayOutcome};
+use hft_io::RxFrame;
+use hft_spsc::Producer;
+use hft_types::{
+    AccountId, InstrumentId, OrderId, OrderState, PriceTicks, Quantity, RejectReason, ReportBuffer,
+    SequenceNumber, Side,
+};
+use hft_wire::{BorrowedMessage, parse_message};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EventId {
+    pub command_sequence: SequenceNumber,
+    pub ordinal: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommandKind {
+    NewOrder,
+    Cancel,
+    Replace,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Accepted {
+    pub id: EventId,
+    pub order_id: OrderId,
+    pub account_id: AccountId,
+    pub instrument_id: InstrumentId,
+    pub state: OrderState,
+    pub filled_quantity: Quantity,
+    pub resting_quantity: Quantity,
+    pub discarded_quantity: Quantity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Rejected {
+    pub id: EventId,
+    pub command: CommandKind,
+    pub order_id: OrderId,
+    pub account_id: AccountId,
+    pub instrument_id: InstrumentId,
+    pub reason: RejectReason,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Trade {
+    pub id: EventId,
+    pub maker_order_id: OrderId,
+    pub taker_order_id: OrderId,
+    pub instrument_id: InstrumentId,
+    pub price: PriceTicks,
+    pub quantity: Quantity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Cancelled {
+    pub id: EventId,
+    pub order_id: OrderId,
+    pub account_id: AccountId,
+    pub instrument_id: InstrumentId,
+    pub quantity: Quantity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Replaced {
+    pub id: EventId,
+    pub order_id: OrderId,
+    pub account_id: AccountId,
+    pub instrument_id: InstrumentId,
+    pub old_quantity: Quantity,
+    pub new_quantity: Quantity,
+    pub price: PriceTicks,
+    pub priority_lost: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TopOfBook {
+    pub id: EventId,
+    pub instrument_id: InstrumentId,
+    pub bid: Option<TopLevel>,
+    pub ask: Option<TopLevel>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Event {
+    Accepted(Accepted),
+    Rejected(Rejected),
+    Trade(Trade),
+    Cancelled(Cancelled),
+    Replaced(Replaced),
+    TopOfBook(TopOfBook),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EventBatch<const N: usize> {
+    events: [Option<Event>; N],
+    len: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BatchFull;
+
+impl<const N: usize> EventBatch<N> {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            events: [None; N],
+            len: 0,
+        }
+    }
+
+    /// # Errors
+    ///
+    /// Returns [`BatchFull`] when the fixed-size batch has no free slot.
+    pub fn try_push(&mut self, event: Event) -> Result<(), BatchFull> {
+        let Some(slot) = self.events.get_mut(self.len) else {
+            return Err(BatchFull);
+        };
+        *slot = Some(event);
+        self.len += 1;
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &Event> {
+        self.events[..self.len].iter().filter_map(Option::as_ref)
+    }
+}
+
+impl<const N: usize> Default for EventBatch<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EventEngineConfigError {
+    BatchTooSmall,
+    TooManyEvents,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EventEngineError {
+    Backpressured,
+    Gateway(GatewayError),
+    EventCapacityInvariant,
+    PublicationInvariant,
+}
+
+pub struct BoundedEventEngine<
+    'queue,
+    const ACCOUNTS: usize,
+    const RISK_ORDERS: usize,
+    const LEVELS: usize,
+    const ORDERS_PER_LEVEL: usize,
+    const REPORTS: usize,
+    const BATCH: usize,
+    const QUEUE: usize,
+> {
+    gateway: Gateway<ACCOUNTS, RISK_ORDERS, LEVELS, ORDERS_PER_LEVEL>,
+    producer: Producer<'queue, EventBatch<BATCH>, QUEUE>,
+}
+
+impl<
+    'queue,
+    const ACCOUNTS: usize,
+    const RISK_ORDERS: usize,
+    const LEVELS: usize,
+    const ORDERS_PER_LEVEL: usize,
+    const REPORTS: usize,
+    const BATCH: usize,
+    const QUEUE: usize,
+>
+    BoundedEventEngine<
+        'queue,
+        ACCOUNTS,
+        RISK_ORDERS,
+        LEVELS,
+        ORDERS_PER_LEVEL,
+        REPORTS,
+        BATCH,
+        QUEUE,
+    >
+{
+    /// Builds an engine when one batch can hold the largest command result.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EventEngineConfigError::BatchTooSmall`] when the batch cannot
+    /// hold every report, one terminal event, and one top-of-book event. Returns
+    /// [`EventEngineConfigError::TooManyEvents`] when ordinals cannot represent
+    /// the configured report count.
+    pub fn try_new(
+        gateway: Gateway<ACCOUNTS, RISK_ORDERS, LEVELS, ORDERS_PER_LEVEL>,
+        producer: Producer<'queue, EventBatch<BATCH>, QUEUE>,
+    ) -> Result<Self, EventEngineConfigError> {
+        if REPORTS > usize::from(u16::MAX) - 1 {
+            return Err(EventEngineConfigError::TooManyEvents);
+        }
+        if BATCH < REPORTS.saturating_add(2) {
+            return Err(EventEngineConfigError::BatchTooSmall);
+        }
+        Ok(Self { gateway, producer })
+    }
+
+    /// Processes one sequence-valid command and publishes its event batch.
+    ///
+    /// Queue capacity is reserved before the gateway advances its sequence or
+    /// mutates state. Parse and sequence failures publish no batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EventEngineError::Backpressured`] without processing when the
+    /// queue is full. Parse, sequence, and fatal gateway errors are returned as
+    /// [`EventEngineError::Gateway`]. Sequence-valid business rejections are
+    /// published as [`Event::Rejected`] and return success. An invariant error
+    /// indicates a configuration or producer contract defect after mutation.
+    pub fn process_frame(&mut self, frame: &RxFrame<'_>) -> Result<(), EventEngineError> {
+        let message = parse_message(frame)
+            .map_err(|error| EventEngineError::Gateway(GatewayError::Parse(error)))?;
+        let sequence = message.sequence();
+        if sequence != self.gateway.expected_sequence() {
+            return Err(EventEngineError::Gateway(GatewayError::Sequence {
+                expected: self.gateway.expected_sequence(),
+                received: sequence,
+            }));
+        }
+        if !self.producer.has_capacity() {
+            return Err(EventEngineError::Backpressured);
+        }
+
+        let command = CommandIdentity::from_message(message);
+        let before = (
+            self.gateway.top_level(Side::Buy),
+            self.gateway.top_level(Side::Sell),
+        );
+        let mut reports = ReportBuffer::<REPORTS>::new();
+        let result = self.gateway.process_frame(frame, &mut reports);
+        let after = (
+            self.gateway.top_level(Side::Buy),
+            self.gateway.top_level(Side::Sell),
+        );
+        let mut batch = EventBatch::new();
+
+        match result {
+            Ok(outcome) => {
+                let mut ordinal = 0_u16;
+                let terminal = terminal_event(outcome, command, sequence, ordinal);
+                push_preflighted(&mut batch, terminal)?;
+                ordinal += 1;
+                for report in reports.iter() {
+                    push_preflighted(
+                        &mut batch,
+                        Event::Trade(Trade {
+                            id: EventId {
+                                command_sequence: sequence,
+                                ordinal,
+                            },
+                            maker_order_id: report.maker_order_id,
+                            taker_order_id: report.taker_order_id,
+                            instrument_id: report.instrument_id,
+                            price: report.price,
+                            quantity: report.quantity,
+                        }),
+                    )?;
+                    ordinal += 1;
+                }
+                if before != after {
+                    push_preflighted(
+                        &mut batch,
+                        Event::TopOfBook(TopOfBook {
+                            id: EventId {
+                                command_sequence: sequence,
+                                ordinal,
+                            },
+                            instrument_id: command.instrument_id,
+                            bid: after.0,
+                            ask: after.1,
+                        }),
+                    )?;
+                }
+            }
+            Err(GatewayError::Risk(reason) | GatewayError::Book(reason)) => {
+                push_preflighted(
+                    &mut batch,
+                    Event::Rejected(Rejected {
+                        id: EventId {
+                            command_sequence: sequence,
+                            ordinal: 0,
+                        },
+                        command: command.kind,
+                        order_id: command.order_id,
+                        account_id: command.account_id,
+                        instrument_id: command.instrument_id,
+                        reason,
+                    }),
+                )?;
+            }
+            Err(error) => return Err(EventEngineError::Gateway(error)),
+        }
+
+        // Capacity was observed before processing. Only the consumer can move
+        // the peer cursor, and it can only free this producer's reserved slot.
+        if self.producer.try_push(batch).is_err() {
+            return Err(EventEngineError::PublicationInvariant);
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn gateway(&self) -> &Gateway<ACCOUNTS, RISK_ORDERS, LEVELS, ORDERS_PER_LEVEL> {
+        &self.gateway
+    }
+
+    #[must_use]
+    pub fn into_gateway(self) -> Gateway<ACCOUNTS, RISK_ORDERS, LEVELS, ORDERS_PER_LEVEL> {
+        self.gateway
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CommandIdentity {
+    kind: CommandKind,
+    order_id: OrderId,
+    account_id: AccountId,
+    instrument_id: InstrumentId,
+}
+
+impl CommandIdentity {
+    fn from_message(message: BorrowedMessage<'_>) -> Self {
+        match message {
+            BorrowedMessage::NewOrder(message) => {
+                let order = message.to_owned();
+                Self {
+                    kind: CommandKind::NewOrder,
+                    order_id: order.order_id,
+                    account_id: order.account_id,
+                    instrument_id: order.instrument_id,
+                }
+            }
+            BorrowedMessage::CancelOrder(message) => {
+                let cancel = message.to_owned();
+                Self {
+                    kind: CommandKind::Cancel,
+                    order_id: cancel.order_id,
+                    account_id: cancel.account_id,
+                    instrument_id: cancel.instrument_id,
+                }
+            }
+            BorrowedMessage::ReplaceOrder(message) => {
+                let replace = message.to_owned();
+                Self {
+                    kind: CommandKind::Replace,
+                    order_id: replace.order_id,
+                    account_id: replace.account_id,
+                    instrument_id: replace.instrument_id,
+                }
+            }
+        }
+    }
+}
+
+fn terminal_event(
+    outcome: GatewayOutcome,
+    command: CommandIdentity,
+    sequence: SequenceNumber,
+    ordinal: u16,
+) -> Event {
+    let id = EventId {
+        command_sequence: sequence,
+        ordinal,
+    };
+    match outcome {
+        GatewayOutcome::NewOrder(summary) => Event::Accepted(Accepted {
+            id,
+            order_id: command.order_id,
+            account_id: command.account_id,
+            instrument_id: command.instrument_id,
+            state: summary.state,
+            filled_quantity: summary.filled_quantity,
+            resting_quantity: summary.resting_quantity,
+            discarded_quantity: summary.discarded_quantity,
+        }),
+        GatewayOutcome::Cancelled(cancelled) => Event::Cancelled(Cancelled {
+            id,
+            order_id: cancelled.order_id,
+            account_id: cancelled.account_id,
+            instrument_id: command.instrument_id,
+            quantity: cancelled.quantity,
+        }),
+        GatewayOutcome::Replaced(replaced) => Event::Replaced(Replaced {
+            id,
+            order_id: replaced.order_id,
+            account_id: replaced.account_id,
+            instrument_id: command.instrument_id,
+            old_quantity: replaced.old_quantity,
+            new_quantity: replaced.new_quantity,
+            price: replaced.price,
+            priority_lost: replaced.priority_lost,
+        }),
+    }
+}
+
+fn push_preflighted<const N: usize>(
+    batch: &mut EventBatch<N>,
+    event: Event,
+) -> Result<(), EventEngineError> {
+    batch
+        .try_push(event)
+        .map_err(|_| EventEngineError::EventCapacityInvariant)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hft_risk::{RiskEngine, RiskLimits};
+    use hft_spsc::SpscQueue;
+    use hft_types::{CancelOrder, NewOrder, ReplaceOrder, TimeInForce};
+    use hft_wire::{encode_cancel_order, encode_new_order, encode_replace_order};
+
+    type TestGateway = Gateway<2, 8, 4, 4>;
+    type TestBatch = EventBatch<6>;
+
+    fn gateway() -> TestGateway {
+        let limits = RiskLimits {
+            max_quantity: Quantity(100),
+            max_notional: 100_000,
+            max_abs_position: Quantity(1_000),
+            max_open_orders: 8,
+            minimum_price: PriceTicks(1),
+            maximum_price: PriceTicks(1_000),
+        };
+        let mut risk = RiskEngine::new();
+        risk.register_account(AccountId(1), limits)
+            .expect("account one");
+        risk.register_account(AccountId(2), limits)
+            .expect("account two");
+        Gateway::new(risk, InstrumentId(7))
+    }
+
+    fn order(
+        id: u64,
+        account: u32,
+        sequence: u64,
+        side: Side,
+        price: i64,
+        quantity: u64,
+    ) -> [u8; 46] {
+        encode_new_order(NewOrder {
+            order_id: OrderId(id),
+            account_id: AccountId(account),
+            instrument_id: InstrumentId(7),
+            price: PriceTicks(price),
+            quantity: Quantity(quantity),
+            sequence: SequenceNumber(sequence),
+            side,
+            time_in_force: TimeInForce::Gtc,
+        })
+    }
+
+    #[test]
+    fn accepted_trade_and_top_events_have_stable_order() {
+        if hft_spsc::IS_LOOM_BUILD {
+            return;
+        }
+        let mut queue = SpscQueue::<TestBatch, 4>::try_new().expect("queue");
+        let (producer, mut consumer) = queue.split();
+        let mut engine = BoundedEventEngine::<2, 8, 4, 4, 4, 6, 4>::try_new(gateway(), producer)
+            .expect("batch capacity");
+
+        let sell = order(1, 1, 1, Side::Sell, 100, 5);
+        engine
+            .process_frame(&RxFrame::from_bytes(&sell))
+            .expect("rest sell");
+        let first = consumer.try_pop().expect("first batch");
+        assert_eq!(first.len(), 2);
+        assert!(matches!(first.iter().next(), Some(Event::Accepted(_))));
+        assert!(matches!(first.iter().nth(1), Some(Event::TopOfBook(_))));
+
+        let buy = order(2, 2, 2, Side::Buy, 100, 5);
+        engine
+            .process_frame(&RxFrame::from_bytes(&buy))
+            .expect("cross sell");
+        let second = consumer.try_pop().expect("second batch");
+        let events: Vec<_> = second.iter().copied().collect();
+        assert!(matches!(events[0], Event::Accepted(_)));
+        assert!(matches!(events[1], Event::Trade(_)));
+        assert!(matches!(events[2], Event::TopOfBook(_)));
+        for (ordinal, event) in events.iter().enumerate() {
+            let id = match event {
+                Event::Accepted(event) => event.id,
+                Event::Trade(event) => event.id,
+                Event::TopOfBook(event) => event.id,
+                _ => unreachable!("unexpected event"),
+            };
+            assert_eq!(id.command_sequence, SequenceNumber(2));
+            assert_eq!(usize::from(id.ordinal), ordinal);
+        }
+        let Event::Trade(trade) = events[1] else {
+            unreachable!("trade event checked above");
+        };
+        assert_eq!(trade.maker_order_id, OrderId(1));
+        assert_eq!(trade.taker_order_id, OrderId(2));
+        assert_eq!(trade.quantity, Quantity(5));
+    }
+
+    #[test]
+    fn multi_level_trades_follow_book_price_time_order() {
+        if hft_spsc::IS_LOOM_BUILD {
+            return;
+        }
+        let mut queue = SpscQueue::<TestBatch, 4>::try_new().expect("queue");
+        let (producer, mut consumer) = queue.split();
+        let mut engine = BoundedEventEngine::<2, 8, 4, 4, 4, 6, 4>::try_new(gateway(), producer)
+            .expect("batch capacity");
+
+        for frame in [
+            order(1, 1, 1, Side::Sell, 100, 2),
+            order(2, 1, 2, Side::Sell, 101, 3),
+        ] {
+            engine
+                .process_frame(&RxFrame::from_bytes(&frame))
+                .expect("rest maker");
+            let _ = consumer.try_pop().expect("maker batch");
+        }
+
+        let taker = order(3, 2, 3, Side::Buy, 101, 5);
+        engine
+            .process_frame(&RxFrame::from_bytes(&taker))
+            .expect("cross levels");
+        let batch = consumer.try_pop().expect("taker batch");
+        let trades: Vec<_> = batch
+            .iter()
+            .filter_map(|event| match event {
+                Event::Trade(trade) => Some(*trade),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(trades.len(), 2);
+        assert_eq!(trades[0].maker_order_id, OrderId(1));
+        assert_eq!(trades[0].price, PriceTicks(100));
+        assert_eq!(trades[1].maker_order_id, OrderId(2));
+        assert_eq!(trades[1].price, PriceTicks(101));
+        assert_eq!(trades[0].id.ordinal, 1);
+        assert_eq!(trades[1].id.ordinal, 2);
+    }
+
+    #[test]
+    fn replace_cancel_and_business_rejection_emit_terminal_events() {
+        if hft_spsc::IS_LOOM_BUILD {
+            return;
+        }
+        let mut queue = SpscQueue::<TestBatch, 8>::try_new().expect("queue");
+        let (producer, mut consumer) = queue.split();
+        let mut engine = BoundedEventEngine::<2, 8, 4, 4, 4, 6, 8>::try_new(gateway(), producer)
+            .expect("batch capacity");
+
+        let first = order(1, 1, 1, Side::Buy, 100, 5);
+        engine
+            .process_frame(&RxFrame::from_bytes(&first))
+            .expect("new order");
+        let _ = consumer.try_pop();
+
+        let replace = encode_replace_order(ReplaceOrder {
+            order_id: OrderId(1),
+            account_id: AccountId(1),
+            instrument_id: InstrumentId(7),
+            sequence: SequenceNumber(2),
+            price: PriceTicks(100),
+            quantity: Quantity(3),
+        });
+        engine
+            .process_frame(&RxFrame::from_bytes(&replace))
+            .expect("replace");
+        let replaced = consumer.try_pop().expect("replace batch");
+        assert!(matches!(replaced.iter().next(), Some(Event::Replaced(_))));
+        assert!(matches!(replaced.iter().nth(1), Some(Event::TopOfBook(_))));
+
+        let cancel = encode_cancel_order(CancelOrder {
+            order_id: OrderId(1),
+            account_id: AccountId(1),
+            instrument_id: InstrumentId(7),
+            sequence: SequenceNumber(3),
+        });
+        engine
+            .process_frame(&RxFrame::from_bytes(&cancel))
+            .expect("cancel");
+        let cancelled = consumer.try_pop().expect("cancel batch");
+        assert!(matches!(cancelled.iter().next(), Some(Event::Cancelled(_))));
+        assert!(matches!(cancelled.iter().nth(1), Some(Event::TopOfBook(_))));
+
+        let unknown = encode_cancel_order(CancelOrder {
+            order_id: OrderId(99),
+            account_id: AccountId(1),
+            instrument_id: InstrumentId(7),
+            sequence: SequenceNumber(4),
+        });
+        engine
+            .process_frame(&RxFrame::from_bytes(&unknown))
+            .expect("recorded rejection");
+        let rejected = consumer.try_pop().expect("rejection batch");
+        assert_eq!(rejected.len(), 1);
+        assert!(matches!(
+            rejected.iter().next(),
+            Some(Event::Rejected(Rejected {
+                command: CommandKind::Cancel,
+                reason: RejectReason::UnknownOrder,
+                ..
+            }))
+        ));
+        assert_eq!(engine.gateway().expected_sequence(), SequenceNumber(5));
+    }
+
+    #[test]
+    fn full_queue_rejects_before_gateway_mutation_and_retry_succeeds() {
+        if hft_spsc::IS_LOOM_BUILD {
+            return;
+        }
+        let mut queue = SpscQueue::<TestBatch, 1>::try_new().expect("queue");
+        let (producer, mut consumer) = queue.split();
+        let mut engine = BoundedEventEngine::<2, 8, 4, 4, 4, 6, 1>::try_new(gateway(), producer)
+            .expect("batch capacity");
+
+        let first = order(1, 1, 1, Side::Buy, 99, 2);
+        engine
+            .process_frame(&RxFrame::from_bytes(&first))
+            .expect("first command");
+        let before = engine.gateway().export_state();
+        let second = order(2, 1, 2, Side::Buy, 98, 2);
+        assert_eq!(
+            engine.process_frame(&RxFrame::from_bytes(&second)),
+            Err(EventEngineError::Backpressured)
+        );
+        assert_eq!(engine.gateway().export_state(), before);
+        assert_eq!(engine.gateway().expected_sequence(), SequenceNumber(2));
+
+        let _ = consumer.try_pop().expect("free queue slot");
+        engine
+            .process_frame(&RxFrame::from_bytes(&second))
+            .expect("retry");
+        assert_eq!(engine.gateway().expected_sequence(), SequenceNumber(3));
+        assert!(consumer.try_pop().is_some());
+    }
+
+    #[test]
+    fn parse_and_sequence_errors_publish_nothing() {
+        if hft_spsc::IS_LOOM_BUILD {
+            return;
+        }
+        let mut queue = SpscQueue::<TestBatch, 2>::try_new().expect("queue");
+        let (producer, mut consumer) = queue.split();
+        let mut engine = BoundedEventEngine::<2, 8, 4, 4, 4, 6, 2>::try_new(gateway(), producer)
+            .expect("batch capacity");
+
+        assert!(matches!(
+            engine.process_frame(&RxFrame::from_bytes(&[0_u8; 1])),
+            Err(EventEngineError::Gateway(GatewayError::Parse(_)))
+        ));
+        let gap = order(1, 1, 2, Side::Buy, 100, 1);
+        assert!(matches!(
+            engine.process_frame(&RxFrame::from_bytes(&gap)),
+            Err(EventEngineError::Gateway(GatewayError::Sequence { .. }))
+        ));
+        assert!(consumer.try_pop().is_none());
+        assert_eq!(engine.gateway().expected_sequence(), SequenceNumber(1));
+    }
+
+    #[test]
+    fn undersized_batch_is_rejected_at_construction() {
+        if hft_spsc::IS_LOOM_BUILD {
+            return;
+        }
+        let mut queue = SpscQueue::<EventBatch<5>, 1>::try_new().expect("queue");
+        let (producer, _consumer) = queue.split();
+        assert!(matches!(
+            BoundedEventEngine::<2, 8, 4, 4, 4, 5, 1>::try_new(gateway(), producer),
+            Err(EventEngineConfigError::BatchTooSmall)
+        ));
+    }
+
+    #[test]
+    fn replay_and_snapshot_tail_emit_identical_event_batches() {
+        if hft_spsc::IS_LOOM_BUILD {
+            return;
+        }
+        let frames = [
+            order(1, 1, 1, Side::Sell, 100, 5),
+            order(2, 2, 2, Side::Buy, 100, 2),
+            order(2, 2, 3, Side::Buy, 100, 1),
+            order(3, 2, 4, Side::Buy, 100, 3),
+        ];
+
+        let full = event_batches(gateway(), &frames);
+        assert_eq!(full.len(), frames.len());
+
+        let mut prefix = gateway();
+        let mut reports = ReportBuffer::<4>::new();
+        for frame in &frames[..2] {
+            let _ = prefix.process_frame(&RxFrame::from_bytes(frame), &mut reports);
+        }
+        let snapshot = hft_recovery::encode_snapshot(&prefix, 2).expect("snapshot");
+        let restored = hft_recovery::decode_snapshot::<2, 8, 4, 4>(snapshot.bytes())
+            .expect("restore")
+            .gateway;
+        let tail = event_batches(restored, &frames[2..]);
+
+        assert_eq!(tail, full[2..]);
+    }
+
+    fn event_batches(gateway: TestGateway, frames: &[[u8; 46]]) -> Vec<TestBatch> {
+        let mut queue = SpscQueue::<TestBatch, 8>::try_new().expect("queue");
+        let (producer, mut consumer) = queue.split();
+        let mut engine = BoundedEventEngine::<2, 8, 4, 4, 4, 6, 8>::try_new(gateway, producer)
+            .expect("batch capacity");
+        let mut batches = Vec::with_capacity(frames.len());
+        for frame in frames {
+            engine
+                .process_frame(&RxFrame::from_bytes(frame))
+                .expect("replay command");
+            batches.push(consumer.try_pop().expect("event batch"));
+        }
+        batches
+    }
+}

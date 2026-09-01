@@ -1,11 +1,11 @@
 #![forbid(unsafe_code)]
 
-use hft_book::{BookState, BookStateError, CancelledOrder, OrderBook};
+use hft_book::{BookState, BookStateError, CancelledOrder, OrderBook, TopLevel};
 use hft_io::RxFrame;
 use hft_risk::{RiskEngine, RiskEngineState, RiskStateError};
 use hft_types::{
     InstrumentId, MatchSummary, OrderId, Quantity, RejectReason, ReplaceOrder, ReportBuffer,
-    SequenceNumber,
+    SequenceNumber, Side,
 };
 use hft_wire::{BorrowedMessage, ParseError, parse_message};
 
@@ -324,6 +324,11 @@ impl<
     #[must_use]
     pub const fn expected_sequence(&self) -> SequenceNumber {
         self.expected_sequence
+    }
+
+    #[must_use]
+    pub fn top_level(&self, side: Side) -> Option<TopLevel> {
+        self.book.top_level(side)
     }
 }
 

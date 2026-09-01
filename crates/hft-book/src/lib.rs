@@ -338,6 +338,13 @@ pub struct ReplacedOrder {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TopLevel {
+    pub price: PriceTicks,
+    pub aggregate_quantity: u128,
+    pub order_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BookOrderState {
     pub order_id: OrderId,
     pub account_id: AccountId,
@@ -610,6 +617,22 @@ pub struct OrderBook<const LEVELS: usize, const ORDERS_PER_LEVEL: usize> {
 }
 
 impl<const LEVELS: usize, const ORDERS_PER_LEVEL: usize> OrderBook<LEVELS, ORDERS_PER_LEVEL> {
+    /// Returns the best level for `side` after aggregating its live orders.
+    #[must_use]
+    pub fn top_level(&self, side: Side) -> Option<TopLevel> {
+        let &(price, level_index) = self.side_index(side).iter().next()?;
+        let level = self.side_levels(side).get(level_index)?.as_ref()?;
+        let mut aggregate_quantity = 0_u128;
+        level.for_each_live(|order| {
+            aggregate_quantity += u128::from(order.quantity.0);
+        });
+        Some(TopLevel {
+            price,
+            aggregate_quantity,
+            order_count: level.len,
+        })
+    }
+
     #[must_use]
     pub const fn new(instrument: InstrumentId) -> Self {
         Self {
@@ -1535,6 +1558,56 @@ mod tests {
         assert_eq!(makers, [OrderId(2), OrderId(3), OrderId(1)]);
         assert_eq!(summary.filled_quantity, Quantity(5));
         assert_eq!(book.order_count(), 1);
+    }
+
+    #[test]
+    fn top_level_reports_best_price_aggregate_and_order_count() {
+        let mut book = OrderBook::<4, 4>::new(InstrumentId(1));
+        let mut reports = ReportBuffer::<4>::new();
+
+        assert_eq!(book.top_level(Side::Buy), None);
+        assert_eq!(book.top_level(Side::Sell), None);
+
+        book.submit(order(1, 99, 2, Side::Buy), &mut reports)
+            .expect("rest lower bid");
+        reports.clear();
+        book.submit(order(2, 100, 3, Side::Buy), &mut reports)
+            .expect("rest best bid");
+        reports.clear();
+        book.submit(order(3, 100, 4, Side::Buy), &mut reports)
+            .expect("rest at best bid");
+        reports.clear();
+        book.submit(order(4, 102, 5, Side::Sell), &mut reports)
+            .expect("rest ask");
+
+        assert_eq!(
+            book.top_level(Side::Buy),
+            Some(TopLevel {
+                price: PriceTicks(100),
+                aggregate_quantity: 7,
+                order_count: 2,
+            })
+        );
+        assert_eq!(
+            book.top_level(Side::Sell),
+            Some(TopLevel {
+                price: PriceTicks(102),
+                aggregate_quantity: 5,
+                order_count: 1,
+            })
+        );
+
+        reports.clear();
+        book.submit(order(5, 100, 5, Side::Sell), &mut reports)
+            .expect("reduce best bid");
+        assert_eq!(
+            book.top_level(Side::Buy),
+            Some(TopLevel {
+                price: PriceTicks(100),
+                aggregate_quantity: 2,
+                order_count: 1,
+            })
+        );
     }
 
     #[test]

@@ -263,9 +263,6 @@ impl<
     /// Owned amend: risk reservation adjusts first (limit-checked), then the
     /// book mutates; a book rejection restores the prior reservation total.
     fn process_replace(&mut self, replace: ReplaceOrder) -> Result<GatewayOutcome, GatewayError> {
-        self.risk
-            .can_cancel(replace.order_id, replace.account_id)
-            .map_err(GatewayError::Risk)?;
         let (_, prior_remaining) = self
             .risk
             .adjust_reservation(

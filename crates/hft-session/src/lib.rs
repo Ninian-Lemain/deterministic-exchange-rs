@@ -1,5 +1,5 @@
 //! Session state machine: connection lifecycle and inbound sequencing
-//! outside the matching core. Deterministic virtual time only — every
+//! outside the matching core. Deterministic virtual time only. Every
 //! deadline check takes `now` from the caller.
 //!
 //! Commands are accepted exclusively in [`SessionState::Active`]; gaps,

@@ -1,9 +1,9 @@
 # Safety
 
-Safe Rust is the default. `hft-types`, `hft-wire`, `hft-io`, `hft-risk`,
-`hft-book`, `hft-gateway`, `hft-replay`, and `hft-cli` forbid unsafe code, so
-matching, risk, parsing, sessions, and replay expose safe public APIs only.
-CI rejects `unsafe` outside the allowlisted files.
+Safe Rust is the default. Every library except `hft-spsc` and `hft-ffi`
+forbids unsafe code. The `hft-bench` library also forbids it. CI rejects
+unsafe blocks, functions, impls, foreign declarations, `UnsafeCell`, and
+mutable statics outside the allowlisted files.
 
 ## Unsafe Inventory
 
@@ -18,16 +18,16 @@ exactly one endpoint of each kind. Drop holds exclusive access and drops only
 the published half-open range `[head, tail)`. `T: Send` is required for
 `Sync`.
 
-v0.12 audit, point by point:
+Audit details:
 
-- **UnsafeCell**: slot access is confined to four sites (producer write,
-  consumer read, `Drop`, `into_inner`). Under `--features loom` the cell type
-  swaps to `loom::cell::UnsafeCell`, so Loom tracks every slot access.
+- **UnsafeCell**: slot access is confined to the `Slot<T>` wrapper. Under
+  `--features loom` it uses `loom::cell::UnsafeCell`, so Loom tracks the same
+  reads and writes as the normal build.
 - **Initialization/drop**: a slot is written exactly once between reclamation
   and publication; it is read exactly once by the consumer (`assume_init_read`)
-  or dropped once by `Drop`/`into_inner`, which walk only `[head, tail)`.
-  `into_inner` drains by value and then forgets the wrapper so no slot is
-  dropped twice.
+  or dropped once by `Drop`. `into_inner` reserves the full live count before
+  moving values and advances the stored head before each move. Unwinding
+  cannot make `Drop` visit a moved value.
 - **Wrap**: indices are `usize` counters masked with `N - 1`; fullness uses
   wrapping subtraction of cached peer positions. Capacity one wraps every
   operation and is covered explicitly.
@@ -35,28 +35,28 @@ v0.12 audit, point by point:
   Cached positions are refreshed with Acquire loads, so a stale cache can only
   cause a retry, never an out-of-bounds access or lost capacity.
 - **Endpoint lifetimes**: `Producer`/`Consumer` borrow the queue for `'queue`;
-  `split(&mut)` guarantees one endpoint pair per borrow. The core steps are
-  shared-reference functions used verbatim by the endpoints and by the Loom
-  tests, so the modeled algorithm is the shipped algorithm.
+  `split(&mut)` guarantees one endpoint pair per borrow. A later split starts
+  from the published head and tail, including when pending values remain. The
+  core steps are shared-reference functions used by the endpoints and Loom
+  tests.
 
 Tests: FIFO order and full rejection, cross-thread transfer, invalid capacity,
-drop-exactly-once property coverage, seeded lossless schedules, actual-
-algorithm Loom runs under `--features loom` (CI), and Miri on the whole crate
-including the cross-thread transfer test (CI). Miri demonstrably rejects a
-weakened Release publication as a data race; Loom demonstrably explores the
-publication/consumption interleavings of the real algorithm.
+endpoint recreation with empty and nonempty queues, drop-exactly-once property
+coverage across endpoint epochs, seeded lossless schedules, Loom runs of the
+actual algorithm under `--features loom`, and Miri on the whole crate.
 
 ### FFI (`crates/hft-ffi/src/lib.rs`)
 
-`VendorSession::open` is the only unsafe public constructor. The caller
-guarantees C ABI validity, no unwind across the boundary, vtable validity for
-`'api`, one uniquely owned non-null handle per successful `create`, and no
-retention of payload pointers. The session is neither `Send` nor `Sync`
-(compile-fail doc test). Drop calls `destroy` exactly once.
+`VendorApi::new` is the only unsafe public constructor. Its contract covers
+callback lifetime, unwinding, handle ownership, error behavior, payload access,
+and destruction. Nullable callback fields make a C table with a null entry a
+valid Rust value. `VendorSession::open` rejects any missing callback before a
+foreign call. The session stores validated callbacks and is neither `Send` nor
+`Sync`. Drop calls `destroy` exactly once.
 
 Tests: ownership/destroy round trip, `create` failure status, null-handle
-rejection, `send` failure status with destroy-on-drop, oversized length
-rejection, and the native ABI suite below.
+rejection, null-callback rejection, `send` failure status with destroy-on-drop,
+oversized length rejection, and the native ABI suite below.
 
 ### Counting allocator (`crates/hft-bench/src/main.rs`)
 
@@ -79,16 +79,16 @@ Enabling `--features vendor-sdk` compiles the C test shim
 (`crates/hft-ffi/native/test_shim.c`) and runs ABI tests that compare the C
 and Rust layouts and drive a full session across the compiled boundary,
 including error propagation. CI runs these tests under ASan and UBSan on
-Linux. A real vendor shim must pass the same gates before merge. Without a C
-compiler the shim is skipped with a warning and the default build is
-unaffected.
+Linux. The suite compares every table field offset before it calls a callback.
+It also compiles the public header as C++. A feature build fails if either
+native probe cannot compile. Default builds do not require a C or C++ compiler.
 
 ## Validation Status
 
 - CI: fmt, workspace check, Clippy with warnings denied, tests, doc tests,
   Loom SPSC model, unsafe allowlist, Rust source ratio.
-- Miri (CI, nightly): `hft-wire`, `hft-risk`, `hft-book`.
+- Miri (CI, nightly): `hft-wire`, `hft-risk`, `hft-book`, `hft-spsc`.
 - ASan and UBSan (CI, nightly Linux): `hft-ffi` with the compiled C test shim.
-- Remaining: Miri does not yet cover the `hft-spsc`/`hft-ffi` unsafe paths
-  (the v0.12 audit owns that); sanitizers exercise the repository test shim,
-  not a proprietary SDK; dedicated-hardware validation remains on the roadmap.
+- Remaining: Miri does not execute foreign callbacks. Sanitizers exercise the
+  repository test shim, not a proprietary SDK. Dedicated-hardware validation
+  remains on the roadmap.

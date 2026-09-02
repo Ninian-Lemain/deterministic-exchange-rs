@@ -1,7 +1,7 @@
 //! Replay fixture: a session gates the matching core. Frames are dispatched
 //! to the gateway only while the session is Active; a mid-stream
 //! disconnect holds traffic, and reconnect resumes sequencing exactly where
-//! it stopped — no gaps, no duplicates.
+//! it stopped. No gaps, no duplicates.
 
 use hft_gateway::{Gateway, GatewayOutcome};
 use hft_io::RxFrame;

@@ -314,6 +314,26 @@ flush latency. No filesystem timing is published. File recovery, short writes,
 flush failures, corrupt tails, truncated tails, duplicates, and gaps are
 correctness fixtures only.
 
+## Report Buffer Storage
+
+`ReportBuffer` now stores reports directly in its fixed array and tracks a live
+prefix. Clearing the buffer only resets its length. Iteration no longer checks
+an `Option` discriminant for each report.
+
+Five alternating runs compared commit `6f4878f` with the direct-storage build
+on the same Windows x86_64 host. The table reports the median of each build's
+five mean values.
+
+| Cell | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| Eight-report multi-fill | 302 ns | 258 ns | -14.6% |
+| Gateway rest/fill | 130 ns | 112 ns | -13.8% |
+| Admitted event handoff | 154 ns | 144 ns | -6.5% |
+| Single fill | 94 ns | 87 ns | -7.4% |
+
+Checksums matched and every cell recorded zero allocation deltas. A 64-entry
+buffer changed from 3,592 to 3,080 bytes on this target, a 512-byte reduction.
+
 ## Allocation Policy
 
 Zero allocation means zero measured heap allocation and deallocation after

@@ -138,25 +138,30 @@ pub struct MatchSummary {
     pub report_count: usize,
 }
 
-#[derive(Debug, Eq, PartialEq)]
 pub struct ReportBuffer<const N: usize> {
-    entries: [Option<ExecutionReport>; N],
+    entries: [ExecutionReport; N],
     len: usize,
 }
 
 impl<const N: usize> ReportBuffer<N> {
+    const EMPTY_REPORT: ExecutionReport = ExecutionReport {
+        maker_order_id: OrderId(0),
+        taker_order_id: OrderId(0),
+        instrument_id: InstrumentId(0),
+        price: PriceTicks(0),
+        quantity: Quantity(0),
+        sequence: SequenceNumber(0),
+    };
+
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            entries: [None; N],
+            entries: [Self::EMPTY_REPORT; N],
             len: 0,
         }
     }
 
     pub fn clear(&mut self) {
-        for entry in &mut self.entries[..self.len] {
-            *entry = None;
-        }
         self.len = 0;
     }
 
@@ -167,7 +172,7 @@ impl<const N: usize> ReportBuffer<N> {
         let Some(slot) = self.entries.get_mut(self.len) else {
             return Err(RejectReason::ReportCapacity);
         };
-        *slot = Some(report);
+        *slot = report;
         self.len += 1;
         Ok(())
     }
@@ -188,9 +193,27 @@ impl<const N: usize> ReportBuffer<N> {
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &ExecutionReport> {
-        self.entries[..self.len].iter().filter_map(Option::as_ref)
+        self.entries[..self.len].iter()
     }
 }
+
+impl<const N: usize> core::fmt::Debug for ReportBuffer<N> {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("ReportBuffer")
+            .field("entries", &&self.entries[..self.len])
+            .field("len", &self.len)
+            .finish()
+    }
+}
+
+impl<const N: usize> PartialEq for ReportBuffer<N> {
+    fn eq(&self, other: &Self) -> bool {
+        self.entries[..self.len] == other.entries[..other.len]
+    }
+}
+
+impl<const N: usize> Eq for ReportBuffer<N> {}
 
 impl<const N: usize> Default for ReportBuffer<N> {
     fn default() -> Self {
@@ -215,5 +238,30 @@ mod tests {
         let mut reports = ReportBuffer::<1>::new();
         assert_eq!(reports.push(report), Ok(()));
         assert_eq!(reports.push(report), Err(RejectReason::ReportCapacity));
+    }
+
+    #[test]
+    fn cleared_report_buffers_ignore_old_entries() {
+        let report = ExecutionReport {
+            maker_order_id: OrderId(1),
+            taker_order_id: OrderId(2),
+            instrument_id: InstrumentId(3),
+            price: PriceTicks(4),
+            quantity: Quantity(5),
+            sequence: SequenceNumber(6),
+        };
+        let mut reports = ReportBuffer::<2>::new();
+        reports.push(report).expect("buffer has capacity");
+        reports.clear();
+        assert_eq!(reports, ReportBuffer::new());
+    }
+
+    #[test]
+    fn direct_report_storage_is_smaller_than_option_slots() {
+        assert!(
+            core::mem::size_of::<ReportBuffer<64>>()
+                < core::mem::size_of::<[Option<ExecutionReport>; 64]>()
+                    + core::mem::size_of::<usize>()
+        );
     }
 }

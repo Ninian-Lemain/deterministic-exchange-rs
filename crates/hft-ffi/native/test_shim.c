@@ -34,9 +34,14 @@ static int32_t shim_send(void *handle, const uint8_t *payload, uint32_t length) 
 }
 
 static const hft_vendor_api shim_api = {shim_create, shim_destroy, shim_send};
+static const hft_vendor_api null_callback_api = {0, shim_destroy, shim_send};
 
 const hft_vendor_api *hft_test_shim_api(void) {
     return &shim_api;
+}
+
+const hft_vendor_api *hft_test_null_callback_api(void) {
+    return &null_callback_api;
 }
 
 size_t hft_vendor_api_size(void) {
@@ -45,6 +50,18 @@ size_t hft_vendor_api_size(void) {
 
 size_t hft_vendor_api_align(void) {
     return _Alignof(hft_vendor_api);
+}
+
+size_t hft_vendor_api_create_offset(void) {
+    return offsetof(hft_vendor_api, create);
+}
+
+size_t hft_vendor_api_destroy_offset(void) {
+    return offsetof(hft_vendor_api, destroy);
+}
+
+size_t hft_vendor_api_send_offset(void) {
+    return offsetof(hft_vendor_api, send);
 }
 
 uint32_t hft_test_shim_sends(void) {

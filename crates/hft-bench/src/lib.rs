@@ -1,7 +1,7 @@
 //! Reproducible benchmark suite over the engine crates. Every cell emits one
 //! [`record::BenchRecord`] serialized as a deterministic JSON line with
 //! warm-up separated from sampling, allocation gates, and stable checksums.
-#![deny(unsafe_op_in_unsafe_fn)]
+#![forbid(unsafe_code)]
 
 pub mod event_workloads;
 pub mod extra_workloads;

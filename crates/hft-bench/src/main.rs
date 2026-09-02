@@ -22,10 +22,13 @@ unsafe impl GlobalAlloc for CountingAllocator {
     }
 
     unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        DEALLOCATIONS.fetch_add(1, Ordering::Relaxed);
         // SAFETY: the caller provides the allocation and new-size contracts.
-        unsafe { System.realloc(pointer, layout, size) }
+        let resized = unsafe { System.realloc(pointer, layout, size) };
+        if !resized.is_null() {
+            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+            DEALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        }
+        resized
     }
 }
 

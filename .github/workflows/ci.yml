@@ -28,7 +28,7 @@ jobs:
       - run: python scripts/source_ratio.py
       - name: Reject unexpected unsafe code
         run: |
-          found=$(grep -R -n --include='*.rs' -E 'unsafe[[:space:]]*(\{|impl|fn)' crates | cut -d: -f1 | sort -u || true)
+          found=$(grep -R -n --include='*.rs' -E 'unsafe[[:space:]]*(\{|impl|fn|extern)|UnsafeCell|static[[:space:]]+mut' crates | cut -d: -f1 | sort -u || true)
           allowed=$'crates/hft-bench/src/main.rs\ncrates/hft-ffi/src/lib.rs\ncrates/hft-ffi/tests/native_abi.rs\ncrates/hft-spsc/src/lib.rs'
           test "$found" = "$allowed"
 

@@ -4,6 +4,7 @@
 
 use std::cell::Cell;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use hft_spsc::{Consumer, SpscQueue};
 
@@ -201,6 +202,94 @@ fn rejected_push_returns_bit_identical_value() {
     }
 }
 
+#[test]
+fn resplit_empty_queue_starts_at_published_positions() {
+    let mut queue = SpscQueue::<u64, 2>::try_new().expect("valid capacity");
+    {
+        let (mut producer, mut consumer) = queue.split();
+        assert_eq!(producer.try_push(11), Ok(()));
+        assert_eq!(consumer.try_pop(), Some(11));
+    }
+
+    let (mut producer, mut consumer) = queue.split();
+    assert_eq!(consumer.try_pop(), None);
+    assert_eq!(producer.try_push(12), Ok(()));
+    assert_eq!(consumer.try_pop(), Some(12));
+}
+
+#[test]
+fn resplit_nonempty_queue_preserves_pending_values() {
+    let mut queue = SpscQueue::<u64, 2>::try_new().expect("valid capacity");
+    {
+        let (mut producer, _consumer) = queue.split();
+        assert_eq!(producer.try_push(21), Ok(()));
+        assert_eq!(producer.try_push(22), Ok(()));
+    }
+
+    let (mut producer, mut consumer) = queue.split();
+    assert_eq!(producer.try_push(23), Err(23));
+    assert_eq!(consumer.try_pop(), Some(21));
+    assert_eq!(producer.try_push(23), Ok(()));
+    assert_eq!(consumer.try_pop(), Some(22));
+    assert_eq!(consumer.try_pop(), Some(23));
+    assert_eq!(consumer.try_pop(), None);
+}
+
+#[test]
+fn into_inner_drains_only_pending_values() {
+    let mut queue = SpscQueue::<u64, 4>::try_new().expect("valid capacity");
+    {
+        let (mut producer, mut consumer) = queue.split();
+        assert_eq!(producer.try_push(24), Ok(()));
+        assert_eq!(producer.try_push(25), Ok(()));
+        assert_eq!(consumer.try_pop(), Some(24));
+    }
+
+    assert_eq!(queue.into_inner(), [25]);
+}
+
+#[test]
+fn second_endpoint_epoch_moves_values_between_threads() {
+    let mut queue = SpscQueue::<u64, 2>::try_new().expect("valid capacity");
+    {
+        let (mut producer, mut consumer) = queue.split();
+        assert_eq!(producer.try_push(31), Ok(()));
+        assert_eq!(consumer.try_pop(), Some(31));
+    }
+
+    let consumer_checked = AtomicBool::new(false);
+    let producer_published = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let (mut producer, mut consumer) = queue.split();
+        let producer_checked = &consumer_checked;
+        let published_by_producer = &producer_published;
+        let producer_thread = scope.spawn(move || {
+            while !producer_checked.load(Ordering::Acquire) {
+                core::hint::spin_loop();
+            }
+            let result = producer.try_push(32);
+            published_by_producer.store(true, Ordering::Release);
+            result
+        });
+        let checked_by_consumer = &consumer_checked;
+        let consumer_published = &producer_published;
+        let consumer_thread = scope.spawn(move || {
+            let before_publication = consumer.try_pop();
+            checked_by_consumer.store(true, Ordering::Release);
+            while !consumer_published.load(Ordering::Acquire) {
+                core::hint::spin_loop();
+            }
+            (before_publication, consumer.try_pop())
+        });
+
+        assert_eq!(producer_thread.join().expect("producer thread"), Ok(()));
+        assert_eq!(
+            consumer_thread.join().expect("consumer thread"),
+            (None, Some(32))
+        );
+    });
+}
+
 /// Non-Copy probe: no Clone or Copy, so surviving a push/pop round trip
 /// proves the queue moves values rather than duplicating or losing them.
 struct Payload<'counter> {
@@ -257,4 +346,29 @@ fn values_drop_exactly_once_after_full_drain() {
     }
     // Residual payloads drop exactly once at queue teardown.
     assert_eq!(drops.get(), 7);
+}
+
+#[test]
+fn values_drop_exactly_once_across_endpoint_epochs() {
+    let drops = Cell::new(0_usize);
+    let payload = |id: u64| Payload { id, drops: &drops };
+    let mut queue = SpscQueue::<Payload, 2>::try_new().expect("valid capacity");
+
+    {
+        let (mut producer, mut consumer) = queue.split();
+        assert!(matches!(producer.try_push(payload(40)), Ok(())));
+        assert!(matches!(producer.try_push(payload(41)), Ok(())));
+        assert!(matches!(consumer.try_pop(), Some(Payload { id: 40, .. })));
+    }
+    assert_eq!(drops.get(), 1);
+
+    {
+        let (mut producer, mut consumer) = queue.split();
+        assert!(matches!(consumer.try_pop(), Some(Payload { id: 41, .. })));
+        assert!(matches!(producer.try_push(payload(42)), Ok(())));
+    }
+    assert_eq!(drops.get(), 2);
+
+    drop(queue);
+    assert_eq!(drops.get(), 3);
 }

@@ -5,8 +5,67 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(feature = "loom")]
 use loom::sync::atomic::{AtomicUsize, Ordering};
 
-use core::cell::UnsafeCell;
+#[cfg(not(feature = "loom"))]
+use core::cell::UnsafeCell as SlotUnsafeCell;
 use core::mem::MaybeUninit;
+#[cfg(feature = "loom")]
+use loom::cell::UnsafeCell as SlotUnsafeCell;
+
+struct Slot<T>(SlotUnsafeCell<MaybeUninit<T>>);
+
+impl<T> Slot<T> {
+    fn uninit() -> Self {
+        Self(SlotUnsafeCell::new(MaybeUninit::uninit()))
+    }
+
+    /// Writes a value into a reclaimed slot.
+    ///
+    /// # Safety
+    ///
+    /// The slot must be uninitialized and inaccessible to the consumer.
+    unsafe fn write(&self, value: T) {
+        #[cfg(not(feature = "loom"))]
+        unsafe {
+            (*self.0.get()).write(value);
+        }
+        #[cfg(feature = "loom")]
+        self.0.with_mut(|slot| unsafe {
+            (*slot).write(value);
+        });
+    }
+
+    /// Moves a published value out of a slot.
+    ///
+    /// # Safety
+    ///
+    /// The slot must contain an initialized value and no writer may access it.
+    unsafe fn read(&self) -> T {
+        #[cfg(not(feature = "loom"))]
+        unsafe {
+            (*self.0.get()).assume_init_read()
+        }
+        #[cfg(feature = "loom")]
+        {
+            self.0.with(|slot| unsafe { (*slot).assume_init_read() })
+        }
+    }
+
+    /// Drops the initialized value in an exclusively owned slot.
+    ///
+    /// # Safety
+    ///
+    /// The slot must contain an initialized value.
+    unsafe fn drop_value(&mut self) {
+        #[cfg(not(feature = "loom"))]
+        unsafe {
+            self.0.get_mut().assume_init_drop();
+        }
+        #[cfg(feature = "loom")]
+        self.0.with_mut(|slot| unsafe {
+            (*slot).assume_init_drop();
+        });
+    }
+}
 
 #[repr(align(64))]
 struct CacheLineAtomic(AtomicUsize);
@@ -15,16 +74,9 @@ const _: () = assert!(core::mem::align_of::<CacheLineAtomic>() >= 64);
 const _: () = assert!(core::mem::size_of::<CacheLineAtomic>() >= 64);
 
 impl CacheLineAtomic {
-    /// Exclusive read for owner-only paths (`Drop`, `into_inner`).
+    /// Exclusive read for owner-only paths (`split`, `Drop`, `into_inner`).
     fn exclusive_load(&mut self) -> usize {
-        #[cfg(feature = "loom")]
-        {
-            self.0.swap(0, Ordering::Relaxed)
-        }
-        #[cfg(not(feature = "loom"))]
-        {
-            *self.0.get_mut()
-        }
+        self.0.load(Ordering::Relaxed)
     }
 
     /// Exclusive write for owner-only paths.
@@ -51,7 +103,7 @@ impl CacheLineAtomic {
 pub struct SpscQueue<T, const N: usize> {
     head: CacheLineAtomic,
     tail: CacheLineAtomic,
-    slots: [UnsafeCell<MaybeUninit<T>>; N],
+    slots: [Slot<T>; N],
 }
 
 /// True when this build swapped in Loom primitives (`--features loom`).
@@ -75,22 +127,24 @@ impl<T, const N: usize> SpscQueue<T, N> {
         Ok(Self {
             head: CacheLineAtomic(AtomicUsize::new(0)),
             tail: CacheLineAtomic(AtomicUsize::new(0)),
-            slots: core::array::from_fn(|_| UnsafeCell::new(MaybeUninit::uninit())),
+            slots: core::array::from_fn(|_| Slot::uninit()),
         })
     }
 
     pub fn split(&mut self) -> (Producer<'_, T, N>, Consumer<'_, T, N>) {
+        let head = self.head.exclusive_load();
+        let tail = self.tail.exclusive_load();
         let queue: &SpscQueue<T, N> = self;
         (
             Producer {
                 queue,
-                tail: 0,
-                cached_head: 0,
+                tail,
+                cached_head: head,
             },
             Consumer {
                 queue,
-                head: 0,
-                cached_tail: 0,
+                head,
+                cached_tail: tail,
             },
         )
     }
@@ -101,23 +155,21 @@ impl<T, const N: usize> SpscQueue<T, N> {
     }
 
     /// Drains every published-but-unconsumed value, leaving the queue empty.
-    /// Exclusive ownership makes this infallible and race-free.
     #[must_use]
     pub fn into_inner(mut self) -> std::vec::Vec<T> {
-        let mut drained = std::vec::Vec::new();
         let mut position = self.head.exclusive_load();
         let tail = self.tail.exclusive_load();
+        let mut drained = std::vec::Vec::with_capacity(tail.wrapping_sub(position));
         while position != tail {
             let index = position & (N - 1);
-            // SAFETY: exclusive `&mut self`; exactly [head, tail) is live.
-            let value = unsafe { (*self.slots[index].get_mut()).assume_init_read() };
-            drained.push(value);
             position = position.wrapping_add(1);
+            // Remove the slot from queue state before moving its value. Drop
+            // must not visit the same slot if draining unwinds.
+            self.head.exclusive_store(position);
+            // SAFETY: exclusive `&mut self`; exactly [head, tail) is live.
+            let value = unsafe { self.slots[index].read() };
+            drained.push(value);
         }
-        self.head.exclusive_store(position);
-        // Nothing published remains: forget the wrapper so the uninit slot
-        // memory is not handed to the Drop impl again.
-        core::mem::forget(self);
         drained
     }
 
@@ -135,7 +187,7 @@ impl<T, const N: usize> SpscQueue<T, N> {
         let index = *tail & (N - 1);
         // SAFETY: the capacity check proves this slot was reclaimed. Only this
         // producer writes it, and it is not published until the Release store.
-        unsafe { (*self.slots[index].get()).write(value) };
+        unsafe { self.slots[index].write(value) };
         *tail = tail.wrapping_add(1);
         self.tail.0.store(*tail, Ordering::Release);
         Ok(())
@@ -152,7 +204,7 @@ impl<T, const N: usize> SpscQueue<T, N> {
         let index = *head & (N - 1);
         // SAFETY: the Acquire load observed publication of this initialized
         // slot. Only this consumer reads it, exactly once, before reclamation.
-        let value = unsafe { (*self.slots[index].get()).assume_init_read() };
+        let value = unsafe { self.slots[index].read() };
         *head = head.wrapping_add(1);
         self.head.0.store(*head, Ordering::Release);
         Some(value)
@@ -174,7 +226,7 @@ impl<T, const N: usize> Drop for SpscQueue<T, N> {
             let index = position & (N - 1);
             // SAFETY: exclusive `&mut self` prevents endpoint access. Exactly
             // the published half-open range [head, tail) is initialized.
-            unsafe { (*self.slots[index].get_mut()).assume_init_drop() };
+            unsafe { self.slots[index].drop_value() };
             position = position.wrapping_add(1);
         }
     }

@@ -397,7 +397,8 @@ mod tests {
     fn malformed_input_smoke_never_panics() {
         let mut state = 0x9e37_79b9_7f4a_7c15_u64;
         let mut bytes = [0_u8; NEW_ORDER_LEN + 8];
-        for _ in 0..50_000 {
+        let iterations = if cfg!(miri) { 1_000 } else { 50_000 };
+        for _ in 0..iterations {
             state ^= state << 13;
             state ^= state >> 7;
             state ^= state << 17;

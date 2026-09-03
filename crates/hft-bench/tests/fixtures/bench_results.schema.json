@@ -1,7 +1,7 @@
 {
   "schema": "hft-bench-results/1",
   "boundaries": ["component", "gateway", "network"],
-  "components": ["parser", "spsc", "queue", "book", "risk", "gateway", "session", "journal", "recovery", "events"],
+  "components": ["parser", "spsc", "queue", "book", "risk", "gateway", "session", "journal", "recovery", "events", "router"],
   "required_strings": ["boundary", "component", "scenario"],
   "required_numbers": [
     "samples",
@@ -44,6 +44,8 @@
     "queue_capacity",
     "queue_occupancy",
     "event_count",
-    "backpressure_count"
+    "backpressure_count",
+    "shards",
+    "instruments"
   ]
 }

@@ -117,6 +117,7 @@ dependencies = [
  "hft-model",
  "hft-recovery",
  "hft-risk",
+ "hft-router",
  "hft-session",
  "hft-spsc",
  "hft-types",

@@ -325,6 +325,9 @@ fn suite_records_match_the_schema_fixture() {
         ("recovery", "snapshot_tail_replay"),
         ("events", "admitted_push_pop"),
         ("events", "full_queue_backpressure"),
+        ("router", "route_command"),
+        ("router", "route_shard_event"),
+        ("router", "full_command_queue"),
     ];
     for (component_name, scenario_name) in expected {
         assert!(

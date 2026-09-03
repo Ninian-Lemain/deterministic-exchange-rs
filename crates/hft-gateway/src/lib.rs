@@ -228,14 +228,29 @@ impl<
     }
 
     fn accept_sequence(&mut self, received_sequence: SequenceNumber) -> Result<(), GatewayError> {
+        self.check_sequence(received_sequence)?;
+        self.expected_sequence.0 = self
+            .expected_sequence
+            .0
+            .checked_add(1)
+            .ok_or(GatewayError::RiskState(RejectReason::ArithmeticOverflow))?;
+        Ok(())
+    }
+
+    /// Checks sequence admission without changing gateway state.
+    ///
+    /// # Errors
+    ///
+    /// Returns a mismatch or exhaustion error when the command cannot advance
+    /// the sequence.
+    pub fn check_sequence(&self, received_sequence: SequenceNumber) -> Result<(), GatewayError> {
         if received_sequence != self.expected_sequence {
             return Err(GatewayError::Sequence {
                 expected: self.expected_sequence,
                 received: received_sequence,
             });
         }
-        self.expected_sequence.0 = self
-            .expected_sequence
+        self.expected_sequence
             .0
             .checked_add(1)
             .ok_or(GatewayError::RiskState(RejectReason::ArithmeticOverflow))?;
@@ -458,6 +473,24 @@ mod tests {
             })
         );
         assert_eq!(gateway.expected_sequence(), SequenceNumber(1));
+    }
+
+    #[test]
+    fn sequence_exhaustion_fails_before_state_mutation() {
+        let mut state = gateway().export_state();
+        state.expected_sequence = SequenceNumber(u64::MAX);
+        let mut gateway = Gateway::<2, 8, 4, 4>::from_state(&state).expect("boundary state");
+        let before = gateway.export_state();
+        let mut reports = ReportBuffer::<4>::new();
+        let mut last = order(1, 1, Side::Buy);
+        last.sequence = SequenceNumber(u64::MAX);
+
+        assert_eq!(
+            gateway.process_command(Command::NewOrder(last), &mut reports),
+            Err(GatewayError::RiskState(RejectReason::ArithmeticOverflow))
+        );
+        assert_eq!(gateway.export_state(), before);
+        assert!(reports.is_empty());
     }
 
     #[test]

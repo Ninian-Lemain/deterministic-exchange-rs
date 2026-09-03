@@ -270,12 +270,9 @@ impl<
     }
 
     fn preflight(&mut self, sequence: SequenceNumber) -> Result<(), EventEngineError> {
-        if sequence != self.gateway.expected_sequence() {
-            return Err(EventEngineError::Gateway(GatewayError::Sequence {
-                expected: self.gateway.expected_sequence(),
-                received: sequence,
-            }));
-        }
+        self.gateway
+            .check_sequence(sequence)
+            .map_err(EventEngineError::Gateway)?;
         if !self.producer.has_capacity() {
             return Err(EventEngineError::Backpressured);
         }
@@ -687,6 +684,64 @@ mod tests {
     }
 
     #[test]
+    fn rejected_new_and_replace_events_preserve_command_identity() {
+        if hft_spsc::IS_LOOM_BUILD {
+            return;
+        }
+        let mut queue = SpscQueue::<TestBatch, 2>::try_new().expect("queue");
+        let (producer, mut consumer) = queue.split();
+        let mut engine = BoundedEventEngine::<2, 8, 4, 4, 4, 6, 2>::try_new(gateway(), producer)
+            .expect("batch capacity");
+
+        let rejected_new = order(7, 2, 1, Side::Buy, 100, 101);
+        engine
+            .process_frame(&RxFrame::from_bytes(&rejected_new))
+            .expect("new rejection event");
+        let new_batch = consumer.try_pop().expect("new rejection batch");
+        assert_eq!(
+            new_batch.iter().next(),
+            Some(&Event::Rejected(Rejected {
+                id: EventId {
+                    command_sequence: SequenceNumber(1),
+                    ordinal: 0,
+                },
+                command: CommandKind::NewOrder,
+                order_id: OrderId(7),
+                account_id: AccountId(2),
+                instrument_id: InstrumentId(7),
+                reason: RejectReason::QuantityLimit,
+            }))
+        );
+
+        let rejected_replace = encode_replace_order(ReplaceOrder {
+            order_id: OrderId(7),
+            account_id: AccountId(2),
+            instrument_id: InstrumentId(7),
+            sequence: SequenceNumber(2),
+            price: PriceTicks(101),
+            quantity: Quantity(1),
+        });
+        engine
+            .process_frame(&RxFrame::from_bytes(&rejected_replace))
+            .expect("replace rejection event");
+        let replace_batch = consumer.try_pop().expect("replace rejection batch");
+        assert_eq!(
+            replace_batch.iter().next(),
+            Some(&Event::Rejected(Rejected {
+                id: EventId {
+                    command_sequence: SequenceNumber(2),
+                    ordinal: 0,
+                },
+                command: CommandKind::Replace,
+                order_id: OrderId(7),
+                account_id: AccountId(2),
+                instrument_id: InstrumentId(7),
+                reason: RejectReason::UnknownOrder,
+            }))
+        );
+    }
+
+    #[test]
     fn full_queue_rejects_before_gateway_mutation_and_retry_succeeds() {
         if hft_spsc::IS_LOOM_BUILD {
             return;
@@ -741,6 +796,33 @@ mod tests {
     }
 
     #[test]
+    fn sequence_exhaustion_publishes_nothing() {
+        if hft_spsc::IS_LOOM_BUILD {
+            return;
+        }
+        let mut state = gateway().export_state();
+        state.expected_sequence = SequenceNumber(u64::MAX);
+        let exhausted = Gateway::from_state(&state).expect("boundary state");
+        let mut queue = SpscQueue::<TestBatch, 1>::try_new().expect("queue");
+        let (producer, mut consumer) = queue.split();
+        let mut engine = BoundedEventEngine::<2, 8, 4, 4, 4, 6, 1>::try_new(exhausted, producer)
+            .expect("batch capacity");
+        let last = order(1, 1, u64::MAX, Side::Buy, 100, 1);
+
+        assert_eq!(
+            engine.process_frame(&RxFrame::from_bytes(&last)),
+            Err(EventEngineError::Gateway(GatewayError::RiskState(
+                RejectReason::ArithmeticOverflow
+            )))
+        );
+        assert!(consumer.try_pop().is_none());
+        assert_eq!(
+            engine.gateway().expected_sequence(),
+            SequenceNumber(u64::MAX)
+        );
+    }
+
+    #[test]
     fn undersized_batch_is_rejected_at_construction() {
         if hft_spsc::IS_LOOM_BUILD {
             return;
@@ -751,6 +833,35 @@ mod tests {
             BoundedEventEngine::<2, 8, 4, 4, 4, 5, 1>::try_new(gateway(), producer),
             Err(EventEngineConfigError::BatchTooSmall)
         ));
+    }
+
+    #[test]
+    fn event_capacity_limits_are_explicit() {
+        if hft_spsc::IS_LOOM_BUILD {
+            return;
+        }
+        let mut queue = SpscQueue::<EventBatch<1>, 1>::try_new().expect("queue");
+        let (producer, _consumer) = queue.split();
+        assert!(matches!(
+            BoundedEventEngine::<2, 8, 4, 4, 65_535, 1, 1>::try_new(gateway(), producer),
+            Err(EventEngineConfigError::TooManyEvents)
+        ));
+
+        let event = Event::Rejected(Rejected {
+            id: EventId {
+                command_sequence: SequenceNumber(1),
+                ordinal: 0,
+            },
+            command: CommandKind::NewOrder,
+            order_id: OrderId(1),
+            account_id: AccountId(1),
+            instrument_id: InstrumentId(7),
+            reason: RejectReason::QuantityLimit,
+        });
+        let mut batch = EventBatch::<1>::new();
+        assert_eq!(batch.try_push(event), Ok(()));
+        assert_eq!(batch.try_push(event), Err(BatchFull));
+        assert_eq!(batch.len(), 1);
     }
 
     #[test]
@@ -767,6 +878,7 @@ mod tests {
 
         let full = event_batches(gateway(), &frames);
         assert_eq!(full.len(), frames.len());
+        assert_eq!(event_batches(gateway(), &frames), full);
 
         let mut prefix = gateway();
         let mut reports = ReportBuffer::<4>::new();

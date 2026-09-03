@@ -40,6 +40,8 @@ pub enum RetainError {
         expected: SequenceNumber,
         received: SequenceNumber,
     },
+    /// The admitted sequence has no representable successor.
+    SequenceOverflow,
 }
 
 impl fmt::Display for RetainError {
@@ -50,6 +52,7 @@ impl fmt::Display for RetainError {
                 f,
                 "out-of-order retention: expected {expected:?}, received {received:?}"
             ),
+            RetainError::SequenceOverflow => f.write_str("retransmission sequence exhausted"),
         }
     }
 }
@@ -98,7 +101,8 @@ impl RetransmitBuffer {
     /// # Errors
     ///
     /// [`RetainError::NotInOrder`] when the frame would leave a gap or
-    /// duplicate history, [`RetainError::Full`] when retention is exhausted.
+    /// duplicate history, [`RetainError::Full`] when retention is exhausted,
+    /// or [`RetainError::SequenceOverflow`] at the sequence limit.
     pub fn retain(&mut self, sequence: SequenceNumber, bytes: &[u8]) -> Result<(), RetainError> {
         if bytes.len() > MAX_FRAME {
             return Err(RetainError::Full);
@@ -112,6 +116,10 @@ impl RetransmitBuffer {
         if self.entries.len() == self.capacity {
             return Err(RetainError::Full);
         }
+        let next_sequence = sequence
+            .0
+            .checked_add(1)
+            .ok_or(RetainError::SequenceOverflow)?;
         let mut stored = [0_u8; MAX_FRAME];
         stored[..bytes.len()].copy_from_slice(bytes);
         self.entries.push_back(RetainedFrame {
@@ -119,7 +127,7 @@ impl RetransmitBuffer {
             bytes: stored,
             len: bytes.len(),
         });
-        self.next_sequence = sequence.0.checked_add(1).ok_or(RetainError::Full)?;
+        self.next_sequence = next_sequence;
         Ok(())
     }
 
@@ -151,5 +159,24 @@ impl RetransmitBuffer {
     #[must_use]
     pub fn remaining_capacity(&self) -> usize {
         self.capacity - self.entries.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sequence_overflow_does_not_retain_the_frame() {
+        let mut buffer = RetransmitBuffer::new(1);
+        buffer.next_sequence = u64::MAX;
+
+        assert_eq!(
+            buffer.retain(SequenceNumber(u64::MAX), b"last"),
+            Err(RetainError::SequenceOverflow)
+        );
+        assert!(buffer.is_empty());
+        assert_eq!(buffer.next_sequence(), u64::MAX);
+        assert_eq!(buffer.remaining_capacity(), 1);
     }
 }

@@ -449,6 +449,9 @@ mod tests {
 
     #[test]
     fn commands_and_events_stay_on_their_configured_shards() {
+        if hft_spsc::IS_LOOM_BUILD {
+            return;
+        }
         let mut command_zero = SpscQueue::<Command, 2>::try_new().expect("command zero");
         let mut command_one = SpscQueue::<Command, 2>::try_new().expect("command one");
         let (command_zero_producer, command_zero_consumer) = command_zero.split();
@@ -530,6 +533,9 @@ mod tests {
 
     #[test]
     fn unknown_instrument_and_full_command_queue_reject() {
+        if hft_spsc::IS_LOOM_BUILD {
+            return;
+        }
         let mut command_zero = SpscQueue::<Command, 1>::try_new().expect("command zero");
         let mut command_one = SpscQueue::<Command, 1>::try_new().expect("command one");
         let (command_zero_producer, mut command_zero_consumer) = command_zero.split();
@@ -563,6 +569,9 @@ mod tests {
 
     #[test]
     fn event_backpressure_retains_the_command_for_retry() {
+        if hft_spsc::IS_LOOM_BUILD {
+            return;
+        }
         let mut command = SpscQueue::<Command, 2>::try_new().expect("command queue");
         let (mut command_producer, command_consumer) = command.split();
         let mut events = SpscQueue::<TestBatch, 1>::try_new().expect("event queue");
@@ -602,6 +611,9 @@ mod tests {
 
     #[test]
     fn shard_constructor_rejects_instrument_mismatch() {
+        if hft_spsc::IS_LOOM_BUILD {
+            return;
+        }
         let mut command = SpscQueue::<Command, 1>::try_new().expect("command queue");
         let (_, command_consumer) = command.split();
         let mut events = SpscQueue::<TestBatch, 1>::try_new().expect("event queue");

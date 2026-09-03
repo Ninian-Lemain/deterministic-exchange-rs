@@ -73,6 +73,33 @@ pub struct CancelOrder {
     pub sequence: SequenceNumber,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Command {
+    NewOrder(NewOrder),
+    CancelOrder(CancelOrder),
+    ReplaceOrder(ReplaceOrder),
+}
+
+impl Command {
+    #[must_use]
+    pub const fn instrument_id(self) -> InstrumentId {
+        match self {
+            Self::NewOrder(order) => order.instrument_id,
+            Self::CancelOrder(cancel) => cancel.instrument_id,
+            Self::ReplaceOrder(replace) => replace.instrument_id,
+        }
+    }
+
+    #[must_use]
+    pub const fn sequence(self) -> SequenceNumber {
+        match self {
+            Self::NewOrder(order) => order.sequence,
+            Self::CancelOrder(cancel) => cancel.sequence,
+            Self::ReplaceOrder(replace) => replace.sequence,
+        }
+    }
+}
+
 const _: () = assert!(core::mem::size_of::<CancelOrder>() == 24);
 const _: () = assert!(core::mem::align_of::<CancelOrder>() == 8);
 

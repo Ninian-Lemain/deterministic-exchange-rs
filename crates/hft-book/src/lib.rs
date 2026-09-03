@@ -617,6 +617,11 @@ pub struct OrderBook<const LEVELS: usize, const ORDERS_PER_LEVEL: usize> {
 }
 
 impl<const LEVELS: usize, const ORDERS_PER_LEVEL: usize> OrderBook<LEVELS, ORDERS_PER_LEVEL> {
+    #[must_use]
+    pub const fn instrument(&self) -> InstrumentId {
+        self.instrument
+    }
+
     /// Returns the best level for `side` after aggregating its live orders.
     #[must_use]
     pub fn top_level(&self, side: Side) -> Option<TopLevel> {

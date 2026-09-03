@@ -2,8 +2,8 @@
 
 use hft_io::RxFrame;
 use hft_types::{
-    AccountId, CancelOrder, InstrumentId, NewOrder, OrderId, PriceTicks, Quantity, ReplaceOrder,
-    SequenceNumber, Side, TimeInForce,
+    AccountId, CancelOrder, Command, InstrumentId, NewOrder, OrderId, PriceTicks, Quantity,
+    ReplaceOrder, SequenceNumber, Side, TimeInForce,
 };
 
 pub const PROTOCOL_VERSION: u8 = 2;
@@ -141,6 +141,15 @@ impl BorrowedMessage<'_> {
             BorrowedMessage::ReplaceOrder(msg) => {
                 SequenceNumber(u64::from_be_bytes(msg.bytes[20..28].try_into().unwrap()))
             }
+        }
+    }
+
+    #[must_use]
+    pub fn to_command(self) -> Command {
+        match self {
+            Self::NewOrder(message) => Command::NewOrder(message.to_owned()),
+            Self::CancelOrder(message) => Command::CancelOrder(message.to_owned()),
+            Self::ReplaceOrder(message) => Command::ReplaceOrder(message.to_owned()),
         }
     }
 }

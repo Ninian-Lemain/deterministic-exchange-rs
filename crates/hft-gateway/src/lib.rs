@@ -4,8 +4,8 @@ use hft_book::{BookState, BookStateError, CancelledOrder, OrderBook, TopLevel};
 use hft_io::RxFrame;
 use hft_risk::{RiskEngine, RiskEngineState, RiskStateError};
 use hft_types::{
-    InstrumentId, MatchSummary, OrderId, Quantity, RejectReason, ReplaceOrder, ReportBuffer,
-    SequenceNumber, Side,
+    Command, InstrumentId, MatchSummary, OrderId, Quantity, RejectReason, ReplaceOrder,
+    ReportBuffer, SequenceNumber, Side,
 };
 use hft_wire::{BorrowedMessage, ParseError, parse_message};
 
@@ -197,7 +197,37 @@ impl<
     ) -> Result<GatewayOutcome, GatewayError> {
         reports.clear();
         let message = parse_message(frame).map_err(GatewayError::Parse)?;
-        let received_sequence = message.sequence();
+        self.accept_sequence(message.sequence())?;
+        match message {
+            BorrowedMessage::NewOrder(message) => {
+                self.process_new_order(message.to_owned(), reports)
+            }
+            BorrowedMessage::CancelOrder(message) => self.process_cancel(message.to_owned()),
+            BorrowedMessage::ReplaceOrder(message) => self.process_replace(message.to_owned()),
+        }
+    }
+
+    /// Processes one normalized command received by a matching shard.
+    ///
+    /// # Errors
+    ///
+    /// Returns the exact sequence, risk, book, or internal risk-state failure.
+    /// Book rejection rolls back the taker's risk reservation.
+    pub fn process_command<const REPORTS: usize>(
+        &mut self,
+        command: Command,
+        reports: &mut ReportBuffer<REPORTS>,
+    ) -> Result<GatewayOutcome, GatewayError> {
+        reports.clear();
+        self.accept_sequence(command.sequence())?;
+        match command {
+            Command::NewOrder(order) => self.process_new_order(order, reports),
+            Command::CancelOrder(cancel) => self.process_cancel(cancel),
+            Command::ReplaceOrder(replace) => self.process_replace(replace),
+        }
+    }
+
+    fn accept_sequence(&mut self, received_sequence: SequenceNumber) -> Result<(), GatewayError> {
         if received_sequence != self.expected_sequence {
             return Err(GatewayError::Sequence {
                 expected: self.expected_sequence,
@@ -209,13 +239,7 @@ impl<
             .0
             .checked_add(1)
             .ok_or(GatewayError::RiskState(RejectReason::ArithmeticOverflow))?;
-        match message {
-            BorrowedMessage::NewOrder(message) => {
-                self.process_new_order(message.to_owned(), reports)
-            }
-            BorrowedMessage::CancelOrder(message) => self.process_cancel(message.to_owned()),
-            BorrowedMessage::ReplaceOrder(message) => self.process_replace(message.to_owned()),
-        }
+        Ok(())
     }
 
     fn process_new_order<const REPORTS: usize>(
@@ -324,6 +348,11 @@ impl<
     }
 
     #[must_use]
+    pub const fn instrument(&self) -> InstrumentId {
+        self.book.instrument()
+    }
+
+    #[must_use]
     pub fn top_level(&self, side: Side) -> Option<TopLevel> {
         self.book.top_level(side)
     }
@@ -334,7 +363,7 @@ mod tests {
     use super::*;
     use hft_risk::RiskLimits;
     use hft_types::{
-        AccountId, CancelOrder, InstrumentId, NewOrder, OrderId, PriceTicks, Quantity,
+        AccountId, CancelOrder, Command, InstrumentId, NewOrder, OrderId, PriceTicks, Quantity,
         SequenceNumber, Side,
     };
     use hft_wire::{encode_cancel_order, encode_new_order, encode_replace_order};
@@ -388,6 +417,30 @@ mod tests {
         assert_eq!(reports.len(), 1);
         assert_eq!(gateway.risk().account_snapshot(AccountId(1)), Some((-5, 0)));
         assert_eq!(gateway.risk().account_snapshot(AccountId(2)), Some((5, 0)));
+    }
+
+    #[test]
+    fn normalized_command_matches_frame_processing() {
+        let order = order(1, 1, Side::Sell);
+        let frame = encode_new_order(order);
+        let mut frame_gateway = gateway();
+        let mut command_gateway = gateway();
+        let mut frame_reports = ReportBuffer::<4>::new();
+        let mut command_reports = ReportBuffer::<4>::new();
+
+        let frame_outcome = frame_gateway
+            .process_frame(&RxFrame::from_bytes(&frame), &mut frame_reports)
+            .expect("frame accepted");
+        let command_outcome = command_gateway
+            .process_command(Command::NewOrder(order), &mut command_reports)
+            .expect("command accepted");
+
+        assert_eq!(command_outcome, frame_outcome);
+        assert_eq!(command_reports, frame_reports);
+        assert_eq!(
+            command_gateway.stable_digest(),
+            frame_gateway.stable_digest()
+        );
     }
 
     #[test]

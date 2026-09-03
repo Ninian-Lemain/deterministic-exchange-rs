@@ -5,8 +5,8 @@ use hft_gateway::{Gateway, GatewayError, GatewayOutcome};
 use hft_io::RxFrame;
 use hft_spsc::Producer;
 use hft_types::{
-    AccountId, InstrumentId, OrderId, OrderState, PriceTicks, Quantity, RejectReason, ReportBuffer,
-    SequenceNumber, Side,
+    AccountId, Command, InstrumentId, OrderId, OrderState, PriceTicks, Quantity, RejectReason,
+    ReportBuffer, SequenceNumber, Side,
 };
 use hft_wire::{BorrowedMessage, parse_message};
 
@@ -231,16 +231,7 @@ impl<
         let message = parse_message(frame)
             .map_err(|error| EventEngineError::Gateway(GatewayError::Parse(error)))?;
         let sequence = message.sequence();
-        if sequence != self.gateway.expected_sequence() {
-            return Err(EventEngineError::Gateway(GatewayError::Sequence {
-                expected: self.gateway.expected_sequence(),
-                received: sequence,
-            }));
-        }
-        if !self.producer.has_capacity() {
-            return Err(EventEngineError::Backpressured);
-        }
-
+        self.preflight(sequence)?;
         let command = CommandIdentity::from_message(message);
         let before = (
             self.gateway.top_level(Side::Buy),
@@ -252,6 +243,54 @@ impl<
             self.gateway.top_level(Side::Buy),
             self.gateway.top_level(Side::Sell),
         );
+        self.publish_result(command, sequence, before, after, &reports, result)
+    }
+
+    /// Processes one normalized command from a bounded shard queue.
+    ///
+    /// # Errors
+    ///
+    /// Uses the same sequence, capacity, gateway, and publication errors as
+    /// [`Self::process_frame`].
+    pub fn process_command(&mut self, command: Command) -> Result<(), EventEngineError> {
+        let sequence = command.sequence();
+        self.preflight(sequence)?;
+        let identity = CommandIdentity::from_command(command);
+        let before = (
+            self.gateway.top_level(Side::Buy),
+            self.gateway.top_level(Side::Sell),
+        );
+        let mut reports = ReportBuffer::<REPORTS>::new();
+        let result = self.gateway.process_command(command, &mut reports);
+        let after = (
+            self.gateway.top_level(Side::Buy),
+            self.gateway.top_level(Side::Sell),
+        );
+        self.publish_result(identity, sequence, before, after, &reports, result)
+    }
+
+    fn preflight(&mut self, sequence: SequenceNumber) -> Result<(), EventEngineError> {
+        if sequence != self.gateway.expected_sequence() {
+            return Err(EventEngineError::Gateway(GatewayError::Sequence {
+                expected: self.gateway.expected_sequence(),
+                received: sequence,
+            }));
+        }
+        if !self.producer.has_capacity() {
+            return Err(EventEngineError::Backpressured);
+        }
+        Ok(())
+    }
+
+    fn publish_result(
+        &mut self,
+        command: CommandIdentity,
+        sequence: SequenceNumber,
+        before: (Option<TopLevel>, Option<TopLevel>),
+        after: (Option<TopLevel>, Option<TopLevel>),
+        reports: &ReportBuffer<REPORTS>,
+        result: Result<GatewayOutcome, GatewayError>,
+    ) -> Result<(), EventEngineError> {
         let mut batch = EventBatch::new();
 
         match result {
@@ -368,6 +407,29 @@ impl CommandIdentity {
                     instrument_id: replace.instrument_id,
                 }
             }
+        }
+    }
+
+    const fn from_command(command: Command) -> Self {
+        match command {
+            Command::NewOrder(order) => Self {
+                kind: CommandKind::NewOrder,
+                order_id: order.order_id,
+                account_id: order.account_id,
+                instrument_id: order.instrument_id,
+            },
+            Command::CancelOrder(cancel) => Self {
+                kind: CommandKind::Cancel,
+                order_id: cancel.order_id,
+                account_id: cancel.account_id,
+                instrument_id: cancel.instrument_id,
+            },
+            Command::ReplaceOrder(replace) => Self {
+                kind: CommandKind::Replace,
+                order_id: replace.order_id,
+                account_id: replace.account_id,
+                instrument_id: replace.instrument_id,
+            },
         }
     }
 }

@@ -1,0 +1,21 @@
+[package]
+name = "hft-router"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+hft-events = { path = "../hft-events" }
+hft-gateway = { path = "../hft-gateway" }
+hft-io = { path = "../hft-io" }
+hft-spsc = { path = "../hft-spsc" }
+hft-types = { path = "../hft-types" }
+hft-wire = { path = "../hft-wire" }
+
+[dev-dependencies]
+hft-risk = { path = "../hft-risk" }
+
+[lints]
+workspace = true

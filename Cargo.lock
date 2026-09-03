@@ -232,6 +232,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "hft-router"
+version = "0.18.0"
+dependencies = [
+ "hft-events",
+ "hft-gateway",
+ "hft-io",
+ "hft-risk",
+ "hft-spsc",
+ "hft-types",
+ "hft-wire",
+]
+
+[[package]]
 name = "hft-session"
 version = "0.18.0"
 dependencies = [

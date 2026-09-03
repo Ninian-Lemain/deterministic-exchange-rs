@@ -2,11 +2,12 @@
 #![forbid(unsafe_code)]
 
 use core::fmt;
-use hft_spsc::{Consumer, Producer, SpscQueue};
+use hft_spsc::{Consumer, Producer, QueueConfigError, SpscQueue};
 use hft_types::SequenceNumber;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub const MAX_PAYLOAD: usize = 46;
 pub const RECORD_SIZE: usize = 64;
@@ -179,9 +180,42 @@ pub enum DecodeError {
     ChecksumMismatch { sequence: SequenceNumber },
 }
 
+/// Journal queue with an explicit producer-close signal.
+pub struct JournalChannel {
+    queue: SpscQueue<JournalRecord, RING_CAPACITY>,
+    producer_closed: AtomicBool,
+}
+
+impl JournalChannel {
+    /// # Errors
+    ///
+    /// Returns the queue configuration error if the fixed capacity is invalid.
+    pub fn try_new() -> Result<Self, QueueConfigError> {
+        Ok(Self {
+            queue: SpscQueue::try_new()?,
+            producer_closed: AtomicBool::new(false),
+        })
+    }
+
+    /// Creates the single writer and reader for one sequence domain.
+    pub fn split(&mut self, first_sequence: u64) -> (JournalWriter<'_>, JournalReader<'_>) {
+        let Self {
+            queue,
+            producer_closed,
+        } = self;
+        producer_closed.store(false, Ordering::Relaxed);
+        let (producer, consumer) = queue.split();
+        (
+            JournalWriter::controlled(producer, first_sequence, producer_closed),
+            JournalReader::controlled(consumer, first_sequence, producer_closed),
+        )
+    }
+}
+
 pub struct JournalWriter<'queue> {
     producer: Producer<'queue, JournalRecord, RING_CAPACITY>,
     next_sequence: u64,
+    producer_closed: Option<&'queue AtomicBool>,
 }
 
 impl<'queue> JournalWriter<'queue> {
@@ -193,6 +227,19 @@ impl<'queue> JournalWriter<'queue> {
         Self {
             producer,
             next_sequence: first_sequence,
+            producer_closed: None,
+        }
+    }
+
+    fn controlled(
+        producer: Producer<'queue, JournalRecord, RING_CAPACITY>,
+        first_sequence: u64,
+        producer_closed: &'queue AtomicBool,
+    ) -> Self {
+        Self {
+            producer,
+            next_sequence: first_sequence,
+            producer_closed: Some(producer_closed),
         }
     }
 
@@ -208,6 +255,17 @@ impl<'queue> JournalWriter<'queue> {
     #[must_use]
     pub const fn next_sequence(&self) -> u64 {
         self.next_sequence
+    }
+
+    /// Closes admission for a controlled journal channel.
+    ///
+    /// Raw SPSC constructors do not carry a close signal.
+    pub fn close(self) {
+        if let Some(producer_closed) = self.producer_closed {
+            // Release follows every enqueue. Close consumes the only writer,
+            // so an acquiring worker cannot miss a later publication.
+            producer_closed.store(true, Ordering::Release);
+        }
     }
 
     /// Builds and publishes one record without storage access or allocation.
@@ -262,6 +320,7 @@ pub struct JournalReader<'queue> {
     consumer: Consumer<'queue, JournalRecord, RING_CAPACITY>,
     expected_sequence: u64,
     poisoned: bool,
+    producer_closed: Option<&'queue AtomicBool>,
 }
 
 impl<'queue> JournalReader<'queue> {
@@ -274,6 +333,20 @@ impl<'queue> JournalReader<'queue> {
             consumer,
             expected_sequence: first_expected,
             poisoned: false,
+            producer_closed: None,
+        }
+    }
+
+    fn controlled(
+        consumer: Consumer<'queue, JournalRecord, RING_CAPACITY>,
+        first_expected: u64,
+        producer_closed: &'queue AtomicBool,
+    ) -> Self {
+        Self {
+            consumer,
+            expected_sequence: first_expected,
+            poisoned: false,
+            producer_closed: Some(producer_closed),
         }
     }
     #[must_use]
@@ -322,6 +395,11 @@ impl<'queue> JournalReader<'queue> {
     pub const fn is_poisoned(&self) -> bool {
         self.poisoned
     }
+
+    fn producer_is_closed(&self) -> bool {
+        self.producer_closed
+            .is_some_and(|closed| closed.load(Ordering::Acquire))
+    }
 }
 
 pub trait DurableSink {
@@ -359,6 +437,7 @@ pub enum FlushPolicy {
 pub enum PersistError {
     Read(ReadError),
     Io(io::Error),
+    ProducerOpen,
     Poisoned,
 }
 
@@ -422,12 +501,19 @@ impl<'queue, S: DurableSink, const BATCH: usize> PersistenceWorker<'queue, S, BA
         }
         Ok(count)
     }
-    /// Drains the queue and flushes the sink.
+    /// Drains the queue and flushes the sink after producer closure.
     ///
     /// # Errors
     ///
-    /// Returns the first validation or storage error.
+    /// Returns [`PersistError::ProducerOpen`] until the controlled writer is
+    /// closed. Returns the first validation or storage error after closure.
     pub fn shutdown(&mut self) -> Result<(), PersistError> {
+        if self.poisoned {
+            return Err(PersistError::Poisoned);
+        }
+        if !self.reader.producer_is_closed() {
+            return Err(PersistError::ProducerOpen);
+        }
         loop {
             if self.drain_batch()? == 0 {
                 break;

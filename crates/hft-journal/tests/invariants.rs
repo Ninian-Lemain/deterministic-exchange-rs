@@ -1,7 +1,7 @@
 use hft_journal::{
-    DecodeError, DurableSink, FlushPolicy, JournalError, JournalReader, JournalRecord,
-    JournalWriter, PersistError, PersistenceWorker, RECORD_SIZE, RING_CAPACITY, ReadError,
-    RecoveryError, open_append, record_checksum, recover,
+    DecodeError, DurableSink, FlushPolicy, JournalChannel, JournalError, JournalReader,
+    JournalRecord, JournalWriter, PersistError, PersistenceWorker, RECORD_SIZE, RING_CAPACITY,
+    ReadError, RecoveryError, open_append, record_checksum, recover,
 };
 use hft_spsc::SpscQueue;
 use hft_types::SequenceNumber;
@@ -85,24 +85,26 @@ fn encoding_is_stable_and_rejects_bad_fields() {
 }
 
 #[test]
-fn on_shutdown_policy_defers_flush() {
+fn shutdown_requires_closed_producer_and_drains_tail() {
     if skip_loom_queue_test() {
         return;
     }
-    let mut queue = SpscQueue::<JournalRecord, RING_CAPACITY>::try_new().expect("queue");
-    let (producer, consumer) = queue.split();
-    let mut writer = JournalWriter::from_producer(producer, 1);
+    let mut channel = JournalChannel::try_new().expect("channel");
+    let (mut writer, reader) = channel.split(1);
     writer.enqueue(b"one").expect("enqueue");
-    let reader = JournalReader::from_consumer(consumer, 1);
     let sink = FaultSink {
         max_write: RECORD_SIZE,
         ..FaultSink::default()
     };
     let mut worker =
         PersistenceWorker::<_, 4>::new(reader, sink, FlushPolicy::OnShutdown).expect("worker");
-    assert_eq!(worker.drain_batch().expect("drain"), 1);
+    assert!(matches!(worker.shutdown(), Err(PersistError::ProducerOpen)));
+    writer.enqueue(b"two").expect("enqueue after refusal");
+    writer.close();
     worker.shutdown().expect("shutdown");
-    assert_eq!(worker.into_sink().expect("healthy").flushes, 1);
+    let sink = worker.into_sink().expect("healthy");
+    assert_eq!(sink.flushes, 1);
+    assert_eq!(sink.bytes.len(), 2 * RECORD_SIZE);
 }
 
 #[test]
@@ -158,18 +160,17 @@ fn persistence_handles_short_and_interrupted_writes_then_flushes() {
     if skip_loom_queue_test() {
         return;
     }
-    let mut queue = SpscQueue::<JournalRecord, RING_CAPACITY>::try_new().expect("queue");
-    let (producer, consumer) = queue.split();
-    let mut writer = JournalWriter::from_producer(producer, 1);
+    let mut channel = JournalChannel::try_new().expect("channel");
+    let (mut writer, reader) = channel.split(1);
     for id in 1..=3 {
         writer.enqueue(&payload(id)).expect("enqueue");
     }
+    writer.close();
     let sink = FaultSink {
         max_write: 7,
         interrupt_once: true,
         ..FaultSink::default()
     };
-    let reader = JournalReader::from_consumer(consumer, 1);
     let mut worker =
         PersistenceWorker::<_, 2>::new(reader, sink, FlushPolicy::EveryBatch).expect("worker");
     assert_eq!(worker.drain_batch().expect("first batch"), 2);
@@ -188,16 +189,15 @@ fn persistence_failure_poisoning_is_permanent() {
     if skip_loom_queue_test() {
         return;
     }
-    let mut queue = SpscQueue::<JournalRecord, RING_CAPACITY>::try_new().expect("queue");
-    let (producer, consumer) = queue.split();
-    let mut writer = JournalWriter::from_producer(producer, 1);
+    let mut channel = JournalChannel::try_new().expect("channel");
+    let (mut writer, reader) = channel.split(1);
     writer.enqueue(b"one").expect("enqueue");
+    writer.close();
     let sink = FaultSink {
         max_write: 8,
         fail_after: Some(8),
         ..FaultSink::default()
     };
-    let reader = JournalReader::from_consumer(consumer, 1);
     let mut worker =
         PersistenceWorker::<_, 1>::new(reader, sink, FlushPolicy::EveryBatch).expect("worker");
     assert!(matches!(worker.drain_batch(), Err(PersistError::Io(_))));
@@ -211,16 +211,15 @@ fn flush_failure_poisoning_is_permanent() {
     if skip_loom_queue_test() {
         return;
     }
-    let mut queue = SpscQueue::<JournalRecord, RING_CAPACITY>::try_new().expect("queue");
-    let (producer, consumer) = queue.split();
-    let mut writer = JournalWriter::from_producer(producer, 1);
+    let mut channel = JournalChannel::try_new().expect("channel");
+    let (mut writer, reader) = channel.split(1);
     writer.enqueue(b"one").expect("enqueue");
+    writer.close();
     let sink = FaultSink {
         max_write: RECORD_SIZE,
         fail_flush: true,
         ..FaultSink::default()
     };
-    let reader = JournalReader::from_consumer(consumer, 1);
     let mut worker =
         PersistenceWorker::<_, 1>::new(reader, sink, FlushPolicy::EveryBatch).expect("worker");
     assert!(matches!(worker.drain_batch(), Err(PersistError::Io(_))));
@@ -333,13 +332,12 @@ fn file_restart_derives_next_sequence() {
     let result = (|| -> Result<(), String> {
         let (file, empty) = open_append(&path, 1).map_err(|error| format!("open: {error:?}"))?;
         assert_eq!(empty.next_sequence, 1);
-        let mut queue = SpscQueue::<JournalRecord, RING_CAPACITY>::try_new()
-            .map_err(|error| format!("queue: {error:?}"))?;
-        let (producer, consumer) = queue.split();
-        let mut writer = JournalWriter::from_producer(producer, empty.next_sequence);
+        let mut channel =
+            JournalChannel::try_new().map_err(|error| format!("channel: {error:?}"))?;
+        let (mut writer, reader) = channel.split(empty.next_sequence);
         writer.enqueue(b"one").map_err(|error| error.to_string())?;
         writer.enqueue(b"two").map_err(|error| error.to_string())?;
-        let reader = JournalReader::from_consumer(consumer, empty.next_sequence);
+        writer.close();
         let mut worker = PersistenceWorker::<_, 8>::new(reader, file, FlushPolicy::EveryBatch)
             .map_err(|error| error.to_string())?;
         worker

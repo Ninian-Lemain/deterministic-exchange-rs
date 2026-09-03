@@ -6,22 +6,23 @@
    memory. Dropping the lease permits descriptor/buffer recycling.
 2. `hft-wire` validates version, type, declared and actual length, boundaries,
    endianness, and side before constructing a borrowed message.
-3. The gateway requires the exact next session sequence before state mutation.
-   A gap or duplicate fails closed and does not advance the expected sequence.
-4. The gateway normalizes validated scalar fields once into a 48-byte
-   `NewOrder`. Across cores this value belongs in a preallocated SPSC slot; this
-   is a bounded single-copy handoff.
-5. A matching shard checks and reserves account exposure, then mutates its
+3. `hft-router` normalizes the command and publishes it to the fixed queue for
+   its configured instrument shard. Unknown instruments and full queues reject.
+4. The gateway requires the exact next per-instrument sequence before state
+   mutation. A gap or duplicate fails closed and does not advance the expected
+   sequence.
+5. The normalized command crosses cores in a preallocated SPSC slot.
+6. A matching shard checks and reserves account exposure, then mutates its
    single-writer book.
-6. Execution reports are written into a caller-owned fixed report buffer. The
+7. Execution reports are written into a caller-owned fixed report buffer. The
    gateway converts filled reservations into settled positions.
-7. Owner-authorized cancellation uses a fixed-capacity `OrderId` index, removes
+8. Owner-authorized cancellation uses a fixed-capacity `OrderId` index, removes
    the resting remainder without disturbing peer FIFO, and releases exactly
    that remaining risk reservation.
-8. `hft-events` builds one fixed-capacity event batch for the command. It emits
+9. `hft-events` builds one fixed-capacity event batch for the command. It emits
    the terminal result, trades in execution order, and the final top-of-book
    change.
-9. The producer publishes the complete batch in one SPSC slot. Replay hashes
+10. The producer publishes the complete batch in one SPSC slot. Replay hashes
    stable logical state, independent of array slot placement.
 
 ## Ownership
@@ -35,6 +36,8 @@
   producer and consumer.
 - One event producer owns gateway admission. A full event queue is detected
   before sequence advancement or state mutation.
+- The router owns command producers and event consumers indexed by shard ID.
+  Each shard owns only its paired endpoints and matching gateway.
 - Vendor sessions uniquely own one opaque handle and destroy it once.
 
 ## Capacity and Backpressure
@@ -43,6 +46,8 @@
 - SPSC: returns the original value when full.
 - Event SPSC: one slot holds a complete command batch. Full means the command
   remains unconsumed and may be retried.
+- Router command SPSC: a full queue rejects publication. Event backpressure
+  leaves one command pending inside the target shard for retry.
 - Risk accounts and orders: explicit account/order capacity rejection.
 - Book: explicit price-level, per-level FIFO, and report capacity rejection.
 - Order index: fixed at four slots per configured per-side order capacity;

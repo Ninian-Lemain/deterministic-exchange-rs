@@ -2,8 +2,8 @@
 
 ## Where the project is
 
-Implemented through **v0.18.0**. The next committed milestone is
-**v0.19.0 Multi-Instrument Routing**.
+Implemented through **v0.19.0**. The next committed milestone is
+**v0.20.0 Fault Injection and Soak**.
 
 Waiting on external prerequisites:
 
@@ -287,10 +287,14 @@ equality, and snapshot-tail event equality.
 
 ### v0.19.0 - Multi-Instrument Routing
 
-Requires v0.12/v0.18. Deterministic instrument-to-shard mapping, independent
-single-writer books, and bounded command/event queues between router and
-shards. Routing is stable; unknown instruments reject; shards cannot mutate
-each other.
+Implemented. A sorted fixed route table maps one instrument to each shard.
+Input order does not change lookup results. The router owns one bounded command
+producer and event consumer per shard. Each shard owns the matching command
+consumer, event producer, gateway, risk state, and book. Unknown instruments,
+invalid maps, and full command queues reject explicitly. Event pressure retains
+the pending command before gateway mutation. Tests cover stable mapping, shard
+isolation, command and event routing, both queue pressure paths, and invalid
+configuration.
 
 ### v0.20.0 - Fault Injection and Soak
 

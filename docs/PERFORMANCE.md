@@ -22,6 +22,8 @@ line using schema `hft-bench-results/1`. The suite covers:
 - journal record creation, enqueue, verification, in-memory persistence, and recovery scanning
 - canonical snapshot encoding, verified restore, and journal tail replay
 - bounded event admission, batch publication, and full-ring refusal
+- multi-instrument route publication, shard processing, event retrieval, and
+  command-queue refusal
 
 Each record names its measurement boundary as component, gateway, or network.
 The current suite has component and gateway cells. It has no measured network
@@ -67,9 +69,9 @@ alone is never accepted as proof that a workload exercised its named path.
 
 The recorded reference environment is:
 
-- Intel N95 with four cores and four threads
-- Windows 11 Pro build 26200
-- about 16 GB RAM
+- AMD Ryzen 7 7735HS with eight cores and sixteen threads
+- Windows 11 Home build 26200
+- about 28 GB RAM
 - Rust 1.96.0 with LLVM 22.1.2
 - `x86_64-pc-windows-msvc`
 - fat LTO
@@ -152,6 +154,24 @@ keeps a capacity-one ring full and retries the same next command.
 
 These cells measure an in-process SPSC handoff. They do not include event wire
 encoding, network publication, storage, or a second process.
+
+## Multi-Instrument Routing
+
+The v0.19 router run used two instruments, two shards, 64 command slots per
+shard, and 64 event slots per shard. Five full-suite runs used 2,000 samples
+per cell. The table reports the median mean and median percentiles from those
+runs.
+
+| Workload | Mean | p50 | p99 | p99.9 | Allocations |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Route lookup and command publish | 44 ns | 0 ns | 100 ns | 100 ns | 0 |
+| Route, shard processing, event pop | 179 ns | 200 ns | 200 ns | 300 ns | 0 |
+| Full command queue refusal | 42 ns | 0 ns | 100 ns | 100 ns | 0 |
+
+Checksums matched across all five runs. The route cell times binary search and
+SPSC publication. The end-to-end cell uses IOC commands and includes route
+lookup, command publication, shard processing, event publication, and event
+retrieval. It does not cross processes or physical cores.
 
 ## Matching and Cancellation
 
@@ -366,6 +386,7 @@ layout changed.
 | v0.16 | Bounded command journal | Added versioned records, persistence, recovery, and fault fixtures |
 | v0.17 | Canonical state recovery | Added snapshot encoding, verified restore, and journal tail replay cells |
 | v0.18 | Bounded command events | Added admitted batch handoff and full-ring refusal cells |
+| v0.19 | Multi-instrument routing | Added route, shard round-trip, and command pressure cells |
 
 Historical absolute timings are desktop smoke evidence. Changes to fixtures or
 measurement boundaries make some cells unsuitable for direct comparison. The

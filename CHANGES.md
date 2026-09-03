@@ -4,6 +4,11 @@
 
 ### Added
 
+- Added fixed instrument-to-shard routes with one instrument per shard.
+- Added bounded command and event queues between the router and matching shards.
+- Added normalized command processing for gateway and event paths.
+- Added routing benchmarks for publication, shard processing, event retrieval,
+  and command queue pressure.
 - Added sequenced accepted, rejected, trade, cancel, replace, and top-of-book
   events.
 - Added fixed-capacity command event batches with SPSC publication and explicit
@@ -19,6 +24,7 @@
 
 ### Changed
 
+- Marked v0.19 multi-instrument routing as implemented.
 - Marked v0.17 recovery and state integrity as implemented.
 - Rewrote the README and the learnings document in a direct technical voice
   and removed typographic dashes from prose. No code changed.

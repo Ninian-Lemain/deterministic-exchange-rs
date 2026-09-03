@@ -7,12 +7,13 @@
 A high-speed backend server for an electronic financial exchange: a
 deterministic, allocation-free Rust matching engine and execution gateway,
 built for learning and experimentation. One packet flow runs end to end:
-RX frame lease -> lifetime-bound binary parsing -> session sequencing ->
-indexed pre-trade risk -> price-time matching/cancel -> execution reports ->
-replay digest.
+RX frame lease -> lifetime-bound binary parsing -> instrument routing ->
+per-instrument sequencing -> indexed pre-trade risk -> price-time
+matching/cancel -> execution reports -> replay digest.
 
-Current version: **v0.18.0** (v0.13 dedicated-Linux qualification pending hardware), under active development and not production
-ready. The project implements exchange-infrastructure mechanics by hand:
+Current version: **v0.19.0**. The v0.13 dedicated Linux qualification still
+needs hardware. The project is under active development and is not production
+ready. It implements exchange-infrastructure mechanics by hand:
 deterministic state transitions, fixed memory layouts, conservative
 pre-trade risk, explicit backpressure, price-time priority, session
 sequencing, replayability, and cache-aware cross-core handoff. Every piece
@@ -160,6 +161,7 @@ the full inventory and native-boundary policy.
 | `hft-book` | Price-time matching: stable-slot FIFO levels, sorted-level indices, `OrderId` index, match plans | None |
 | `hft-gateway` | Transaction coordination and report accounting | None |
 | `hft-events` | Sequenced command event batches and bounded SPSC publication | None after construction |
+| `hft-router` | Fixed instrument routes, shard command queues, and shard event queues | None after construction |
 | `hft-replay` | Ordered replay and stable final-state digest | None in engine |
 | `hft-recovery` | Canonical snapshots, SHA-256 verification, and journal tail restore | Cold path |
 | `hft-ffi` | Optional vendor C ABI ownership wrapper | Vendor-defined |
@@ -254,6 +256,7 @@ single subsystem did. The full write-up is in
 | Deterministic replay | Implemented | Stable final-state digest test |
 | Snapshot and journal recovery | Implemented | Canonical v1 fixture, SHA-256 verification, full replay equivalence |
 | Bounded command events | Implemented | Atomic command batches, stable order, explicit pre-mutation backpressure |
+| Multi-instrument routing | Implemented | Fixed routes, one writer per shard, bounded command and event queues |
 | Session sequence enforcement | Implemented | Duplicates/gaps fail closed without advancing |
 | Owner-authorized cancel | Implemented | FIFO-preserving removal and exact risk release |
 | Cache-aware SPSC | Implemented | Release/Acquire docs, stress test, Loom model |
@@ -266,8 +269,9 @@ single subsystem did. The full write-up is in
 ## Current Limitations
 
 - No external venue traffic, automatic snapshot rotation, snapshot manifest,
-  multi-instrument routing, authentication, or venue-certified session protocol
-  is implemented.
+  authentication, or venue-certified session protocol is implemented.
+- Routing uses one instrument per shard and per-instrument sequence domains.
+  Dynamic reassignment and a merged cross-shard event order are not provided.
 - Order IDs are monotonically increasing per gateway session. Reuse and
   out-of-order IDs fail closed.
 - The book rejects when report, order, per-price FIFO, or price-level
@@ -288,8 +292,9 @@ For a focused engineering review:
 3. `hft-book`: price-time matching, plan preflight, and stable-slot levels.
 4. `hft-gateway`: sequence enforcement and risk/book lifecycle coordination.
 5. `hft-events`: command event ordering and pre-mutation backpressure.
-6. `hft-spsc`: documented Release/Acquire ownership transfer.
-7. `hft-bench`: measured allocation assertion and reproducibility limitations.
+6. `hft-router`: fixed route lookup, shard ownership, and queue backpressure.
+7. `hft-spsc`: documented Release/Acquire ownership transfer.
+8. `hft-bench`: measured allocation assertion and reproducibility limitations.
 
 The protocol is specified in [docs/PROTOCOL.md](docs/PROTOCOL.md); operational
 failure behavior is in [docs/OPERATIONS.md](docs/OPERATIONS.md).

@@ -1,0 +1,31 @@
+flowchart TB
+    accTitle: Two execution paths
+    accDescr: The router sends commands to per-instrument shards without journaling. The separate single-instrument engine enqueues a journal record before gateway application. Its persistence worker writes and flushes outside matching. Both publish complete event batches.
+
+    subgraph Routed["Routed path (no journal)"]
+        direction LR
+        Router["Instrument router"] --> Commands["Command SPSC"]
+        Commands --> Shard["MatchingShard<br/>Sequence, risk, book"]
+        Shard --> RoutedEvents["Event SPSC"]
+    end
+
+    subgraph Journaled["Journaled path (one instrument)"]
+        direction LR
+        Admission["Engine admission"] --> Enqueue["Journal enqueue"]
+        Enqueue --> Gateway["Gateway<br/>Risk and book"]
+        Gateway --> EngineEvents["Event SPSC"]
+        Enqueue -.-> Persistence["PersistenceWorker<br/>Write and flush"]
+    end
+
+    Routed ~~~ Journaled
+
+    classDef entry fill:#e8f1ff,stroke:#647fa8,color:#172b4d,stroke-width:1.5px,rx:6,ry:6
+    classDef hot fill:#e9f6f1,stroke:#4e8a73,color:#133d2d,stroke-width:1.5px,rx:6,ry:6
+    classDef queue fill:#f1edfb,stroke:#9684b4,color:#443566,stroke-width:1.5px,rx:6,ry:6
+    classDef cold fill:#eef1f5,stroke:#7d899b,color:#243347,stroke-width:1.5px,rx:6,ry:6
+    class Router,Admission entry
+    class Shard,Gateway hot
+    class Commands,RoutedEvents,Enqueue,EngineEvents queue
+    class Persistence cold
+    style Routed fill:#fafbfd,stroke:#cbd5e1,stroke-width:1px
+    style Journaled fill:#fafbfd,stroke:#cbd5e1,stroke-width:1px

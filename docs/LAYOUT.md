@@ -1,7 +1,10 @@
 # Layout measurements
 
-Measured on x86_64 Windows with Rust 1.96.0, LLVM 22.1.2, and an AMD Ryzen 7
-7735HS. Release builds use fat LTO and one codegen unit.
+These measurements compare specific builds on x86_64 Windows with Rust 1.96.0,
+LLVM 22.1.2, and an AMD Ryzen 7 7735HS. Release builds used fat LTO and one
+codegen unit. Sizes depend on the target and configured capacities.
+
+## Book and risk storage, 2026-09-10
 
 | Type | Before bytes | After bytes |
 | --- | ---: | ---: |
@@ -11,24 +14,27 @@ Measured on x86_64 Windows with Rust 1.96.0, LLVM 22.1.2, and an AMD Ryzen 7
 | Risk index entry | 24 | 16 |
 | `RiskEngine<64,1024>` | 93,216 | 75,808 |
 
-Book commit `e17f78a` removes the price stored in each resting order. Export and
-replace read it from the containing level. The saving is 16 bytes per configured
-level/order pair across both sides.
+Book commit `e17f78a` removed the price stored in each resting order. Export and
+replace read it from the containing level. The change saved 16 bytes per
+configured level/order pair across both sides.
 
-Risk commit `c3d5efd` stores each private slot handle as `slot + 1` in a
+Risk commit `c3d5efd` stored each private slot handle as `slot + 1` in a
 `NonZeroUsize`. Zero represents an empty index entry. Account and order keys
-keep their full ranges. Both indexes save 16 bytes per configured account or
-reservation.
+keep their full ranges. Each index has two entries per configured slot, so
+the change saved 16 bytes per configured account or reservation.
 
-Wire, journal, snapshot, and public C layouts are unchanged. Model, FIFO,
-replace, collision, slot reuse, and snapshot fixture tests pass.
+The changes preserved wire, journal, snapshot, and public C layouts. Model,
+FIFO, replace, collision, slot reuse, and snapshot fixture tests passed for
+these builds.
 
 ## Desktop comparison
 
 [Raw results](evidence/layout-2026-09-10.zip) contain five paired book runs and
 ten paired risk runs. Each run contains 103 benchmark cells. Every pair has
 matching checksums, allocation counts, and deallocation counts. Recovery cells
-allocate on their cold paths. All measured hot paths retain zero allocations.
+allocate on their cold paths. Hot-path records report zero allocations, with
+the session measurement gap described in
+[Performance evidence](PERFORMANCE.md#allocation-policy).
 
 The book comparison uses `a4098bd` as its baseline. The risk comparison uses
 `e17f78a`, which already contains the book change. Risk runs 1 through 5 execute
@@ -43,19 +49,20 @@ The range covers the lowest and highest per-run mean.
 | Seeded gateway mix | 112.5 | 107 | 100 to 231 | 96 to 129 |
 | Route, process, retrieve event | 109.5 | 118 | 101 to 211 | 107 to 226 |
 
-Some cells regress and others improve. Dedicated Linux measurements must
-resolve the timing changes before performance qualification.
+The timing changes are mixed and the ranges overlap. Dedicated Linux runs are
+needed before performance qualification.
 
 ## Book totals and route lookup
 
-The 2026-09-12 build stores an order location as a nonzero flat handle. It
-encodes the side, level, and FIFO slot. Zero marks an empty index entry.
-Order IDs still use all 64 bits.
+The 2026-09-12 comparison uses baseline `011ca7b` with benchmark changes from
+`1dca1b5` and candidate `795908a`. The candidate stores each order location as
+a nonzero flat handle encoding the side, level, and FIFO slot. Zero marks an
+empty index entry. Order IDs still use all 64 bits.
 
 Each price level maintains a `u128` quantity total. Insert, partial fill,
 unlink, and replacement update it. Restore rebuilds it from logical orders.
-This adds 24 bytes per level on this target, including alignment. The smaller
-order index more than offsets that cost for the measured shapes.
+The total adds 24 bytes per level on this target, including alignment. The
+smaller order index saves more than that cost for the measured shapes.
 
 | Type | Before bytes | After bytes |
 | --- | ---: | ---: |
@@ -66,14 +73,14 @@ order index more than offsets that cost for the measured shapes.
 | `RouteTable<64>` | 768 | 644 |
 | `RouteTable<1024>` | 12,288 | 10,244 |
 
-The route table stores reverse indexes as `u16` instead of duplicate instrument
-IDs. A construction-time flag selects direct offsets for contiguous IDs and
+The route table stores `u16` reverse indexes in place of duplicate instrument
+IDs. A flag set at construction selects direct offsets for contiguous IDs and
 binary search for sparse IDs. Reverse lookup adds an indexed read. Full
 instrument IDs and all 65,536 shard IDs remain supported.
 
-The sorted price directory stays contiguous. Order slots do not move when
-prices are inserted or removed. Matching adds no heap allocation or logging.
-Wire, journal, snapshot, and C layouts are unchanged.
+The sorted price directory stays contiguous. Inserting or removing prices
+does not move order slots. These changes add no matching-path heap allocation
+or logging and preserve wire, journal, snapshot, and C layouts.
 
 [Measurements](PERFORMANCE.md#book-totals-and-direct-routing) include update
 costs and sparse lookup regressions.

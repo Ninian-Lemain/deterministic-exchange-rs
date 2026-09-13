@@ -1,98 +1,114 @@
-# Operational Model
+# Operations
 
-## Process Layout
+The intended Linux deployment assigns one writer to each instrument. Configure
+sockets, memory, queues, CPU affinity, NUMA placement, logging, metrics, and
+shutdown outside the matching loop. The router sends normalized, fixed-size
+commands between cores through SPSC queues.
 
-The intended Linux deployment uses one single-writer shard per instrument.
-Cold-path control configures sockets, memory, rings, affinity,
-NUMA placement, logging, metrics export, and shutdown before the hot loop.
-Inbound work crosses cores only as a normalized fixed-size SPSC value.
+`hft-router::MatchingShard` and the single-instrument `hft-engine` are separate
+components. The router does not use the journaled engine. See
+[Engine](ENGINE.md) for the engine's admission and shutdown contract.
 
-## Fail-Closed Conditions
+## Rejection and backpressure
 
-- Invalid packet/version/type/length/side: parse rejection.
-- Duplicate or missing sequence: rejection without advancing expected sequence.
-- Risk limit, kill switch, account, or order capacity failure: order rejection.
-- Report, level, or per-price FIFO exhaustion: book rejection after preflight.
-  The gateway releases the taker reservation.
-- Unauthorized or unknown cancel: rejection without changing book or risk state.
-- SPSC full: producer retains the value and observes explicit backpressure.
-- RX ring full: backend rejects rather than overwriting an unread frame.
-- Event ring full: the command is not admitted, its sequence is not consumed,
-  and gateway state is unchanged.
+| Condition | Result |
+| --- | --- |
+| Invalid wire version, type, length, or field encoding | Parse error. No command is applied. |
+| Duplicate or missing command sequence | Sequence error. Expected sequence is unchanged. |
+| Risk limit, kill switch, unknown account, or risk order capacity | Business rejection. Existing orders and account exposure are unchanged. |
+| Report, price level, or per-price order capacity | Book rejection after preflight. A new order's risk reservation is released. |
+| Unknown or unauthorized cancel | Business rejection. Book and risk state are unchanged. |
+| Replace business rejection | Existing book state and reservation are preserved. |
+| Full SPSC queue | Push returns the unpublished value. Higher-level callers retain input for retry. |
+| Full in-memory RX queue | `QueueError::Full`. Unread frames are preserved. |
+| Full event queue | Command is not admitted. Sequence and gateway state are unchanged. |
+| Full journal queue in `hft-engine` | Command is not admitted. Event reservation is dropped without applying the command. |
 
-Sequence-valid business rejections consume the command sequence. Rejected new
-orders can also advance order ID watermarks. Resting orders and account
-exposure remain unchanged. `RiskState` errors stop processing. They include
-sequence exhaustion and inconsistent internal risk state.
+Business rejections consume a valid command sequence. A rejected new order can
+also advance order ID watermarks. Retry a backpressured frame or command
+unchanged after the consumer frees capacity. Do not retry a consumed business
+rejection at the same sequence.
 
-## Event Boundary
+`RiskState` errors require processing to stop. They include sequence exhaustion
+and inconsistent internal risk state. `EventCapacityInvariant` and
+`PublicationInvariant` indicate a broken event batch bound or producer contract.
+These failures can occur after mutation and must not be retried.
 
-One queue entry contains every event produced by one command. Consumers never
-observe a partial command result. Event order within a batch is terminal event,
-trade events in book execution order, then changed top-of-book. A
-sequence-valid business rejection emits one rejection event. Parse and sequence
-errors emit no event.
+## Events and journal admission
 
-The caller must retain a backpressured frame and retry it after the consumer
-reclaims queue capacity. Treat `EventCapacityInvariant` and
-`PublicationInvariant` as fatal engine defects. They can occur only if the
-configured batch bound or the single-producer capacity contract is broken.
+One event queue entry contains the complete result of one command. Events appear
+in this order: terminal result, trades in execution order, then top-of-book if it
+changed. A business rejection produces one rejection event. Parse and sequence
+errors produce no events.
 
-The [engine facade](ENGINE.md) owns joint journal and event admission. It checks
-the journal sequence, obtains an `admit` token, enqueues the command, then calls
-`apply`. Journal pressure drops the token without changing gateway state. An
-error after enqueue stops admission. The lower-level APIs remain available for
-component use, but callers composing them must keep this ordering themselves.
+`hft-engine` checks the journal sequence, reserves event capacity with `admit`,
+enqueues the command, then calls `apply`. An error after enqueue stops admission.
+Callers composing the lower-level APIs must enforce that ordering themselves.
 
-## Journal Progress
+Events report command application. They do not acknowledge durable storage.
 
-A controlled `JournalChannel` exposes a `JournalStatusReader`. Written progress
-advances only after a whole batch is written. Durable progress advances only
-after a successful sink flush. Dequeue alone advances neither watermark.
-A partial write failure leaves the previous complete-batch watermark intact.
+## Persistence status
 
-Both watermarks identify the first sequence not covered. They start at the
-sequence supplied to `split`. An event is not a durability acknowledgment.
-Raw SPSC constructors provide no shared persistence status.
+A controlled `JournalChannel` exposes a `JournalStatusReader`. Its watermarks
+identify the first sequence not covered and start at the sequence passed to
+`split`.
 
-Worker failure or abandonment poisons the status. Taking its sink before
-shutdown also poisons it. Callers must stop admission on poison, although a
-command already in flight can race a storage failure. Producer closure, queue
-drain, and final flush must finish before `shutdown_complete` becomes true.
-Repeated successful shutdown does not flush again.
+| Status | Advances when |
+| --- | --- |
+| `next_written_sequence` | A complete batch has been written to the sink. |
+| `next_durable_sequence` | The sink has successfully flushed all preceding writes. |
+| `shutdown_complete` | The producer is closed, the queue is drained, and the final flush succeeds. |
 
-## Recovery Boundary
+Dequeue advances neither watermark. A partial write failure leaves the written
+watermark at the previous complete batch. For a file sink, flush includes
+`sync_data`. `EveryBatch` flushes each nonempty batch. `OnShutdown` defers flush
+until shutdown. Repeating a successful shutdown does not flush again.
 
-`hft-recovery` restores a versioned snapshot and a contiguous journal tail.
-The snapshot stores logical gateway, risk, and book state with its capacity
-shape, applied sequence, and SHA-256 digest. Restore rejects corrupt,
-truncated, unsupported, noncanonical, or capacity-incompatible state. Tail
-replay rejects overlap, gaps, partial records, corrupt records, and a mismatch
-between the journal sequence and wire payload sequence.
+Worker failure or abandonment poisons the shared status. Taking the sink before
+shutdown also poisons it. Stop admission when poison is observed. A storage
+failure can still race a command already in flight. Raw SPSC journal constructors
+do not provide shared persistence status.
 
-Snapshot publication accepts only a new generation path. It syncs the file and,
-on Unix, its parent directory. The API distinguishes failure before publication
-from failure after the destination became visible. The repository does not yet
-provide generation naming, manifest replacement, snapshot retention, or
-automatic selection of the latest valid snapshot. An adapter must stop order
-admission, select an authoritative snapshot and tail, restore them, verify the
-result, and only then reopen the shard.
+## Recovery
 
-## Linux Qualification Checklist
+`hft-recovery` restores logical gateway, risk, and book state from a versioned
+snapshot, then replays a contiguous journal tail. The snapshot includes its
+capacity shape, applied sequence, and SHA-256 digest. Restore rejects corruption,
+truncation, unsupported formats, noncanonical encoding, invalid logical state,
+and capacity mismatch. Tail replay rejects overlap, gaps, partial or corrupt
+records, and differences between journal and payload sequence numbers.
 
-- Pin shard and NIC queue IRQs to topology-aware isolated cores.
-- Place UMEM, book, risk, SPSC, and TX frames on the NIC-local NUMA node.
-- Prefault and lock memory; validate hugepage policy outside the hot loop.
-- Exercise RX/TX exhaustion, link reset, process shutdown, and recovery.
+Snapshot v1 records account, risk order, level, and per-level order capacities.
+It does not record `REPORTS`. Replay must use the original report bound.
+
+`persist_snapshot_new` requires a new destination path. It syncs a temporary file,
+publishes the destination through a hard link, removes the temporary name, and
+syncs the parent directory on Unix. Errors distinguish failure before publication
+from failure after the destination became visible.
+
+Generation naming, manifest replacement, retention, and selection of the latest
+valid snapshot remain application responsibilities. Keep admission closed while
+selecting an authoritative snapshot and tail, restoring them, and verifying the
+result. Reopen only after those steps succeed.
+
+## Linux deployment checks
+
+Component qualification scripts require a dedicated Linux host and hardware
+counters. They do not require a NIC adapter. A network deployment also needs
+these checks:
+
+- Pin shard threads to cores free of unrelated interrupts. Record NIC queue and
+  interrupt placement separately.
+- Place UMEM, book, risk, SPSC, and TX storage on the NIC's NUMA node.
+- Prefault and lock memory. Validate the hugepage policy before admission.
+- Exercise RX/TX exhaustion, link reset, shutdown, and recovery.
 - Record kernel, firmware, mitigations, governor, compiler flags, offered load,
-  percentiles, queue occupancy, cache/branch misses, context switches, page
-  faults, and allocation deltas.
-- Never promote hosted-runner or Windows timing to a latency SLO.
+  latency percentiles, queue occupancy, cache and branch misses, context switches,
+  page faults, and allocation deltas.
 
-## Integration Boundaries
+Hosted-runner and Windows timings do not establish a Linux latency SLO.
 
-- `UdpRx` is a portable syscall baseline.
-- `af-xdp` is a truthful feature-gated marker until real descriptor/UMEM
-  ownership is implemented on Linux.
-- `VendorSession` is a safe ownership wrapper around an unavailable SDK, not a
-  simulated vendor backend.
+`UdpRx` provides a portable syscall baseline. The `af-xdp` feature is an
+availability marker without descriptor or UMEM ownership. `VendorSession` wraps
+SDK ownership, but the vendor SDK is unavailable. AF_XDP and vendor integration
+are not implemented production NIC backends.

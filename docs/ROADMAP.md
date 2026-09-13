@@ -1,357 +1,141 @@
 # Roadmap
 
-## Where the project is
+The workspace version is 0.19.0. Matching, risk, sessions, journaling, recovery,
+events, and instrument routing are implemented as library components.
+Dedicated Linux qualification and v0.20 fault qualification remain open.
+The repository is not ready for a production deployment.
 
-Implemented through **v0.19.0**. The next committed milestone is
-**v0.20.0 Fault Injection and Soak**.
+## Current work
 
-Waiting on external prerequisites:
+| Area | Status | Remaining work |
+| --- | --- | --- |
+| v0.13 Dedicated Linux qualification | Waiting on hardware | Qualified host, environment manifest, raw latency and hardware counters |
+| v0.20 Fault injection and soak | In progress | Completed multi-hour runs and combined service fault coverage |
+| Pre-v1 engine API | In progress | Router and session ownership, persisted configuration, operations workflows, independent review |
 
-- **v0.13 Dedicated Linux Qualification** needs a dedicated Linux host
-  (pinned CPU/governor/isolation) so `perf` results can be published with a
-  named environment manifest. Nothing else in the roadmap depends on it;
-  every later milestone's dependency chain skips over it. It stays open until
-  that hardware is available.
+The [engine facade](ENGINE.md) now joins admission, bounded events, and journal
+status for one instrument. Its tests cover both queue pressure paths, worker
+failure, shutdown, snapshot restart, and separate workers. The router still
+uses its own `MatchingShard`, without this facade or a journal.
 
-## Scope and Rules
+## Implemented milestones
 
-This is a library-first deterministic execution engine. The matching core is
-single-writer and fixed-capacity. Measured hot paths perform no heap allocation
-after initialization and contain no locks, blocking I/O, logging, formatting,
-or syscalls.
+These entries describe completed implementation work, not a production
+qualification. Historical timings belong in [performance evidence](PERFORMANCE.md).
 
-Status is evidence-based:
+| Version | Change | Behavior and coverage |
+| --- | --- | --- |
+| v0.1.0 | Deterministic vertical slice | Borrowed parsing, fixed-capacity risk and book, owner cancel, SPSC handoff, and replay digest |
+| v0.2.0 | Indexed order lookup | Fixed order ID index with back-shift deletion and collision, relocation, and slot-reuse tests |
+| v0.3.0 | Stable-slot FIFO | Per-level linked slots replace order shifting. Tests cover priority, live/free separation, and atomic full-level refusal |
+| v0.4.0 | Indexed risk state | Account and reservation indexes with bounded load, stable slots, and exposure reconciliation |
+| v0.5.0 | Price-level discovery | Sorted active-level directory and free-slot pool. Best price is O(1), lookup O(log n), and insertion/removal shifts O(n) index entries |
+| v0.6.0 | Matching transaction plan | One preflight walk checks liquidity and capacity. A bounded plan applies fills and the resting remainder without a book undo log |
+| v0.7.0 | Reference models | Seeded book and gateway comparisons cover quantity, priority, ownership, reservations, and replay |
+| v0.8.0 | Benchmark suite | Machine-readable component and gateway measurements with percentiles, checksums, and allocation checks |
+| v0.9.0 | IOC and FOK | IOC discards its unfilled remainder. FOK fills completely or rejects before book mutation |
+| v0.10.0 | Post-only | Crossing orders reject. Non-crossing orders join the normal FIFO tail |
+| v0.11.0 | Replace | A strict same-price reduction keeps priority. Other accepted replaces lose priority. Crossing replaces reject and restore the prior reservation |
+| v0.12.0 | SPSC Loom and unsafe audit | Loom runs the shipped queue algorithm. Tests cover publication, wrap, and returned full-queue payloads |
+| v0.14.0 | Session state machine | Caller-supplied virtual time drives connection, logon, active, recovery, logout, and failure states |
+| v0.15.0 | Session recovery | Bounded retransmission retains unconfirmed frames. Confirmation removes a prefix and recovery replays the retained suffix |
+| v0.16.0 | Command journal | Versioned 64-byte CRC32C records, bounded enqueue, batched persistence, short-write handling, flush policies, and corrupt-tail rejection |
+| v0.17.0 | State recovery | Canonical SHA-256 snapshots, rebuilt indexes and free lists, and contiguous journal-tail replay |
+| v0.18.0 | Bounded events | One fixed batch per processed command, sequence/ordinal IDs, and capacity checks before gateway mutation |
+| v0.19.0 | Instrument routing | Fixed instrument-to-shard mapping, independent books and risk state, bounded command/event queues, and explicit unknown-route refusal |
 
-- **Implemented:** code, tests, documentation, and required evidence exist.
-- **Next:** the only committed implementation milestone.
-- **Planned:** dependency-ordered work with no completion claim.
-- **Experimental:** optional work that cannot define core APIs.
-- **Post-v1 research:** hardware or venue-specific investigation.
+The implementations have limits that remain part of their contracts:
 
-Every release requires formatting, workspace check, Clippy with warnings
-denied, tests, relevant Miri/Loom/sanitizer/property coverage, explicit capacity
-and failure behavior, and a documented limitation. Performance changes require
-same-workload before/after release results with workload, configuration, CPU,
-OS, compiler, memory cost, and allocation delta. CI and Windows timings are not
-production-latency evidence.
+- Identity lookup is expected O(1) at bounded load. Collisions still require
+  probing.
+- Snapshot v1 stores the gateway capacity shape, but not the report bound.
+  Tail replay must use the original `REPORTS` value.
+- Event publication acknowledges application, not durable persistence.
+- Each instrument has its own sequence and event order. There is no merged
+  cross-shard event order or dynamic shard reassignment.
+- Session state and retransmission are library mechanisms, not a certified
+  external venue protocol.
 
-## Safety and Native Boundaries Before v0.3
+## v0.13 Dedicated Linux qualification
 
-- Public APIs, matching, risk, parsing, sessions, and replay remain safe Rust.
-- Repository-owned unsafe sites require a documented invariant and test.
-- Keep the audited Rust SPSC; do not move it to C++ merely to hide unsafe code.
-- Use optional C++ only for a real vendor/NIC SDK behind a C ABI with opaque
-  handles, fixed-width fields, explicit ownership/errors, and no exceptions or
-  C++ standard-library types across the boundary.
-- Default builds stay Rust-only. Native shims require ABI tests and ASan/UBSan.
+A qualifying run needs a dedicated Linux host with controlled CPU placement,
+frequency policy, SMT, IRQs, and NUMA placement. Publish the environment
+manifest, raw samples, binary identity, and hardware counters with the result.
 
-This is immediate policy and verification work, not an engine feature release.
-Policy status: safe-crate forbids and the unsafe allowlist are CI-enforced;
-each unsafe site has a documented invariant and test ([safety](SAFETY.md));
-the `vendor-sdk` C ABI tests run under ASan/UBSan in CI.
+The tooling in `scripts/linux` captures the environment, checks host settings,
+pins execution, collects counters, and hashes output. It rejects container
+runs as qualification evidence. Passing its checks is a prerequisite, not a
+substitute for reviewing the host and workload.
 
-## Implemented
+Windows and Docker Desktop can validate code and tooling. They do not meet
+this hardware requirement. Later implementation milestones do not depend on
+v0.13, but v1 requires its evidence.
 
-### v0.1.0 - Deterministic Vertical Slice
+## v0.20 Fault injection and soak
 
-Borrowed parsing, RAII frame ownership, fixed-capacity risk/matching, bounded
-SPSC handoff, owner-authorized cancel, replay digest, and portable CI. Remaining
-hot-path limits were linear risk lookup, linear price discovery, FIFO shifts,
-and duplicate matching traversal during preflight.
+Requires v0.11 and v0.14 through v0.19.
 
-### v0.2.0 - Indexed Order Lookup
+The [soak runner](SOAK.md) covers routed churn, recurring queue pressure,
+session faults, exhaustion, and repeated snapshot recovery. Each seed runs
+twice and must produce matching state, events, and counters. Journal faults
+currently use a separate in-memory fixture.
 
-Fixed-capacity `OrderId -> resting slot` lookup with deterministic back-shift
-deletion. Collision, relocation, fill, cancel, and slot-reuse invariants pass.
-The documented 512-level desktop workload measured 1,329 ns to 26 ns median
-cancellation latency at a 64 KiB book-size cost. See the
-[performance methodology](PERFORMANCE.md) for the workload and evidence.
-Per-level FIFO shifts remain.
+Completion requires retained seeds and completed multi-hour runs covering:
 
-### v0.3.0 - Stable-Slot FIFO Levels
+- Churn, gaps, reconnects, malformed input, and capacity exhaustion.
+- Command and event pressure, journal stalls, and routing imbalance.
+- Snapshots and recovery during the declared workload.
+- Shutdown races across the combined service boundaries.
+- Recorded memory use with no unexplained growth or state divergence.
 
-Intrusive doubly linked per-level FIFOs with head, tail, free-list, and stable
-slot handles replaced array shifts. The order index maps IDs to stable slot
-handles, never FIFO positions. Handle stability across unrelated mutations,
-stale-handle fail-closed behavior, disjoint live/free sets, atomic full-level
-rejection, and a 600-command array-model comparison pass. The documented depth
-harness measured flat 100 ns p50 head/middle/tail cancel and head fill at
-depths 1 through 512 (down from 3,300/1,400/100/3,100 ns at depth 512) for a
-+14% `OrderBook<1, 512>` memory cost. See the
-[performance methodology](PERFORMANCE.md) for the workload and evidence.
-Best-price and risk lookup stay linear.
+A profile name or large step count is not proof of elapsed hours. An interrupted
+run without a successful result is not a pass. No completed multi-hour
+qualification is currently recorded.
 
-### v0.4.0 - Indexed Risk State
+## Pre-v1 stabilization
 
-Fixed-capacity `AccountId -> AccountState` and `OrderId -> Reservation` open
-addressed indices with deterministic collision/back-shift deletion replaced
-linear scans. Reservations live in a stable-slot free-list. Account and
-reservation lookups are now O(1) at load ≤ 1/2. Handle stability across
-unrelated churn, stale-handle fail-closed, disjoint live/free sets, duplicate
-and full rejection, and reservation-totals-equal-exposure invariant all pass.
-The documented risk harness measured up to 53x latency reduction at 90%
-reservation occupancy (2,892 ns to 55 ns for cancel at occupancy 921) and
-2.8x for account lookups at 90% account occupancy, with zero allocations and
-unchanged logical digest. See the
-[performance methodology](PERFORMANCE.md) for the workload and evidence.
+The initial facade, builder, lifecycle example, MSRV checks, and
+[desktop overhead comparison](PERFORMANCE.md#engine-boundary) are present.
+Session benchmark fixtures also need repair before their timings or allocation
+fields can be used as evidence. The current gaps are listed in
+[Performance](PERFORMANCE.md#session-and-recovery-window).
 
-### v0.5.0 - Price-Level Discovery
+The following work remains:
 
-Sorted-level index for O(1) best-bid/ask discovery replaced O(LEVELS) linear
-scan. Each side carries a sorted array of occupied level indices; insert and
-remove maintain sort order. `best_crossing_level` and `simulate_sorted` now
-iterate the sorted index directly, visiting only occupied levels. The sorted
-index handles arbitrary price distributions. All levels, crossings, boundaries,
-model comparisons, and churn invariants pass. The documented price benchmark
-measured 76-86 ns mean discovery latency across sparse and dense book shapes
-with zero allocations and unchanged logical digest. Best-price and risk lookup
-are now O(1) with respect to level count.
+1. Finish the public engine boundary for routing and session admission.
+   Public mutation must not bypass sequence, risk, or capacity checks.
+2. Persist and validate configuration needed for replay, including the report
+   bound. Define API and format compatibility rules.
+3. Add the operational harness for configuration validation, health, drain,
+   shutdown, backup/restore, upgrade, and rollback. Keep storage and process
+   control outside matching.
+4. Measure the completed boundary on dedicated Linux. Resolve unexplained
+   regressions and verify allocation behavior on each declared hot path.
+5. Obtain independent API, unsafe-boundary, recovery-format, and operations
+   review before a v1 release candidate.
 
-### v0.6.0 - Matching Transaction Plan
+## v1 entry criteria
 
-A `MatchPlan` of bounded fills and resting quantity replaces the second
-simulation walk: `build_plan` preflights validation, duplicates, report
-capacity, level capacity, and liquidity with a single traversal of the
-sorted-level index that stops at the taker's price limit; `apply_plan`
-performs the mutation walk. Because preflight decides every fallible condition
-against an unchanged book, plan application is infallible and there is no
-rollback path. The resting path finds or allocates price levels through the
-sorted-level index (binary search plus a free-slot pool); level removal from
-the index is also a binary search. Capacity rejection is atomic; quantity is
-conserved; each maker appears once; plan application equals the reference
-matcher. A match-plan benchmark measures non-crossing, single/multi-fill,
-report-full rejection, and deep rejection at 72-115 ns mean with zero
-allocations and unchanged logical digest. See the
-[performance methodology](PERFORMANCE.md) for the workload and evidence.
-
-### v0.7.0 - Property and Reference Models
-
-A shared test-support crate (`hft-model`) provides seeded deterministic
-command generation, a naive array reference book, and a gateway-level
-reference model that mirrors sequencing, duplicate-id policy, risk
-reservations, and matching outcomes. Fixed-seed CI coverage now checks
-quantity conservation, non-negative remainder, price-time priority via fill
-sequence equality across multiple book shapes, owner cancel, unique terminal
-transitions, reservation-equals-live-exposure account snapshots at every
-step, replay digest equality over full byte streams including rejections,
-and lossless SPSC delivery under seeded interleavings. The release benchmark
-suite was rerun with unchanged digests and zero measured hot-path
-allocations.
-
-### v0.8.0 - Reproducible Benchmark Suite
-
-The harness emits one machine-readable JSON record per cell (schema fixture
-validated in CI against a reduced run) with p50/p90/p99/p99.9/max,
-throughput, allocation deltas, deterministic checksums, and separated
-component, gateway, and network boundaries. Workloads cover wire parsing,
-SPSC ring traffic with occupancy and backpressure tracking, a seeded mixed
-gateway session, deep-book traversals at cycled depths, head/middle/tail
-FIFO operations across depths, full risk-operation sweeps at three
-reservation occupancies, best-price discovery, and match-plan scenarios;
-every scenario warms up untimed, validates percentile ordering, and fails on
-any measured allocation. Validating the suite exposed a release-only defect:
-both open-addressed indexes ran their back-shift update closures inside
-debug_assert, stranding moved handles and leaking entries in release builds.
-The closures now run unconditionally with regression coverage. Perf counters
-(cycles, instructions, branches, cache misses) stay deferred to the dedicated
-Linux qualification; Windows runs validate correctness and allocation
-behavior only.
-
-### v0.9.0 - IOC and FOK
-
-Wire protocol v2 adds a time-in-force byte to new orders. IOC executes what
-crossed at the limit and never rests; its untraded remainder is reported as
-a discarded quantity and releases the risk reservation immediately, so
-quantity conservation reads filled + rested + discarded. FOK preflights full
-liquidity and report capacity in the plan walk and either fills completely
-or rejects with `InsufficientLiquidity` before any mutation. The reference
-model mirrors both semantics, seeded property sessions generate mixed TIF
-traffic with per-step snapshot equivalence and replay equality, and the
-benchmark suite gained IOC empty/partial/full plus FOK
-reject/single/multi-fill cells alongside their GTC comparisons.
-
-### v0.10.0 - Post-Only
-
-Post-only orders use the best-price sorted index to reject any order that
-would trade before a single mutation occurs; accepted post-only orders rest
-at the level tail exactly like other makers. The reference model mirrors the
-check, seeded property sessions include post-only traffic through the full
-gateway equivalence, snapshot, and replay gates, and the benchmark suite
-gained crossing and non-crossing post-only cells at shallow (one level) and
-deep (64 level) occupancies. Explicit unit tests lock the three invariants:
-never trades, joins the FIFO tail, rejection leaves book state untouched.
-
-### v0.11.0 - Replace and Order Lifecycle
-
-Protocol type 3 adds owned replaces. A same-price quantity reduction patches
-the resting slot in place and keeps FIFO priority; a price change or increase
-loses priority, re-enters at the destination tail after capacity preflight,
-and rejects with `ReplaceWouldCross` when the new price would cross the
-opposing best. Risk reservations adjust before the book mutates and are
-restored exactly on any rejected replace; filled or canceled orders are
-terminal and reject further replaces as unknown. The reference model mirrors
-every transition, seeded property sessions drive replace churn through
-gateway equivalence, per-step reservation-equals-exposure snapshots, and
-replay equality, and explicit tests lock rejected-replace atomicity,
-priority retention, and terminal immutability. Benchmarks report book-side
-reduce/increase/reprice/reject cells and a separate risk-only adjustment
-cell.
-
-### v0.12.0 - Actual SPSC Loom and Unsafe Audit
-
-The queue swaps its atomics and slot cells to Loom primitives under
-`--features loom`, so CI explores the shipped algorithm directly: a
-capacity-two FIFO handoff across all publication/consumption interleavings
-and a capacity-one backpressure/wrap scenario asserting the rejected payload
-is returned intact. The stand-in model test was removed. The unsafe audit
-covers UnsafeCell sites, initialization/drop pairing, index wrap, full/empty
-discrimination, and endpoint lifetimes in [SAFETY](SAFETY.md). Miri runs the
-whole crate in CI with reduced iteration budgets and demonstrably rejects a
-weakened Release publication as a data race. The SPSC benchmark cell is
-unchanged at 43 ns mean before/after the refactor with zero allocation
-deltas.
-
-### v0.14.0 - Session State Machine
-
-The `hft-session` crate owns the connection lifecycle (disconnected,
-connecting, logon, active, recovering, logout, failed) outside the matching
-core, on a deterministic virtual clock. Commands are admitted only while
-Active or Recovering; gaps, duplicates, and invalid transitions fail closed
-without advancing state, sequence, or timers. A heartbeat timeout drops to
-Recovering with a second window armed, and a second consecutive timeout
-fails the session. An exhaustive state-times-event table test pins every
-cell of the transition matrix and asserts refusals leave the observable
-session untouched, virtual-time tests cover both deadline paths, and a
-replay fixture gates recorded gateway frames through an Active session,
-disconnects mid-stream, and replays the tail without gaps after re-logon.
-Benchmark cells time active admission versus duplicate rejection against
-the gateway baseline. Shipped ahead of v0.13 because its dependency chain
-does not include it.
-
-### v0.15.0 - Session Recovery
-
-A bounded retransmission buffer retains accepted command frames in order
-alongside their sequences; confirmation drops the confirmed prefix, and
-recovery replays exactly the retained suffix. Retention exhaustion is an
-explicit error rather than silent history loss, and delayed, reordered, or
-duplicated inputs are refused by sequence gating before they can duplicate a
-command. Deterministic timeout tests drive the state machine into
-Recovering and back: the retained window replays from the first unconfirmed
-sequence, confirmation is idempotent, and benchmark cells cover active
-traffic, heartbeat keep-alive, gap entry with refill bursts, and full-
-retention replay.
-
-### v0.16.0 - Bounded Command Journal
-
-A 64-byte versioned command record carries its sequence, payload length, and
-CRC32C. The matching side only builds and publishes records through the bounded
-SPSC queue. The persistence worker owns storage writes, fixed-size batching,
-short-write handling, and `EveryBatch` or `OnShutdown` flush policy. Storage or
-validation failure poisons the worker. Recovery rejects corrupt, truncated,
-duplicate, missing, unsupported, or out-of-order records. Crash fixtures scan
-encoded prefixes and partial tails. Matching-side record creation, checksum,
-enqueue, verification, batching, recovery, and saturation cells check allocation
-deltas.
-
-## Waiting on dedicated hardware
-
-### v0.13.0 - Dedicated Linux Qualification
-
-Requires a dedicated Linux host (pinned CPU, governor, isolation, IRQs) so
-`perf` counters and an environment manifest can be published as raw evidence.
-The scripts under `scripts/linux` capture the environment, reject unsuitable
-hosts, pin CPU and NUMA placement, collect perf data, and hash raw results.
-This Windows laptop and Docker Desktop do not qualify. Nothing below depends on
-v0.13.
-
-## Planned Reliability
-
-### v0.17.0 Recovery and State Integrity
-
-Implemented. Book, risk, and gateway state export canonical logical records.
-The versioned big-endian snapshot uses SHA-256 integrity and records its
-capacity shape and applied sequence. Restore rebuilds indexes and free lists,
-then replays a contiguous journal tail. Compatibility fixtures fix the v1 byte
-format. Tests reject corruption, truncation, unsupported versions, capacity
-mismatch, noncanonical state, tail overlap, gaps, and payload sequence mismatch.
-
-### v0.18.0 - Bounded Events
-
-Implemented. Each sequence-valid command publishes one fixed-capacity batch
-containing accepted, rejected, trade, cancel, replace, and changed top-of-book
-events. Event IDs use the command sequence and batch ordinal. One SPSC slot
-holds the whole command result. A full queue rejects admission before the
-gateway advances its sequence or mutates state. Tests cover event order,
-multi-level fills, business rejections, retry after backpressure, replay
-equality, and snapshot-tail event equality.
-
-### v0.19.0 - Multi-Instrument Routing
-
-Implemented. A sorted fixed route table maps one instrument to each shard.
-Input order does not change lookup results. The router owns one bounded command
-producer and event consumer per shard. Each shard owns the matching command
-consumer, event producer, gateway, risk state, and book. Unknown instruments,
-invalid maps, and full command queues reject explicitly. Event pressure retains
-the pending command before gateway mutation. Tests cover stable mapping, shard
-isolation, command and event routing, both queue pressure paths, and invalid
-configuration.
-
-### v0.20.0 - Fault Injection and Soak
-
-Requires v0.11/v0.14-v0.19. Hours of deterministic churn, gaps, reconnect,
-queue pressure, journal stalls, snapshots, recovery, malformed input,
-exhaustion, routing imbalance, and shutdown races with retained seeds. No
-unexplained growth or divergence for the declared run.
-
-The [soak runner](SOAK.md) now checks sustained routed churn, recurring queue
-pressure, resumed snapshot recovery, session faults, and capacity exhaustion.
-Multi-hour evidence and combined service fault coverage remain open.
-
-## Pre-v1 Stabilization
-
-The initial [engine facade](ENGINE.md) joins single-instrument admission,
-bounded events, and journal persistence status. Tests cover queue pressure,
-worker failure, shutdown, snapshot restart, and separate worker threads.
-Router and session ownership, a persisted configuration manifest, operational
-recovery workflows, and API review remain open.
-
-- Add a small facade crate, validated builder, bounded command/report/event
-  API, ownership/backpressure rustdoc, MSRV/features, examples, and format/API
-  compatibility policy. The public API cannot bypass sequence, risk, or capacity.
-- Add only the operational harness needed to validate configuration, health,
-  drain, shutdown, backup/restore, upgrade, rollback, and recovery. Keep it
-  outside the library core.
-- Measure facade overhead against the internal gateway and rerun the dedicated
-  Linux suite. No new hot allocation or unexplained regression is accepted.
-- Require independent API, unsafe-boundary, recovery-format, and operations
-  review before creating a v1 release candidate.
-
-## v1.0 Entry Criteria
-
-- Stable library API; deterministic matching/risk/sessions/events/recovery.
-- Zero measured post-initialization allocation on declared hot paths.
-- Explicit overload behavior for every capacity and queue.
-- Dedicated-Linux raw evidence with no network-latency overclaim.
-- Miri, actual-algorithm Loom coverage, sanitizers, property/fuzz, crash, and
-  soak qualification.
+- Stable library API for matching, risk, sessions, events, and recovery.
+- Zero measured allocation after initialization on declared hot paths.
+- Explicit overload behavior for every fixed capacity and queue.
+- Dedicated Linux evidence for the measured boundary, without a network claim
+  where no network path was measured.
+- Relevant Miri, actual-algorithm Loom, sanitizer, property/fuzz, crash, and
+  soak checks.
 - Install, validate, drain, shutdown, backup/restore, upgrade/rollback, health,
-  and incident runbooks for any reference service.
-- Explicit unsupported venue, regulatory, hardware, and deployment requirements.
+  and incident procedures for any reference service.
+- Documented unsupported venue, regulatory, hardware, and deployment requirements.
 
-## Experimental
+## Later work
 
-- Tuned Linux UDP batching only after the dedicated Linux qualification; it
-  stays outside the engine API.
-- Real vendor/NIC SDK shims may use optional C++ under the audited C ABI policy.
-
-## Post-v1 Research
+Linux UDP batching is experimental and follows dedicated qualification.
+A real vendor SDK may use a small C ABI shim with ownership and ABI tests.
 
 AF_XDP, DPDK, huge pages, hardware timestamps, kernel bypass, replication,
-standby promotion, and venue adapters. These require hardware and separate
-failure/performance evidence.
+standby promotion, and venue adapters require separate designs and evidence.
+Multi-chain execution is not implemented.
 
-## Non-Claims
-
-No exchange certification, regulatory compliance, unimplemented venue
-compatibility, production readiness before recovery/operations tests, or
-production latency without dedicated measurement of the stated boundary.
+The [safety policy](SAFETY.md) applies throughout. Business logic stays in safe
+Rust. Native code is reserved for an actual external boundary, not a way to
+move unsafe code out of the Rust inventory.

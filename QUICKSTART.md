@@ -20,14 +20,16 @@ count, execution-report count, and deterministic final-state digest.
 cargo fmt --all --check
 cargo check --workspace --all-targets --all-features
 cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace
 cargo test --workspace --all-features
 cargo test --doc --workspace
-cargo test -p hft-spsc --features loom loom_models_release_acquire_publication
+cargo test -p hft-spsc --features loom loom_actual_queue
 cargo test -p hft-wire malformed_input_smoke_never_panics
 cargo run --release -p hft-bench
 python scripts/source_ratio.py
 ```
 
 The benchmark executable exits nonzero if allocation or deallocation occurs
-between its post-warm-up counters. Its Windows/macOS times are not production
-latency evidence.
+between its post-warm-up counters. Known gaps in session fixture and allocation
+coverage are listed in [Performance evidence](docs/PERFORMANCE.md#session-and-recovery-window).
+Desktop timings are not production latency evidence.

@@ -1,159 +1,134 @@
-# What I Learned
+# Engineering lessons
 
-I built this project to learn how exchange mechanics change when capacity,
-ordering, and failure behavior are part of the API. Most useful lessons came
-from code that looked reasonable until a test or benchmark proved otherwise.
+The project's useful lessons came from workload failures, release-only bugs,
+and changes in data layout. These notes explain the decisions behind the
+current implementation.
 
-## Fixed Capacity Defines Overload
+## Capacity is part of admission
 
-Fixed arrays removed allocator activity from the measured path. They also made
-every full condition observable. A full book, risk table, report buffer, or
-queue must reject the operation or return backpressure without changing live
-state. Capacity is part of the protocol, not an implementation detail.
+Fixed arrays remove growth from matching, but every full condition needs a
+defined response. Command, event, and journal queues return backpressure.
+Risk and book capacities produce business rejections.
 
-The release benchmark checks allocation and deallocation counters after
-warmup. That catches a regression directly. A latency change alone would be a
-weaker signal.
+Those outcomes are different. Backpressure before admission consumes no
+sequence. A sequence-valid business rejection consumes the sequence and can
+advance order ID watermarks. Resting orders and exposure must still remain
+consistent.
 
-## Stable Handles Stop FIFO Movement
+## Stable slots and compact indexes solve different costs
 
-Dense price levels made cancellation cost depend on queue depth because
-removing an order shifted every order behind it. Stable slots with intrusive
-links changed removal into a few link updates. Peer orders stay in place and
-keep their identity.
+Removing an order from a dense FIFO used to move its peers. Intrusive links over
+stable slots reduce cancellation to index lookup and link updates. They cost
+metadata, so shallow and deep workloads both need measurement.
 
-The tradeoff is more metadata per slot and a slower depth-one case. The memory
-cost and the shallow regression belong beside the latency result.
+The price directory is a separate contiguous array of level indexes. Binary
+search finds a price, while insertion and removal shift index entries.
+Orders do not move with the directory. Best-price lookup reads its first entry.
 
-## Indexes Trade Memory for Predictable Lookup
+Compact private handles reduced index storage without reducing the public ID
+range. Each level now maintains its quantity total, so top-of-book reads do
+not walk the FIFO. Update work and memory cost still belong in the benchmark.
+The [layout measurements](LAYOUT.md) include both.
 
-Cancellation starts with an order ID. Scanning the book made its cost depend
-on unrelated occupancy. Fixed open-addressed indexes removed that scan for
-orders, accounts, and reservations.
+## Preflight removes expected failure from book application
 
-The first price index only sorted active levels. Insertion still scanned the
-level array for a free slot. Giving the index its own free-slot pool removed
-that second scan. An index has to own lookup and slot lifecycle to remove the
-occupancy-dependent path.
+The matcher builds a bounded plan before changing orders. It checks order
+validity, liquidity, report capacity, and resting capacity against the unchanged
+book. Applying an accepted plan needs no book undo log.
 
-## Preflight Removed Rollback
+This does not remove every rollback in the gateway. Risk exposure is reserved
+before book submission. A rejected new order must release that reservation.
+A rejected replace must restore its prior reservation. Book and gateway
+atomicity are different contracts.
 
-The matcher once carried an undo log for failures during plan application.
-Reviewing the failure set showed that duplicate checks, report capacity, price
-level capacity, and match quantity could all be decided before mutation.
+## Parsing and handoff have different copy boundaries
 
-After complete preflight, applying a plan has no expected failure path. Removing
-the undo log also removed recovery code that could fail while trying to repair
-state.
+Parsing borrows an RX frame. Routing converts the parsed fields to a fixed-size
+`Command` and copies it into a preallocated queue slot. This is not an
+end-to-end zero-copy pipeline.
 
-## Zero Allocation Starts With Layout
+The journaled engine parses its frame once and enqueues the original wire
+bytes. Its normalized-command entry point encodes once. Storage writes belong
+to the persistence worker, not the matching call.
 
-The hot path does not avoid allocation through local coding discipline alone.
-Accounts, reservations, orders, price levels, reports, retransmit frames, and
-queue slots all have fixed storage created before processing starts.
+## A plausible benchmark can measure the wrong branch
 
-The same precision matters for zero-copy claims. Parsing borrows an RX frame.
-Cross-core handoff copies a bounded value into a preallocated SPSC slot. The
-pipeline is not zero-copy.
+An early risk fixture closed reservations and then timed cancel and settle
+against those closed IDs. It measured `UnknownOrder`, not successful cleanup.
+A crossing fixture consumed its makers and then timed rejection. Another
+replace fixture used a live order while claiming to measure unknown-order
+rejection.
 
-## Benchmarks Can Measure the Wrong Work
+A workload needs assertions on the operation it names. Destructive operations
+also need untimed repair or a declared changing workload. Percentiles and
+checksums cannot compensate for a fixture that measures the wrong branch.
 
-An early risk benchmark filled reservations, closed them, then timed cancel and
-settle against the closed IDs. The output looked plausible but measured
-`UnknownOrder` rejection. Another crossing fixture consumed its makers and
-spent most samples timing capacity errors.
+Allocation counters must bracket the work being claimed. Reading both counters
+after sampling cannot prove that sampling allocated nothing. Known coverage
+limits remain listed in [performance evidence](PERFORMANCE.md).
 
-Timed operations now assert the expected outcome. Destructive workloads use an
-untimed repair step so each sample starts from the same state. Warmup happens
-before sampling, and the report includes p50, p90, p99, p99.9, and max. A mean
-cannot show that the workload drifted onto another branch.
+## Assertions must not contain required mutation
 
-## Release Builds Exposed a Side Effect Bug
+Two index deletion paths called relocation closures inside `debug_assert!`.
+Debug builds updated the moved handles. Release builds omitted the calls and
+left stale handles behind.
 
-Two open-addressed index removal paths called update closures inside
-`debug_assert!`. Debug builds updated moved handles. Release builds removed the
-calls, left stale handles behind, and eventually filled the tables.
+Required state changes now run unconditionally. Assertions check their results.
+Release execution and model comparisons belong in validation, not just timing.
 
-Assertions now inspect results. Required mutation happens outside them. Tests
-that only run debug builds would not have found this defect.
+## SPSC ordering protects two transfers
 
-## SPSC Ordering Needs a Proof
+The producer writes a slot, then publishes it with Release. The consumer
+observes publication with Acquire before reading. The consumer's release of
+that slot must also become visible before the producer reuses it.
 
-The queue publishes initialized slot contents with Release and observes them
-with Acquire. The reverse handoff protects slot reuse. Cached positions remain
-thread-local.
+Loom exercises the shipped algorithm's atomics and cells. Miri checks the
+memory accesses on supported paths. Neither replaces the ownership argument
+for one producer, one consumer, and correctly paired initialization and drop.
 
-Loom explores the publication and wraparound interleavings in the shipped
-algorithm. Miri catches the plain-memory race when publication is weakened.
-The memory ordering argument is part of the queue design, not a comment added
-afterward.
+## Publication is not durability
 
-## Desktop Timing Is Smoke Evidence
+A journal queue preserves order inside one process. It does not prove that a
+record reached disk. Written progress advances after a complete batch write.
+Durable progress advances after a successful flush.
 
-Windows runs catch large regressions, workload mistakes, allocation changes,
-and digest changes. They do not establish production latency. Scheduler
-preemption, timer resolution, frequency changes, and background work are all
-visible in the samples.
+The engine reserves event capacity, enqueues the command, and only then applies
+it. A full journal queue leaves the command unconsumed. Observed persistence
+failure stops admission, although a command already in flight can race it.
 
-A qualified result needs a named Linux host, pinned cores, controlled frequency,
-IRQ and NUMA placement, hardware counters, and the full environment recorded
-beside the raw output. Docker can pin tools and dependencies. It cannot make a
-shared host dedicated.
+Events describe applied state. A crash between application and flush can lose
+an applied command from durable history. Exactly-once effects across crashes
+need acknowledgment, retry, and delivery rules beyond an SPSC queue and a
+sequence number.
 
-## Journaling Makes Backpressure Part of Admission
+## One queue slot holds one command result
 
-A bounded journal queue can refuse a command when persistence falls behind.
-That refusal must happen before accepted matching state becomes visible. If the
-engine mutates first and discovers a full queue afterward, the journal is no
-longer a record of accepted history.
+Publishing a command's events separately could expose an acknowledgment but
+lose later trades when the ring fills. The event queue stores a complete
+fixed-capacity batch and publishes it with one tail update.
 
-The journal now has a storage writer, batch and shutdown flush policies, writer
-failure poisoning, and restart scanning over persisted bytes. The remaining
-engine contract is how persistence failure reaches admission before the queue
-fills. That belongs in the caller API, not inside the file writer.
+The command sequence and batch ordinal form the event ID. No extra event
+counter is needed. Business rejections produce one rejected event. Successful
+commands produce their result, trades in execution order, and top-of-book
+only when it changed.
 
-## Exactly Once Is a Recovery Rule
+## Snapshots preserve logical state, not arena history
 
-An SPSC queue can preserve order within one process. It cannot prove that a
-record reached durable storage exactly once. A crash can happen after enqueue,
-after write, during a partial write, or after flush but before acknowledgement.
+Snapshots store accounts, reservations, levels, and FIFO orders in canonical
+order. They do not serialize raw arenas, private handles, or free-list history.
+Restore validates logical records and rebuilds those structures.
 
-Exactly once requires a versioned disk format, sequence validation, a stated
-flush point, and recovery that either returns one ordered prefix or rejects the
-file. The crash fixtures now scan actual encoded bytes. Partial tails,
-duplicates, gaps, and corrupt records stop recovery.
+The applied sequence defines where tail replay starts. Recovery rejects gaps,
+overlap, partial records, corruption, and payload sequence mismatch. Snapshot
+v1 does not record the report bound, so replay still needs the original
+configuration. Restore does not provide durable event redelivery.
 
-## Unsafe Code Stays at Narrow Boundaries
+## Measurement claims need a named environment
 
-Unsafe code is limited to SPSC slot access, the opaque-handle C ABI, and the
-benchmark counting allocator. Domain logic, parsing, risk, matching, gateway,
-session, replay, and journal code forbid unsafe Rust.
+Desktop runs expose large regressions, allocation changes, and workload errors.
+They also contain timer quantization, scheduler interruptions, and frequency
+changes. Small differences are not evidence of a production speedup.
 
-Keeping these boundaries small makes the invariants testable. It also keeps
-Miri, sanitizer runs, and the unsafe allowlist focused on code that needs them.
-
-## Snapshots Store Logical State
-
-Copying fixed-capacity arenas would preserve slot placement, tombstones, and
-free-list history. Those details are not part of exchange state. The snapshot
-stores accounts, reservations, price levels, and FIFO orders in canonical
-order. Restore validates those records and rebuilds indexes and free lists.
-Two engines with the same logical state therefore produce the same bytes even
-when their allocation histories differ.
-
-The snapshot sequence is the boundary between state and the journal tail.
-Recovery accepts only the next journal sequence and checks that each record
-matches the sequence inside its wire payload. Rejected business commands still
-consume a valid sequence. Corrupt framing and sequence errors stop recovery.
-
-## Publish One Command Per Queue Slot
-
-Publishing trades and acknowledgements as separate queue entries permits a full
-ring to expose only part of a command. Rolling back matching state would not
-remove events already observed by the consumer. The event ring therefore stores
-one fixed-capacity batch per command. Capacity is checked before mutation and
-the producer publishes the batch with one tail update.
-
-Event IDs do not use a separate counter. The protocol sequence identifies the
-command and an ordinal identifies its events. Snapshot restore can reproduce
-the same IDs without extending the v1 snapshot format.
+Dedicated Linux qualification requires the workload, build, CPU placement,
+frequency policy, IRQ and NUMA settings, counters, and raw output together.
+Docker can reproduce tools. It cannot make shared hardware dedicated.

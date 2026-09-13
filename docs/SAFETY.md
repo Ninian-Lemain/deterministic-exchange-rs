@@ -1,94 +1,131 @@
 # Safety
 
-Safe Rust is the default. Every library except `hft-spsc` and `hft-ffi`
-forbids unsafe code. The `hft-bench` library also forbids it. CI rejects
-unsafe blocks, functions, impls, foreign declarations, `UnsafeCell`, and
-mutable statics outside the allowlisted files.
+Every library except `hft-spsc` and `hft-ffi` uses `#![forbid(unsafe_code)]`.
+This includes the `hft-bench` library. Its executable installs the counting
+allocator described below.
 
-## Unsafe Inventory
+[CI](../.github/workflows/ci.yml) scans Rust source under `crates` for unsafe
+blocks, functions, implementations, foreign declarations, `UnsafeCell`, and
+mutable statics. Matching files must equal this allowlist:
 
-Every repository-owned unsafe site carries a documented invariant and a test.
+- `crates/hft-spsc/src/lib.rs`
+- `crates/hft-ffi/src/lib.rs`
+- `crates/hft-ffi/tests/native_abi.rs`
+- `crates/hft-bench/src/main.rs`
 
-### SPSC (`crates/hft-spsc/src/lib.rs`)
+This text scan limits where unsafe code can appear. Review and tests must
+still establish the invariants within those files.
 
-`UnsafeCell<MaybeUninit<T>>` slots: the producer alone writes a slot before
-Release publication; the consumer alone reads it after Acquire observation and
-before Release reclamation. `split` requires exclusive access and creates
-exactly one endpoint of each kind. Drop holds exclusive access and drops only
-the published half-open range `[head, tail)`. `T: Send` is required for
-`Sync`.
+## SPSC queue
 
-Audit details:
+The queue stores slots as `UnsafeCell<MaybeUninit<T>>`. The producer alone
+writes each slot before publishing it with a Release store to `tail`. The
+consumer reads it after an Acquire load observes publication, then reclaims
+the slot with a Release store to `head`. The producer acquires that reclamation
+before reusing the slot.
 
-- **UnsafeCell**: slot access is confined to the `Slot<T>` wrapper. Under
-  `--features loom` it uses `loom::cell::UnsafeCell`, so Loom tracks the same
-  reads and writes as the normal build.
-- **Initialization/drop**: a slot is written exactly once between reclamation
-  and publication; it is read exactly once by the consumer (`assume_init_read`)
-  or dropped once by `Drop`. `into_inner` reserves the full live count before
-  moving values and advances the stored head before each move. Unwinding
-  cannot make `Drop` visit a moved value.
-- **Wrap**: indices are `usize` counters masked with `N - 1`; fullness uses
-  wrapping subtraction of cached peer positions. Capacity one wraps every
-  operation and is covered explicitly.
-- **Full/empty**: empty means `head == tail`; full means `tail - head == N`.
-  Cached positions are refreshed with Acquire loads, so a stale cache can only
-  cause a retry, never an out-of-bounds access or lost capacity.
-- **Endpoint lifetimes**: `Producer`/`Consumer` borrow the queue for `'queue`;
-  `split(&mut)` guarantees one endpoint pair per borrow. A later split starts
-  from the published head and tail, including when pending values remain. The
-  core steps are shared-reference functions used by the endpoints and Loom
-  tests.
+The safety review depends on these invariants:
 
-Tests: FIFO order and full rejection, cross-thread transfer, invalid capacity,
-endpoint recreation with empty and nonempty queues, drop-exactly-once property
-coverage across endpoint epochs, seeded lossless schedules, Loom runs of the
-actual algorithm under `--features loom`, and Miri on the whole crate.
+- Slot access stays inside `Slot<T>`. With `--features loom`, the wrapper uses
+  `loom::cell::UnsafeCell` so Loom tracks the algorithm's slot reads and writes.
+- Each reclaimed slot is initialized once before publication. Its value moves
+  out once through `assume_init_read`, or the queue drops it while still live.
+  Queue destruction has exclusive access and visits only the published
+  half-open range `[head, tail)`.
+- `into_inner` reserves space for every live value before draining. It advances
+  the stored head before each move, so unwinding cannot make queue destruction
+  revisit a moved value.
+- Capacity `N` is a nonzero power of two. Slot indices are wrapping `usize`
+  counters masked with `N - 1`. Empty means `head == tail`. Full means
+  `tail.wrapping_sub(head) == N`.
+- Each endpoint owns its cursor and cached peer position. An apparent full or
+  empty condition refreshes the cache with an Acquire load. A stale cache can
+  delay progress but cannot permit access to an unavailable slot.
+- `split(&mut self)` creates exactly one producer and one consumer. Both borrow
+  the queue for `'queue`. A later split starts from the published positions,
+  including any pending values. Sharing the queue across threads requires
+  `T: Send` through its `Sync` implementation.
 
-### FFI (`crates/hft-ffi/src/lib.rs`)
+Unit and integration tests cover FIFO order, full rejection, cross-thread
+transfer, invalid capacity, capacity-one slot reuse, endpoint recreation on
+empty and nonempty queues, draining, and exactly-once destruction across
+endpoint lifetimes. Seeded schedules compare operations with a `VecDeque`.
+Loom tests exercise the same producer and consumer core functions with modeled
+atomics and cells. CI also configures Miri for this crate.
 
-`VendorApi::new` is the only unsafe public constructor. Its contract covers
-callback lifetime, unwinding, handle ownership, error behavior, payload access,
-and destruction. Nullable callback fields make a C table with a null entry a
-valid Rust value. `VendorSession::open` rejects any missing callback before a
-foreign call. The session stores validated callbacks and is neither `Send` nor
-`Sync`. Drop calls `destroy` exactly once.
+## Foreign function interface
 
-Tests: ownership/destroy round trip, `create` failure status, null-handle
-rejection, null-callback rejection, `send` failure status with destroy-on-drop,
-oversized length rejection, and the native ABI suite below.
+`VendorApi::new` is the FFI crate's unsafe public constructor. Its caller must
+establish the callback contract:
 
-### Counting allocator (`crates/hft-bench/src/main.rs`)
+- Callback addresses remain callable for the process lifetime. No callback
+  unwinds or throws across the C ABI.
+- `create` writes only to its output handle pointer and does not retain that
+  pointer. Status zero with a nonnull handle transfers unique ownership to the
+  session. A nonzero status transfers no resource.
+- `send` reads at most the supplied length during the call. It neither writes
+  through nor retains the payload pointer. Every returned status leaves the
+  handle live and owned by the session.
+- `destroy` accepts each live handle once, releases it before returning, and
+  does not retain it.
 
-Every `GlobalAlloc` operation delegates to `System` under the identical
-pointer and layout contract; only atomic counters are added. It is an isolated
-executable and does not alter library allocator behavior.
+Nullable callback fields allow a C table with a null entry to have a valid Rust
+representation. `VendorSession::open` rejects missing callbacks before calling
+foreign code. It also rejects a successful `create` that returns a null handle.
+The session stores validated callbacks and is neither `Send` nor `Sync`. When
+the session is dropped, it calls `destroy` once.
 
-Test: allocation and deallocation counters track a `Vec` round trip.
+Tests cover ownership and destruction, create and send errors, null handles,
+oversized lengths, and the native ABI checks below. A compile-fail doc test
+checks that a session cannot be sent between threads.
 
-## Native Boundary Policy
+## Counting allocator
 
-Default builds are Rust-only. Optional C++ is permitted only for a real
-vendor/NIC SDK behind the C ABI declared in
-`crates/hft-ffi/native/hft_vendor_api.h`: opaque handles, fixed-width fields,
-explicit ownership and integer error codes, and no exceptions or C++
-standard-library types across the boundary. The audited Rust SPSC stays in
-Rust; it is never wrapped in C++ to hide unsafe code.
+The benchmark executable's `GlobalAlloc` implementation delegates to `System`
+with the caller's pointer, layout, and size contracts. Atomic counters record
+allocation activity without changing ownership or alignment. Linking the
+benchmark library does not install this allocator.
 
-Enabling `--features vendor-sdk` compiles the C test shim
-(`crates/hft-ffi/native/test_shim.c`) and runs ABI tests that compare the C
-and Rust layouts and drive a full session across the compiled boundary,
-including error propagation. CI runs these tests under ASan and UBSan on
-Linux. The suite compares every table field offset before it calls a callback.
-It also compiles the public header as C++. A feature build fails if either
-native probe cannot compile. Default builds do not require a C or C++ compiler.
+The reduced-suite integration test launches the executable with its allocator.
+It checks reported hot-path allocation counts and positive counts for recovery
+workloads that allocate. This does not prove that every workload places its
+counters correctly. Known gaps are recorded in [PERFORMANCE.md](PERFORMANCE.md).
 
-## Validation Status
+## Native boundary policy
 
-- CI: fmt, workspace check, Clippy with warnings denied, tests, doc tests,
-  Loom SPSC model, unsafe allowlist, Rust source ratio.
-- Miri (CI, nightly): `hft-wire`, `hft-risk`, `hft-book`, `hft-spsc`.
-- ASan and UBSan (CI, nightly Linux): `hft-ffi` with the compiled C test shim.
-- Remaining: Miri does not execute foreign callbacks. Sanitizers exercise the
-  repository test shim, not a proprietary SDK. Dedicated-hardware validation
-  remains on the roadmap.
+Default builds compile no repository C or C++ code and require no C or C++
+compiler for the FFI crate. Beyond ABI probes, optional C++ is limited to real
+vendor or NIC SDK adapters. Those adapters must use the C ABI in
+[hft_vendor_api.h](../crates/hft-ffi/native/hft_vendor_api.h): opaque handles,
+fixed-width fields, explicit ownership, and integer error codes.
+Exceptions and C++ standard-library types must not cross the boundary. The
+SPSC queue remains in Rust.
+
+The `vendor-sdk` feature currently compiles the repository's C test shim and a
+C++ header probe. It does not supply a proprietary SDK. Either probe failing
+to compile fails the feature build.
+
+`cargo test -p hft-ffi --features vendor-sdk` runs the native ABI suite. The
+suite compares table size, alignment, and every field offset before invoking
+table callbacks. It checks session creation, payload access, send errors,
+destruction, and null-callback rejection against the compiled C shim.
+
+## Validation scope
+
+The CI workflow configures these checks:
+
+| Check | Scope |
+| --- | --- |
+| Stable Rust | Formatting, workspace check and Clippy for all targets and features, warnings denied, workspace tests and doc tests |
+| Default features | Benchmark, soak, and engine tests, parser malformed-input smoke test, release soak smoke profile, release benchmark suite |
+| MSRV 1.85.0 | Locked workspace check for all targets and workspace tests |
+| Loom | SPSC tests using the queue's actual algorithm |
+| Nightly Miri | `hft-wire`, `hft-risk`, `hft-book`, and `hft-spsc` |
+| Nightly Linux ASan | Rust FFI tests and compiled C shim with address sanitization |
+| Nightly Linux UBSan | FFI tests linked to the undefined-behavior-sanitized C shim |
+| Source policy | Unsafe allowlist and at least 90% Rust among counted Rust and native source lines |
+
+This table describes CI configuration. It does not establish which checks ran
+or passed locally. The Miri job excludes the FFI crate and native shim.
+Sanitizer coverage applies to the repository shim, not a proprietary SDK.
+Dedicated-hardware validation remains open.

@@ -6,6 +6,7 @@ edits must not change their contents or silently replace an earlier run.
 
 | Archive | Recorded comparison |
 | --- | --- |
+| [latency-2026-09-15.zip](latency-2026-09-15.zip) | Batched gateway measurements, single-maker fills, flat index access, and compiler tuning; includes identified invalid exploratory runs |
 | [layout-2026-09-10.zip](layout-2026-09-10.zip) | Resting-order and risk-index storage changes |
 | [admission-2026-09-11.zip](admission-2026-09-11.zip) | Event admission token comparison |
 | [journal-status-2026-09-11.zip](journal-status-2026-09-11.zip) | Controlled journal persistence status |

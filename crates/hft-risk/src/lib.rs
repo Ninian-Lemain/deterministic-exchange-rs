@@ -119,20 +119,12 @@ impl<const PLANE: usize, const PLANES: usize> ProbeIndex<PLANE, PLANES> {
         }
     }
 
-    /// Flat-index coordinates. Callers only pass indices below `CAPACITY`.
-    fn coordinates(flat_index: usize) -> (usize, usize) {
-        debug_assert!(flat_index < Self::CAPACITY);
-        (flat_index / PLANE, flat_index % PLANE)
-    }
-
     fn slot(&self, flat_index: usize) -> &IndexSlot {
-        let (plane, within) = Self::coordinates(flat_index);
-        &self.slots[plane][within]
+        &self.slots.as_flattened()[flat_index]
     }
 
     fn slot_mut(&mut self, flat_index: usize) -> &mut IndexSlot {
-        let (plane, within) = Self::coordinates(flat_index);
-        &mut self.slots[plane][within]
+        &mut self.slots.as_flattened_mut()[flat_index]
     }
 
     /// Probing requires a non-zero capacity; callers guard `CAPACITY == 0`.

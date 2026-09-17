@@ -21,7 +21,7 @@ fn reduced_suite_checks_hot_path_and_recovery_allocations() {
     let lines: Vec<_> = stdout.lines().collect();
     assert!(lines.len() > 40, "suite emitted {}", lines.len());
     let mut recovery_cells = 0;
-    for line in lines {
+    for line in &lines {
         assert!(
             line.starts_with("{\"schema\":\"hft-bench-results/1\","),
             "{line}"
@@ -38,6 +38,53 @@ fn reduced_suite_checks_hot_path_and_recovery_allocations() {
         }
     }
     assert_eq!(recovery_cells, 3);
+    validate_batched_cells(&lines);
+}
+
+fn validate_batched_cells(lines: &[&str]) {
+    let batched: Vec<_> = lines
+        .iter()
+        .copied()
+        .filter(|line| string_field(line, "scenario").ends_with("_batched"))
+        .collect();
+    let expected = [
+        ("gateway", "pair_rest_fill_batched", "frame", 100),
+        ("gateway", "pair_rest_fill_batched", "command", 100),
+        ("risk", "risk_check_batched", "check_and_reserve", 32),
+        ("risk", "fill_batched", "record_fill", 32),
+        ("risk", "account_lookup_batched", "account_snapshot", 32),
+        ("risk", "reservation_lookup_batched", "can_cancel", 32),
+        ("book", "non_crossing_batched", "submit", 100),
+        ("book", "single_fill_batched", "submit", 100),
+        ("book", "cancel_batched", "cancel", 100),
+        ("book", "order_lookup_batched", "contains_order", 100),
+    ];
+    assert_eq!(batched.len(), expected.len());
+    for (component, scenario, path, samples) in expected {
+        let matching: Vec<_> = batched
+            .iter()
+            .copied()
+            .filter(|line| {
+                string_field(line, "component") == component
+                    && string_field(line, "scenario") == scenario
+                    && string_field(line, "path") == path
+            })
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "missing or duplicate {component}/{scenario}/{path}"
+        );
+        let line = matching[0];
+        assert_eq!(numeric_field(line, "batch"), 64);
+        assert_eq!(numeric_field(line, "samples"), samples);
+        assert_eq!(numeric_field(line, "commands"), samples * 64);
+        assert!(numeric_field(line, "ops_per_second") > 0, "{line}");
+    }
+    assert_eq!(
+        string_field(batched[0], "checksum"),
+        string_field(batched[1], "checksum")
+    );
 }
 
 #[test]
@@ -67,4 +114,10 @@ fn numeric_field(line: &str, name: &str) -> u64 {
         .expect("numeric field value exists")
         .parse()
         .expect("numeric field is u64")
+}
+
+fn string_field<'a>(line: &'a str, name: &str) -> &'a str {
+    let key = format!("\"{name}\":\"");
+    let (_, value) = line.split_once(&key).expect("string field exists");
+    value.split('"').next().expect("string field value exists")
 }

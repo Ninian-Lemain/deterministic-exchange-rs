@@ -120,23 +120,12 @@ impl<const LEVELS: usize, const ORDERS: usize> OrderIndex<LEVELS, ORDERS> {
         })
     }
 
-    /// Flat-index coordinates. Callers only pass indices below `CAPACITY`.
-    fn coordinates(flat_index: usize) -> (usize, usize, usize) {
-        debug_assert!(flat_index < Self::CAPACITY);
-        let per_plane = LEVELS * ORDERS;
-        let plane = flat_index / per_plane;
-        let within_plane = flat_index % per_plane;
-        (plane, within_plane / ORDERS, within_plane % ORDERS)
-    }
-
     fn slot(&self, flat_index: usize) -> &IndexSlot {
-        let (plane, level, order) = Self::coordinates(flat_index);
-        &self.slots[plane][level][order]
+        &self.slots.as_flattened().as_flattened()[flat_index]
     }
 
     fn slot_mut(&mut self, flat_index: usize) -> &mut IndexSlot {
-        let (plane, level, order) = Self::coordinates(flat_index);
-        &mut self.slots[plane][level][order]
+        &mut self.slots.as_flattened_mut().as_flattened_mut()[flat_index]
     }
 
     /// Probing requires a non-zero capacity; callers guard `CAPACITY == 0`.
@@ -947,16 +936,29 @@ impl<const LEVELS: usize, const ORDERS_PER_LEVEL: usize> OrderBook<LEVELS, ORDER
 
     /// # Errors
     ///
-    /// Returns an explicit validation or capacity rejection. `build_plan`
-    /// preflights every fallible condition, so a rejection provably leaves the
+    /// Returns an explicit validation or capacity rejection. Both matching
+    /// paths preflight every fallible condition, so a rejection leaves the
     /// book and report buffer untouched.
     pub fn submit<const REPORTS: usize>(
         &mut self,
         order: NewOrder,
         reports: &mut ReportBuffer<REPORTS>,
     ) -> Result<MatchSummary, RejectReason> {
+        let maker_side = self.validate_order(order)?;
+        if let Some(summary) = self.try_single_fill(order, maker_side, reports)? {
+            return Ok(summary);
+        }
+        self.submit_plan(order, maker_side, reports)
+    }
+
+    fn submit_plan<const REPORTS: usize>(
+        &mut self,
+        order: NewOrder,
+        maker_side: Side,
+        reports: &mut ReportBuffer<REPORTS>,
+    ) -> Result<MatchSummary, RejectReason> {
         let initial_report_count = reports.len();
-        let plan = self.build_plan::<REPORTS>(order, reports.remaining_capacity())?;
+        let plan = self.build_plan::<REPORTS>(order, maker_side, reports.remaining_capacity())?;
         self.apply_plan(order, &plan, reports);
         let filled = order.quantity.0 - plan.resting_quantity.0 - plan.discarded;
         let state = if filled == order.quantity.0 {
@@ -975,15 +977,8 @@ impl<const LEVELS: usize, const ORDERS_PER_LEVEL: usize> OrderBook<LEVELS, ORDER
         })
     }
 
-    /// Walks crossing levels once to build a compact match plan, preflighting
-    /// validation, duplicates, report capacity, and resting capacity. Because
-    /// every fallible condition is decided here against an unchanged book,
-    /// `apply_plan` afterwards is infallible and needs no rollback path.
-    fn build_plan<const REPORTS: usize>(
-        &self,
-        order: NewOrder,
-        report_capacity: usize,
-    ) -> Result<MatchPlan<REPORTS>, RejectReason> {
+    /// Admission checks run before either matching path can mutate state.
+    fn validate_order(&self, order: NewOrder) -> Result<Side, RejectReason> {
         if order.instrument_id != self.instrument {
             return Err(RejectReason::InvalidInstrument);
         }
@@ -1013,6 +1008,83 @@ impl<const LEVELS: usize, const ORDERS_PER_LEVEL: usize> OrderBook<LEVELS, ORDER
                 }
             }
         }
+        Ok(maker_side)
+    }
+
+    /// The first maker can satisfy the complete taker. Report admission is
+    /// the only remaining rejection: no resting capacity or rollback is needed.
+    fn try_single_fill<const REPORTS: usize>(
+        &mut self,
+        order: NewOrder,
+        maker_side: Side,
+        reports: &mut ReportBuffer<REPORTS>,
+    ) -> Result<Option<MatchSummary>, RejectReason> {
+        let Some(&(price, level_index)) = self.side_index(maker_side).iter().next() else {
+            return Ok(None);
+        };
+        let crosses = match order.side {
+            Side::Buy => price <= order.price,
+            Side::Sell => price >= order.price,
+        };
+        if !crosses {
+            return Ok(None);
+        }
+        let Some(level) = self.side_levels_mut(maker_side)[level_index].as_mut() else {
+            return Ok(None);
+        };
+        let slot = level.head;
+        let Some(maker) = level.get_live_mut(slot) else {
+            return Ok(None);
+        };
+        if maker.quantity < order.quantity {
+            return Ok(None);
+        }
+        let maker_id = maker.id;
+        let index_slot = maker.index_slot;
+        let full_fill = maker.quantity == order.quantity;
+        // A full buffer rejects before either the maker or the book changes.
+        reports.push(ExecutionReport {
+            maker_order_id: maker_id,
+            taker_order_id: order.order_id,
+            instrument_id: order.instrument_id,
+            price,
+            quantity: order.quantity,
+            sequence: order.sequence,
+        })?;
+        if full_fill {
+            self.remove_filled_order(
+                OrderLocation {
+                    side: maker_side,
+                    level_index,
+                    slot,
+                },
+                maker_id,
+                index_slot,
+                order.quantity,
+            );
+        } else {
+            maker.quantity.0 -= order.quantity.0;
+            level.aggregate_quantity -= u128::from(order.quantity.0);
+        }
+        Ok(Some(MatchSummary {
+            state: OrderState::Filled,
+            filled_quantity: order.quantity,
+            resting_quantity: Quantity(0),
+            discarded_quantity: Quantity(0),
+            report_count: 1,
+        }))
+    }
+
+    /// After admission validation, walks crossing levels once to build a
+    /// compact match plan, preflighting report and resting capacity. Because
+    /// every fallible condition is decided here against an unchanged book,
+    /// `apply_plan` afterwards is infallible and needs no rollback path.
+    fn build_plan<const REPORTS: usize>(
+        &self,
+        order: NewOrder,
+        maker_side: Side,
+        report_capacity: usize,
+    ) -> Result<MatchPlan<REPORTS>, RejectReason> {
         let maker_levels = self.side_levels(maker_side);
         let mut plan = MatchPlan::<REPORTS>::new(maker_side, report_capacity);
         let mut remaining = order.quantity.0;
@@ -1080,8 +1152,8 @@ impl<const LEVELS: usize, const ORDERS_PER_LEVEL: usize> OrderBook<LEVELS, ORDER
     }
 
     /// Applies a pre-built match plan, emitting one execution report per fill.
-    /// Infallible: `build_plan` preflighted report capacity, level capacity,
-    /// and duplicates, and the book cannot change between the two calls.
+    /// Infallible: admission and planning preflighted duplicates and all
+    /// capacities, and the book cannot change between the calls.
     /// Violations of those preflighted invariants are bugs, not rejections.
     fn apply_plan<const REPORTS: usize>(
         &mut self,
@@ -1109,28 +1181,16 @@ impl<const LEVELS: usize, const ORDERS_PER_LEVEL: usize> OrderBook<LEVELS, ORDER
                 (maker.index_slot, maker.quantity.0 == fill.quantity.0)
             };
             if full_fill {
-                let removed_location = self.remove_index_entry(index_slot, fill.order_id);
-                debug_assert_eq!(
-                    removed_location,
-                    Some(OrderLocation {
+                self.remove_filled_order(
+                    OrderLocation {
                         side: plan.maker_side,
                         level_index: fill.level_index,
                         slot: fill.slot,
-                    })
+                    },
+                    fill.order_id,
+                    index_slot,
+                    fill.quantity,
                 );
-                let level = self.side_levels_mut(plan.maker_side)[fill.level_index]
-                    .as_mut()
-                    .expect("plan level is occupied");
-                let removed = level.unlink(fill.slot).expect("plan maker is live");
-                debug_assert_eq!(removed.quantity, fill.quantity);
-                if level.len == 0 {
-                    let price = level.price;
-                    self.side_levels_mut(plan.maker_side)[fill.level_index] = None;
-                    let removed_index = self
-                        .side_index_mut(plan.maker_side)
-                        .remove(price, plan.maker_side == Side::Buy);
-                    debug_assert_eq!(removed_index, Some(fill.level_index));
-                }
             } else {
                 self.side_levels_mut(plan.maker_side)[fill.level_index]
                     .as_mut()
@@ -1140,6 +1200,37 @@ impl<const LEVELS: usize, const ORDERS_PER_LEVEL: usize> OrderBook<LEVELS, ORDER
         }
         if plan.resting_quantity.0 > 0 {
             self.rest(order, plan.resting_quantity);
+        }
+    }
+
+    fn remove_filled_order(
+        &mut self,
+        location: OrderLocation,
+        order_id: OrderId,
+        index_slot: u32,
+        quantity: Quantity,
+    ) {
+        let removed_location = self.remove_index_entry(index_slot, order_id);
+        debug_assert_eq!(
+            removed_location,
+            Some(OrderLocation {
+                side: location.side,
+                level_index: location.level_index,
+                slot: location.slot,
+            })
+        );
+        let level = self.side_levels_mut(location.side)[location.level_index]
+            .as_mut()
+            .expect("plan level is occupied");
+        let removed = level.unlink(location.slot).expect("plan maker is live");
+        debug_assert_eq!(removed.quantity, quantity);
+        if level.len == 0 {
+            let price = level.price;
+            self.side_levels_mut(location.side)[location.level_index] = None;
+            let removed_index = self
+                .side_index_mut(location.side)
+                .remove(price, location.side == Side::Buy);
+            debug_assert_eq!(removed_index, Some(location.level_index));
         }
     }
 
@@ -1432,7 +1523,9 @@ impl<const LEVELS: usize, const ORDERS_PER_LEVEL: usize> OrderBook<LEVELS, ORDER
         })
     }
 
-    fn contains_order(&self, order_id: OrderId) -> bool {
+    /// Returns whether an order ID is present in the book's order index.
+    #[must_use]
+    pub fn contains_order(&self, order_id: OrderId) -> bool {
         self.index.location(order_id).is_some()
     }
 
@@ -2397,6 +2490,104 @@ mod tests {
             );
             assert_index_consistent(&book);
         }
+    }
+
+    #[test]
+    fn single_fill_matches_general_plan_with_fifo_and_existing_reports() {
+        for maker_side in [Side::Buy, Side::Sell] {
+            for quantity in [2, 3, 4, 9] {
+                for time_in_force in [
+                    TimeInForce::Gtc,
+                    TimeInForce::Ioc,
+                    TimeInForce::Fok,
+                    TimeInForce::PostOnly,
+                ] {
+                    for existing_report in [false, true] {
+                        let mut planned = OrderBook::<2, 2>::new(InstrumentId(1));
+                        let mut planned_reports = ReportBuffer::<2>::new();
+                        // These IDs collide in the 16-slot order index.
+                        planned
+                            .submit(order(1, 100, 3, maker_side), &mut planned_reports)
+                            .expect("head");
+                        planned
+                            .submit(order(17, 100, 5, maker_side), &mut planned_reports)
+                            .expect("peer");
+                        let mut fast =
+                            OrderBook::from_state(InstrumentId(1), &planned.export_state())
+                                .expect("same book");
+                        let mut fast_reports = ReportBuffer::<2>::new();
+                        if existing_report {
+                            let prior = ExecutionReport {
+                                maker_order_id: OrderId(90),
+                                taker_order_id: OrderId(91),
+                                instrument_id: InstrumentId(1),
+                                price: PriceTicks(99),
+                                quantity: Quantity(1),
+                                sequence: SequenceNumber(91),
+                            };
+                            planned_reports.push(prior).expect("prior report");
+                            fast_reports.push(prior).expect("prior report");
+                        }
+                        let taker_side = if maker_side == Side::Buy {
+                            Side::Sell
+                        } else {
+                            Side::Buy
+                        };
+                        let mut taker = order(33, 100, quantity, taker_side);
+                        taker.time_in_force = time_in_force;
+                        let expected = planned.validate_order(taker).and_then(|side| {
+                            planned.submit_plan(taker, side, &mut planned_reports)
+                        });
+                        assert_eq!(fast.submit(taker, &mut fast_reports), expected);
+                        assert_eq!(fast_reports, planned_reports);
+                        assert_eq!(fast.export_state(), planned.export_state());
+                        assert_eq!(fast.stable_digest(), planned.stable_digest());
+                        assert_index_consistent(&fast);
+                        if fast.contains_order(OrderId(17)) {
+                            fast.cancel(CancelOrder {
+                                order_id: OrderId(17),
+                                account_id: AccountId(1),
+                                instrument_id: InstrumentId(1),
+                                sequence: SequenceNumber(34),
+                            })
+                            .expect("peer remains reachable after back-shift");
+                            assert_index_consistent(&fast);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn single_fill_with_zero_report_capacity_is_atomic() {
+        let mut book = OrderBook::<1, 1>::new(InstrumentId(1));
+        let mut reports = ReportBuffer::<0>::new();
+        book.submit(order(1, 100, 3, Side::Sell), &mut reports)
+            .expect("rest maker");
+        let before = book.export_state();
+        for time_in_force in [TimeInForce::Gtc, TimeInForce::Ioc, TimeInForce::Fok] {
+            let mut taker = order(2, 100, 2, Side::Buy);
+            taker.time_in_force = time_in_force;
+            assert_eq!(
+                book.submit(taker, &mut reports),
+                Err(RejectReason::ReportCapacity)
+            );
+            assert_eq!(book.export_state(), before);
+            assert!(reports.is_empty());
+        }
+        let mut duplicate = order(1, 100, 2, Side::Buy);
+        duplicate.time_in_force = TimeInForce::PostOnly;
+        assert_eq!(
+            book.submit(duplicate, &mut reports),
+            Err(RejectReason::DuplicateOrderId)
+        );
+        duplicate.order_id = OrderId(2);
+        assert_eq!(
+            book.submit(duplicate, &mut reports),
+            Err(RejectReason::PostOnlyWouldTrade)
+        );
+        assert_eq!(book.export_state(), before);
     }
 
     #[test]

@@ -7,6 +7,10 @@ workloads, not one measurement of the current checkout.
 The [layout measurements](LAYOUT.md) cover book, risk, and route-table storage
 changes and their paired desktop runs.
 
+The [September 15 gateway measurements](LATENCY_2026-09-15.md) cover batched
+timing, flattened index access, single-maker fills, compiler tuning, and the
+observed gains and regressions across the full suite.
+
 ## What Is Measured
 
 `hft-bench` measures in-memory operations with fixed workloads. It emits one

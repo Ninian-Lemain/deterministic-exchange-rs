@@ -10,6 +10,8 @@
 - Added combined service faults, sustained soak duration and Linux memory
   capture, plus four service admission benchmark cells.
 - Added Linux safety capture for Loom, Miri, sanitizers and fuzzing.
+- Retained two completed two-hour combined fault captures with bounded memory
+  and matching seed results, plus Linux safety and benchmark evidence.
 
 - Added fixed instrument-to-shard routes with one instrument per shard.
 - Added bounded command and event queues between the router and matching shards.

@@ -57,7 +57,8 @@ requirements for a release candidate. Specific unresolved areas include:
 - Application-owned snapshot selection and retention; verify new backup,
   restore and compatibility workflows against trusted expected configuration.
 - Durable event delivery or an explicit application-level acknowledgment policy.
-- Completed multi-hour combined fault runs and dedicated Linux measurements.
+- Review the [completed multi-hour fault evidence](ROADMAP_PROGRESS_2026-10-06.md#sustained-qualification);
+  dedicated Linux latency measurements remain pending.
 - Repaired session benchmark assertions, allocation boundaries, and sustained
   retransmission refill. Historical results remain invalid; see
   [fixture contracts](PERFORMANCE.md#session-and-recovery-window).

@@ -32,7 +32,7 @@ Use [Quick Start](../QUICKSTART.md) for build and test commands. The
 | [Diagram sources](diagrams/README.md) | Editable Mermaid files and the rendering command |
 | [Evidence archives](evidence/README.md) | Raw benchmark bundles and provenance |
 
-No dedicated Linux latency result or completed multi-hour qualification is
-published. Events acknowledge application, not durable storage. The routed
+Two completed multi-hour fault captures are published; dedicated Linux latency
+qualification remains open. Events acknowledge application, not durable storage. The routed
 matching path and journaled engine remain separate entry points; the new engine
 facades explicitly join session and routed admission to journals.

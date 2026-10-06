@@ -2,7 +2,8 @@
 
 The workspace version is 0.19.0. Matching, risk, sessions, journaling, recovery,
 events, and instrument routing are implemented as library components.
-Dedicated Linux qualification and v0.20 fault qualification remain open.
+Dedicated Linux qualification remains open. The declared v0.20 fault workload
+has completed multi-hour qualification under WSL 2.
 The repository is not ready for a production deployment.
 The [current implementation report](ROADMAP_PROGRESS_2026-10-06.md) records
 integration changes, Linux verification and outstanding qualification evidence.
@@ -12,7 +13,7 @@ integration changes, Linux verification and outstanding qualification evidence.
 | Area | Status | Remaining work |
 | --- | --- | --- |
 | v0.13 Dedicated Linux qualification | Waiting on hardware | Qualified host, environment manifest, raw latency and hardware counters |
-| v0.20 Fault injection and soak | Qualification in progress | Combined service faults implemented; sustained run and memory evidence must pass |
+| v0.20 Fault injection and soak | Declared workload qualified | Two completed two-hour WSL captures retained; real disk and dedicated latency are outside this scope |
 | Pre-v1 engine API | Software integrated | Dedicated Linux boundary measurement and independent review |
 
 The [engine facade](ENGINE.md) now joins admission, bounded events, and journal
@@ -97,8 +98,9 @@ Completion requires retained seeds and completed multi-hour runs covering:
 - Recorded memory use with no unexplained growth or state divergence.
 
 A profile name or large step count is not proof of elapsed hours. An interrupted
-run without a successful result is not a pass. No completed multi-hour
-qualification is currently recorded.
+run without a successful result is not a pass. Two successful sustained captures
+completed 7,213.34 and 7,201.41 seconds with all retained seeds, repeated combined
+faults and bounded memory. See the [results and raw evidence](ROADMAP_PROGRESS_2026-10-06.md#sustained-qualification).
 
 ## Pre-v1 stabilization
 
@@ -113,8 +115,7 @@ The following work remains:
 
 1. Measure the completed boundary on dedicated Linux. Resolve unexplained
    regressions and verify allocation behavior on each declared hot path.
-2. Retain successful elapsed multi-hour fault evidence and examine memory use.
-3. Obtain independent API, unsafe-boundary, recovery-format, and operations
+2. Obtain independent API, unsafe-boundary, recovery-format, and operations
    review before a v1 release candidate.
 
 Operational health currently checks an explicitly selected bundle offline.

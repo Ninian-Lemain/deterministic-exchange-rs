@@ -114,7 +114,9 @@ and retains success or failure artifacts.
 
 ## Qualification status
 
-There is no completed qualifying multi-hour soak result. A profile name and step
-count do not establish elapsed hours. v0.20 remains open until multi-hour evidence
-and the remaining combined fault coverage are recorded. Dedicated Linux
-performance qualification is a separate requirement.
+Two sustained WSL 2 captures passed in 7,213.34 and 7,201.41 seconds. All four
+retained seeds repeatedly matched state, events and fault counters, and sampled
+RSS remained bounded. The declared v0.20 fault workload is qualified. Inspect the
+[result table and evidence archive](ROADMAP_PROGRESS_2026-10-06.md#sustained-qualification)
+for completion records and the full memory series. Dedicated Linux performance
+qualification and real disk fault testing are separate requirements.

@@ -10,8 +10,9 @@ a single-instrument journaled engine, and routed/session facades that own
 journaled admission across fixed instruments. All use the same matching core.
 
 Current version: **v0.19.0**. The v0.13 dedicated Linux qualification still
-needs dedicated hardware. Combined fault qualification and independent review
-remain open; engine integration and cold-path operations are implemented. The
+needs dedicated hardware. Combined fault qualification has passed two sustained
+two-hour runs; independent review remains open. Engine integration and cold-path
+operations are implemented. The
 project is not production ready. See the
 [documentation index](docs/README.md) and [roadmap](docs/ROADMAP.md).
 

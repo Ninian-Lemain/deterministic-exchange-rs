@@ -55,14 +55,31 @@ SMT, IRQ and NUMA requirements still need a dedicated host.
 ## Sustained qualification
 
 Two captures use all retained seeds with 1,000,000 and 65,536 steps per seed pass,
-respectively. Each process requests at least 7,200 seconds and performs matching,
-fault and repeat verification work continuously. Qualification remains pending
-until both successful host-result records and their memory series are retained.
-A running process, requested duration or profile name is not a completed pass.
+respectively. Both sustained processes completed successfully with every retained
+seed, recurring combined faults and equal repeated state, event and counter results.
 
-Raw development evidence currently lives under `target/roadmap-validation` in
-the Linux checkout. The final evidence archive will retain logs, source identities,
-binary hashes, profiling and completed soak captures. External independent API,
+| Steps per seed pass | Actual seconds | Verified seed results | Combined rounds per verified pass | Peak sampled RSS | Initial / final quarter median RSS |
+| --- | --- | --- | --- | --- | --- |
+| 1,000,000 | 7,213.34 | 1,304 | 245 | 3,977,216 bytes | 3,543,040 / 3,530,752 bytes |
+| 65,536 | 7,201.41 | 20,676 | 16 | 3,846,144 bytes | 3,399,680 / 3,432,448 bytes |
+
+Each verified result represents two independently executed matching passes.
+Memory remained bounded; neither capture reported divergence, missing fault
+coverage or unexplained RSS growth. These WSL runs qualify the declared in-memory
+fault workload, not dedicated latency or real disk fault behavior.
+
+[Evidence archive](evidence/roadmap-2026-10-06.zip), SHA-256:
+`3b9600a54f5ba1d499205cc2285f07d415ed71b0865fe6d090ed35ba45c97194`.
+It retains completed host results, per-seed results, memory samples, safety and
+verification logs, profiling, binary identities and validation sources. Its source
+comparison records six later benchmark/test/CLI metadata edits after the first
+capture; soak and production dependency sources match both captures. The lockfile
+difference only adds a CLI test dependency. The second capture matches the source
+archive exactly. CI [run 89](https://github.com/Ninian-Lemain/deterministic-exchange-rs/actions/runs/37532150878)
+passed quality, MSRV, Miri and sanitizer jobs for implementation commit `2d0dca2`.
+
+Raw development evidence also lives under `target/roadmap-validation` in
+the Linux checkout. External independent API,
 unsafe-boundary, recovery-format and operational review is still required before
 a v1 release candidate. Later NIC backends, venue adapters and replication remain
 separate designs with their own hardware and protocol requirements.

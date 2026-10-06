@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 
 pub mod capacity;
+pub mod combined;
 pub mod config;
 pub mod digest;
 pub mod events;

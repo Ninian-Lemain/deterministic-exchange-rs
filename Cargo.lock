@@ -138,9 +138,11 @@ name = "hft-cli"
 version = "0.19.0"
 dependencies = [
  "hft-book",
+ "hft-engine",
  "hft-gateway",
  "hft-replay",
  "hft-risk",
+ "hft-spsc",
  "hft-types",
  "hft-wire",
 ]
@@ -155,9 +157,12 @@ dependencies = [
  "hft-journal",
  "hft-recovery",
  "hft-risk",
+ "hft-router",
+ "hft-session",
  "hft-spsc",
  "hft-types",
  "hft-wire",
+ "sha2",
 ]
 
 [[package]]
@@ -278,6 +283,7 @@ name = "hft-soak"
 version = "0.19.0"
 dependencies = [
  "hft-book",
+ "hft-engine",
  "hft-events",
  "hft-gateway",
  "hft-io",

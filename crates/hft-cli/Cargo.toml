@@ -7,6 +7,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+hft-engine = { path = "../hft-engine" }
 hft-book = { path = "../hft-book" }
 hft-gateway = { path = "../hft-gateway" }
 hft-risk = { path = "../hft-risk" }
@@ -16,3 +17,6 @@ hft-wire = { path = "../hft-wire" }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+hft-spsc = { path = "../hft-spsc" }

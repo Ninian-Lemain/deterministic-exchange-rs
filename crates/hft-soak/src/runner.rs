@@ -1,4 +1,5 @@
 use crate::capacity::{CapacityResult, run_capacity};
+use crate::combined::{CombinedResult, run_combined};
 use crate::journal_faults::{JournalFaultResult, run_journal_faults};
 use crate::recovery_faults::{RecoveryFaultResult, run_recovery_faults};
 use crate::result::push_json_string;
@@ -14,6 +15,7 @@ pub struct ScenarioResults {
     pub recovery: RecoveryFaultResult,
     pub journal: JournalFaultResult,
     pub capacity: CapacityResult,
+    pub combined: CombinedResult,
 }
 
 /// The first failing phase, with the original configuration needed to replay it.
@@ -95,12 +97,18 @@ pub fn run(config: RunConfig) -> Result<RunResult, SoakError> {
         .map_err(|error| SoakError::at(config, "recovery", error))?;
     let journal = run_journal_faults().map_err(|error| SoakError::at(config, "journal", error))?;
     let capacity = run_capacity().map_err(|error| SoakError::at(config, "capacity", error))?;
+    let combined = run_combined(
+        seed_for(Scenario::ShutdownRaces)?,
+        config.steps.div_ceil(4096),
+    )
+    .map_err(|error| SoakError::at(config, "combined", error))?;
     let scenarios = ScenarioResults {
         routed,
         session,
         recovery,
         journal,
         capacity,
+        combined,
     };
     let state_digest = canonical_sha256(
         b"soak-state-v1",

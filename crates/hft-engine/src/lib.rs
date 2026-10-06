@@ -2,12 +2,22 @@
 #![forbid(unsafe_code)]
 
 mod builder;
+mod config;
+mod operations;
+mod routed;
+mod session;
 
 pub use builder::{BuildError, EngineBuilder, EngineParts, EngineStorage};
+pub use config::*;
 pub use hft_events::{Event, EventBatch};
 pub use hft_journal::{DurableSink, FlushPolicy, PersistenceWorker};
 pub use hft_risk::RiskLimits;
+pub use hft_router::{InstrumentRoute, RouteTable, RouteTableError, ShardId};
+pub use hft_session::{SessionConfig, SessionError, SessionEvent, SessionState, Transition};
 pub use hft_types::{AccountId, Command, InstrumentId, SequenceNumber};
+pub use operations::*;
+pub use routed::{RoutedCheckpointError, RoutedEngine, RoutedEngineBuildError, RoutedEngineError};
+pub use session::{SessionAdmissionError, SessionEngine};
 
 use hft_events::{BoundedEventEngine, EventEngineError};
 use hft_gateway::GatewayError;
@@ -72,6 +82,7 @@ pub struct Engine<
     journal: Option<JournalWriter<'storage>>,
     status: JournalStatusReader<'storage>,
     failed: bool,
+    configuration: EngineConfig,
 }
 
 impl<
@@ -84,6 +95,11 @@ impl<
     const EVENTS: usize,
 > Engine<'_, ACCOUNTS, RISK_ORDERS, LEVELS, ORDERS, REPORTS, BATCH, EVENTS>
 {
+    #[must_use]
+    pub fn configuration(&self) -> &EngineConfig {
+        &self.configuration
+    }
+
     #[must_use]
     pub fn instrument(&self) -> InstrumentId {
         self.events.gateway().instrument()

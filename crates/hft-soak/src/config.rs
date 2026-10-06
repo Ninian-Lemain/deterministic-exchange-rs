@@ -250,6 +250,8 @@ pub struct CliOptions {
     pub seed: Option<Seed>,
     pub steps: u64,
     pub seed_file: Option<PathBuf>,
+    /// Repeat complete seed passes in one process for at least this elapsed time.
+    pub duration_seconds: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -260,6 +262,7 @@ pub enum CliError {
     Profile(ProfileParseError),
     Seed(SeedParseError),
     InvalidSteps(String),
+    InvalidDuration(String),
     ConflictingSeedSources,
 }
 
@@ -274,6 +277,10 @@ impl fmt::Display for CliError {
             Self::InvalidSteps(value) => write!(
                 formatter,
                 "invalid steps '{value}'. Expected a positive decimal integer"
+            ),
+            Self::InvalidDuration(value) => write!(
+                formatter,
+                "invalid duration '{value}'. Expected 1 through 86400 seconds"
             ),
             Self::ConflictingSeedSources => {
                 formatter.write_str("--seed and --seed-file cannot be used together")
@@ -308,6 +315,7 @@ impl CliOptions {
         let mut seed = None;
         let mut steps = None;
         let mut seed_file = None;
+        let mut duration_seconds = None;
         let mut args = args.into_iter().map(Into::into);
 
         while let Some(option) = args.next() {
@@ -341,6 +349,16 @@ impl CliOptions {
                     }
                     set_once(&mut seed_file, PathBuf::from(value), &option)?;
                 }
+                "--duration-seconds" => {
+                    let value = next_value(&mut args, &option)?;
+                    let parsed = value
+                        .parse::<u64>()
+                        .map_err(|_| CliError::InvalidDuration(value.clone()))?;
+                    if !(1..=86_400).contains(&parsed) {
+                        return Err(CliError::InvalidDuration(value));
+                    }
+                    set_once(&mut duration_seconds, parsed, &option)?;
+                }
                 _ => return Err(CliError::UnknownOption(option)),
             }
         }
@@ -354,6 +372,7 @@ impl CliOptions {
             seed,
             steps: steps.unwrap_or(profile.default_steps()),
             seed_file,
+            duration_seconds,
         })
     }
 }

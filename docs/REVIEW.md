@@ -19,8 +19,9 @@ The project remains pre-v1.
 | [Unsafe boundaries](SAFETY.md) | Do ownership, memory ordering, initialization, drop, and FFI contracts justify each unsafe operation? |
 | [Benchmarks](PERFORMANCE.md) | Does each fixture exercise its named path? Are timing and allocation boundaries actually checked? |
 
-The router and journaled engine are separate entry points. A review must not
-assume that a guarantee from one is automatically present in the other.
+The original router and journaled engine remain separate entry points.
+`RoutedEngine` and `SessionEngine` now compose journaled admission explicitly;
+review their staged commits, per-instrument sequences and failure propagation.
 
 ## Evidence to inspect
 
@@ -51,13 +52,15 @@ Previous fixes provide useful regression targets:
 Independent API, unsafe-boundary, recovery-format, and operational review remain
 requirements for a release candidate. Specific unresolved areas include:
 
-- Router/session integration with the journaled engine.
-- A persisted configuration manifest, including the report bound used in replay.
-- Snapshot selection, retention, backup, upgrade, and rollback workflows.
+- New router/session engine integration and failure propagation.
+- Canonical configuration and bundle integrity, including the report bound.
+- Application-owned snapshot selection and retention; verify new backup,
+  restore and compatibility workflows against trusted expected configuration.
 - Durable event delivery or an explicit application-level acknowledgment policy.
 - Completed multi-hour combined fault runs and dedicated Linux measurements.
-- Session benchmark outcome assertions, allocation boundaries, and sustained
-  retransmission refill. See the [known gaps](PERFORMANCE.md#session-and-recovery-window).
+- Repaired session benchmark assertions, allocation boundaries, and sustained
+  retransmission refill. Historical results remain invalid; see
+  [fixture contracts](PERFORMANCE.md#session-and-recovery-window).
 - Real venue adapters and vendor integration.
 
 Replace, session recovery, journaling, snapshots, and bounded events are already

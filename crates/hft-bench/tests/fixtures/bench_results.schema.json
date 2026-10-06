@@ -18,6 +18,7 @@
   "checksum_key": "checksum",
   "param_names": [
     "path",
+    "input",
     "messages",
     "capacity",
     "max_occupancy",

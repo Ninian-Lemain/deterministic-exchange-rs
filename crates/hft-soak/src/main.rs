@@ -8,7 +8,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::path::PathBuf;
 
-const USAGE: &str = "usage: hft-soak [--profile smoke|nightly|qualification] [--seed HEX | --seed-file PATH] [--steps COUNT]";
+const USAGE: &str = "usage: hft-soak [--profile smoke|nightly|qualification] [--seed HEX | --seed-file PATH] [--steps COUNT] [--duration-seconds SECONDS]";
 
 fn main() {
     if let Err(error) = execute() {
@@ -43,18 +43,27 @@ where
         .collect::<Result<Vec<_>, _>>()?;
     let options = CliOptions::parse(args).map_err(AppError::Cli)?;
     let seeds = load_seeds(&options)?;
-    for seed in seeds {
-        let config = RunConfig::new(options.profile, seed, options.steps)
-            .map_err(AppError::Configuration)?;
-        let result = run_verified(config).map_err(AppError::Soak)?;
-        let line = result.to_json_line().map_err(|error| {
-            AppError::Soak(SoakError {
-                config,
-                phase: "result serialization",
-                message: error.to_string(),
-            })
-        })?;
-        println!("{line}");
+    let started = std::time::Instant::now();
+    loop {
+        for &seed in &seeds {
+            let config = RunConfig::new(options.profile, seed, options.steps)
+                .map_err(AppError::Configuration)?;
+            let result = run_verified(config).map_err(AppError::Soak)?;
+            let line = result.to_json_line().map_err(|error| {
+                AppError::Soak(SoakError {
+                    config,
+                    phase: "result serialization",
+                    message: error.to_string(),
+                })
+            })?;
+            println!("{line}");
+        }
+        if options
+            .duration_seconds
+            .is_none_or(|seconds| started.elapsed().as_secs() >= seconds)
+        {
+            break;
+        }
     }
     Ok(())
 }

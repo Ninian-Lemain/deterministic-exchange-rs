@@ -6,18 +6,21 @@
 
 A Rust workspace for price-time matching, pre-trade risk, sequenced commands,
 bounded events, and state recovery. It provides a multi-instrument router and
-a separate single-instrument journaled engine. Both use the same matching core.
+a single-instrument journaled engine, and routed/session facades that own
+journaled admission across fixed instruments. All use the same matching core.
 
 Current version: **v0.19.0**. The v0.13 dedicated Linux qualification still
-needs hardware. Combined fault qualification, engine integration, and operations
-work also remain open. The project is not production ready. See the
+needs dedicated hardware. Combined fault qualification and independent review
+remain open; engine integration and cold-path operations are implemented. The
+project is not production ready. See the
 [documentation index](docs/README.md) and [roadmap](docs/ROADMAP.md).
 
 ## Workflow Diagrams
 
 The router does not journal commands. The engine enqueues them before gateway
 application. Events report application, not durability. Session admission
-remains caller-managed.
+can also use `SessionEngine`, which stages session admission until journaled
+application succeeds.
 
 [![Two execution paths](docs/diagrams/system-overview.svg)](docs/diagrams/system-overview.svg)
 
@@ -69,8 +72,9 @@ releases the taker reservation. It does not rewind the whole gateway state.
 
 Snapshots require stopped admission and completed persistence. Event drain is
 the caller's responsibility, not a snapshot precondition. Restore uses fresh
-queues and the original report bound. Snapshot selection, retention, and a
-persisted configuration manifest remain open.
+queues and the original report bound. Snapshot generation selection and retention
+remain application responsibilities. Configured restore now
+validates a sidecar including the original report bound.
 
 </details>
 
@@ -108,7 +112,7 @@ cargo run --release -p hft-bench
 
 The benchmark executable checks allocation deltas around declared hot paths.
 [Performance evidence](docs/PERFORMANCE.md) records the measurement boundaries
-and known session fixture gaps. See [QUICKSTART.md](QUICKSTART.md) for all
+and historical session fixture errors. See [QUICKSTART.md](QUICKSTART.md) for all
 validation commands.
 
 Supported platforms: the engine is portable safe Rust, tested on Windows and
@@ -190,12 +194,12 @@ the full inventory and native-boundary policy.
 | `hft-wire` | Validated lifetime-bound parsing | None |
 | `hft-io` | RAII frame leases, in-memory and UDP baseline | Preallocated frame |
 | `hft-spsc` | Bounded cache-aware SPSC handoff | None after construction |
-| `hft-session` | Caller-driven connection state and bounded retransmission | Session benchmark coverage incomplete |
+| `hft-session` | Caller-driven connection state and bounded retransmission | None in verified admission and retransmission fixtures |
 | `hft-risk` | Fixed-capacity limits, indexed accounts and reservations | None |
 | `hft-book` | Price-time matching: stable-slot FIFO levels, sorted-level indices, `OrderId` index, match plans | None |
 | `hft-gateway` | Transaction coordination and report accounting | None |
 | `hft-events` | Sequenced command event batches and bounded SPSC publication | None after construction |
-| `hft-engine` | Single-instrument admission, journal status, shutdown, and snapshot boundary | None in measured admission |
+| `hft-engine` | Journaled admission, routed/session ownership, configuration, shutdown, and checkpoints | None in measured admission |
 | `hft-router` | Fixed instrument routes, shard command queues, and shard event queues | None after construction |
 | `hft-journal` | CRC32C records, bounded enqueue, and batched persistence | None in measured enqueue. Sink-dependent outside matching |
 | `hft-replay` | Ordered replay and stable final-state digest | None in engine |
@@ -237,15 +241,15 @@ which guarantees belong to individual components and which require integration.
 | Session sequence enforcement | Implemented | Duplicates/gaps fail closed without advancing |
 | Owner-authorized cancel | Implemented | FIFO-preserving removal and exact risk release |
 | Cache-aware SPSC | Implemented | Release/Acquire docs, stress test, Loom model |
-| Allocation checks | Partial coverage | Release counter assertions. Session measurement gaps remain |
+| Allocation checks | Verified declared paths | Release counter assertions, including session and routed facade cells |
 | UDP baseline | Implemented | Syscall path without network latency evidence |
 | AF_XDP backend | Planned | Feature-gated availability marker only |
 | Vendor SDK | Planned | Ownership wrapper exists. No proprietary SDK linked |
-| Hardware perf counters | Planned | Requires Linux/perf and a dedicated runner |
+| Hardware perf counters | Development capture available | WSL perf works; dedicated Linux qualification remains open |
 
 ## Current Limitations
 
-- No external venue traffic, automatic snapshot rotation, snapshot manifest,
+- No external venue traffic, automatic snapshot rotation or generation selection,
   authentication, or venue-certified session protocol is implemented.
 - Routing uses one instrument per shard and per-instrument sequence domains.
   Dynamic reassignment and a merged cross-shard event order are not provided.

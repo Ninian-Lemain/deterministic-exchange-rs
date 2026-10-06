@@ -1,4 +1,4 @@
-use crate::Engine;
+use crate::{ConfigError, Engine, EngineConfig};
 use hft_events::{BoundedEventEngine, EventBatch, EventEngineConfigError};
 use hft_gateway::Gateway;
 use hft_journal::{JournalChannel, JournalReader};
@@ -16,6 +16,7 @@ pub enum BuildError {
     JournalStatusUnavailable,
     Recovery(RecoveryError),
     InstrumentMismatch,
+    Configuration(ConfigError),
 }
 
 /// Fixed event and journal storage for one engine lifetime.
@@ -63,6 +64,7 @@ pub struct EngineBuilder<
     const REPORTS: usize,
 > {
     gateway: Gateway<ACCOUNTS, RISK_ORDERS, LEVELS, ORDERS>,
+    configuration: EngineConfig,
 }
 
 impl<
@@ -87,8 +89,19 @@ impl<
             risk.register_account(account, limits)
                 .map_err(BuildError::Registration)?;
         }
+        let mut definitions = accounts.to_vec();
+        definitions.sort_unstable_by_key(|(id, _)| *id);
+        let configuration = EngineConfig {
+            instrument,
+            capacities: [ACCOUNTS, RISK_ORDERS, LEVELS, ORDERS, REPORTS],
+            accounts: definitions,
+        };
+        configuration
+            .validate()
+            .map_err(BuildError::Configuration)?;
         Ok(Self {
             gateway: Gateway::new(risk, instrument),
+            configuration,
         })
     }
 
@@ -112,7 +125,56 @@ impl<
         if gateway.instrument() != instrument {
             return Err(BuildError::InstrumentMismatch);
         }
-        Ok(Self { gateway })
+        let accounts = gateway
+            .risk()
+            .export_state()
+            .accounts
+            .into_iter()
+            .map(|account| (account.id, account.limits))
+            .collect();
+        let configuration = EngineConfig {
+            instrument,
+            capacities: [ACCOUNTS, RISK_ORDERS, LEVELS, ORDERS, REPORTS],
+            accounts,
+        };
+        configuration
+            .validate()
+            .map_err(BuildError::Configuration)?;
+        Ok(Self {
+            gateway,
+            configuration,
+        })
+    }
+
+    /// Restore only when the authoritative sidecar matches the requested configuration.
+    /// Snapshot account definitions are checked before any journal tail is replayed.
+    /// # Errors
+    /// Rejects configuration, snapshot, account, or contiguous-tail mismatches.
+    pub fn restore_configured(
+        expected: &EngineConfig,
+        persisted: &[u8],
+        snapshot: &[u8],
+        tail: &[u8],
+    ) -> Result<Self, BuildError> {
+        let stored = EngineConfig::decode(persisted).map_err(BuildError::Configuration)?;
+        stored
+            .check_compatible(expected)
+            .map_err(BuildError::Configuration)?;
+        if stored.capacities != [ACCOUNTS, RISK_ORDERS, LEVELS, ORDERS, REPORTS] {
+            return Err(BuildError::Configuration(ConfigError::Mismatch));
+        }
+        let prefix = Self::restore(stored.instrument, snapshot, &[])?;
+        stored
+            .check_compatible(&prefix.configuration)
+            .map_err(BuildError::Configuration)?;
+        let mut restored = Self::restore(stored.instrument, snapshot, tail)?;
+        restored.configuration = stored;
+        Ok(restored)
+    }
+
+    #[must_use]
+    pub fn configuration(&self) -> &EngineConfig {
+        &self.configuration
     }
 
     fn validate_capacity() -> Result<(), BuildError> {
@@ -153,6 +215,7 @@ impl<
                 journal: Some(writer),
                 status,
                 failed: false,
+                configuration: self.configuration,
             },
             events,
             journal,

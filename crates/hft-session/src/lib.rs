@@ -97,7 +97,7 @@ pub struct Transition {
 
 /// The machine. Sequence bookkeeping mirrors the gateway: commands must
 /// arrive with exactly `next_sequence`, which advances only on acceptance.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct SessionStateMachine {
     state: SessionState,
     config: SessionConfig,
@@ -159,13 +159,14 @@ impl SessionStateMachine {
                 if first_sequence.0 == 0 {
                     return Err(SessionError::ArithmeticOverflow);
                 }
-                self.next_sequence = first_sequence.0;
-                self.heartbeat_timeouts = 0;
-                self.arm(
+                let transition = self.arm(
                     SessionState::Active,
                     self.config.heartbeat_timeout_ticks,
                     now,
-                )
+                )?;
+                self.next_sequence = first_sequence.0;
+                self.heartbeat_timeouts = 0;
+                Ok(transition)
             }
             // --- commands ---
             (
@@ -185,13 +186,18 @@ impl SessionStateMachine {
                         received: sequence,
                     });
                 }
-                match self.next_sequence.checked_add(1) {
-                    Some(next) => self.next_sequence = next,
-                    None => return Err(SessionError::ArithmeticOverflow),
-                }
+                let next = self
+                    .next_sequence
+                    .checked_add(1)
+                    .ok_or(SessionError::ArithmeticOverflow)?;
+                let transition = self.arm(
+                    SessionState::Active,
+                    self.config.heartbeat_timeout_ticks,
+                    now,
+                )?;
+                self.next_sequence = next;
                 self.heartbeat_timeouts = 0;
-                self.state = SessionState::Active;
-                self.arm(self.state, self.config.heartbeat_timeout_ticks, now)
+                Ok(transition)
             }
             // --- heartbeats keep Active alive ---
             (SessionState::Active, SessionEvent::HeartbeatReceived) => self.arm(
@@ -242,10 +248,10 @@ impl SessionStateMachine {
                 Ok(self.enter(SessionState::Failed, None))
             }
             SessionState::Active => {
-                self.heartbeat_timeouts += 1;
                 let deadline = now
                     .checked_add(self.config.heartbeat_timeout_ticks)
                     .ok_or(SessionError::ArithmeticOverflow)?;
+                self.heartbeat_timeouts += 1;
                 self.state = SessionState::Recovering;
                 self.deadline = Some(deadline);
                 Ok(Transition {

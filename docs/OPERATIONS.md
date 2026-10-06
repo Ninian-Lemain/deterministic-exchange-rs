@@ -6,7 +6,8 @@ shutdown outside the matching loop. The router sends normalized, fixed-size
 commands between cores through SPSC queues.
 
 `hft-router::MatchingShard` and the single-instrument `hft-engine` are separate
-components. The router does not use the journaled engine. See
+components. `hft-engine::RoutedEngine` is a separate fixed-route facade over
+journaled engines, and `SessionEngine` owns admission across those routes. See
 [Engine](ENGINE.md) for the engine's admission and shutdown contract.
 
 ## Rejection and backpressure
@@ -80,6 +81,9 @@ records, and differences between journal and payload sequence numbers.
 
 Snapshot v1 records account, risk order, level, and per-level order capacities.
 It does not record `REPORTS`. Replay must use the original report bound.
+Configured engine restore binds that report bound and account risk definitions
+through `EngineConfig` before replay. Legacy low-level recovery retains its
+caller-assured original-bound requirement.
 
 `persist_snapshot_new` requires a new destination path. It syncs a temporary file,
 publishes the destination through a hard link, removes the temporary name, and
@@ -90,6 +94,44 @@ Generation naming, manifest replacement, retention, and selection of the latest
 valid snapshot remain application responsibilities. Keep admission closed while
 selecting an authoritative snapshot and tail, restoring them, and verifying the
 result. Reopen only after those steps succeed.
+
+## Operational commands and immutable bundles
+
+`RecoveryBundle` publishes `config.v1`, `snapshot.v1`, `tail.v1` and a `COMMITTED`
+marker at a new directory. The marker hashes length-framed member bytes with
+SHA-256 and is published last. Files and directories are synchronized on Unix;
+Windows supports file synchronization but this API makes no directory durability
+promise. Publication errors may leave an incomplete directory. Never treat it
+as committed or retry by overwriting it. The marker is integrity protection,
+not authentication; use trusted independently supplied expected configuration.
+
+The current cold-path CLI has fixed recovery capacities `2,8,4,4,4`. The
+library APIs remain generic. A lifecycle example for those CLI capacities is:
+
+```text
+cargo run --release -p hft-cli -- checkpoint-demo target/checkpoint-1
+cargo run --release -p hft-cli -- config-validate target/checkpoint-1/config.v1
+cargo run --release -p hft-cli -- health target/checkpoint-1 target/checkpoint-1/config.v1
+cargo run --release -p hft-cli -- backup target/checkpoint-1 target/checkpoint-backup target/checkpoint-1/config.v1
+cargo run --release -p hft-cli -- restore-check target/checkpoint-backup target/checkpoint-1/config.v1
+cargo run --release -p hft-cli -- compatibility-check target/checkpoint-1/config.v1 target/checkpoint-backup/config.v1
+```
+
+`checkpoint-demo` closes admission, flushes its journal, drains events and
+publishes the checkpoint. It also requires a new sibling `.journal` path.
+`health` reports offline recoverability and the next sequence, not live service
+health. Keep the expected configuration in a separate trusted location for a
+real deployment; using the generated copy above only demonstrates the workflow.
+
+Upgrade and rollback compatibility currently require identical instrument,
+capacities including reports, risk definitions and supported format versions.
+Keep the previous binary and committed bundle; validate the candidate against
+the independently selected configuration before switching, then restore with
+fresh queue storage and verify sequence progress. A change in replay semantics
+requires an explicitly designed migration. Automatic newest-bundle selection,
+retention, process supervision and durable event delivery are not supplied by
+these commands. Incident handling closes admission on poison, preserves evidence
+and recovers an authoritative committed bundle rather than resuming failed state.
 
 ## Linux deployment checks
 

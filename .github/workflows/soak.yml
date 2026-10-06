@@ -8,6 +8,11 @@ on:
         required: true
         default: '10000000'
         type: string
+      duration_seconds:
+        description: Minimum sustained runtime in one process
+        required: true
+        default: '7200'
+        type: string
 
 permissions:
   contents: read
@@ -21,7 +26,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: rustc -Vv
       - run: cargo test -p hft-soak
-      - name: Run retained seeds
+      - run: cargo build --release -p hft-soak
+      - name: Run sustained retained seeds and sample memory
         env:
           SOAK_STEPS: ${{ inputs.steps }}
-        run: cargo run --release -p hft-soak -- --profile nightly --steps "$SOAK_STEPS"
+          SOAK_SECONDS: ${{ inputs.duration_seconds }}
+        run: python3 scripts/soak/run_linux.py --output target/soak-evidence --steps "$SOAK_STEPS" --seconds "$SOAK_SECONDS"
+      - name: Retain success or failure evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-soak-evidence
+          path: target/soak-evidence

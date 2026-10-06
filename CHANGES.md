@@ -4,6 +4,13 @@
 
 ### Added
 
+- Added journaled routed and session engine admission with staged retry behavior.
+- Added replay configuration including report bounds and verified checkpoint
+  bundles, backup, restore and compatibility commands.
+- Added combined service faults, sustained soak duration and Linux memory
+  capture, plus four service admission benchmark cells.
+- Added Linux safety capture for Loom, Miri, sanitizers and fuzzing.
+
 - Added fixed instrument-to-shard routes with one instrument per shard.
 - Added bounded command and event queues between the router and matching shards.
 - Added normalized command processing for gateway and event paths.
@@ -23,6 +30,11 @@
 - Added recovery benchmarks for encoding, verified restore, and tail replay.
 
 ### Changed
+
+- Fixed session arithmetic errors mutating state before refusal.
+- Repaired session benchmark outcomes, sampled allocation checks and sustained
+  retransmission refill. Historical invalid timings remain excluded.
+- Explicitly reject WSL as dedicated latency qualification evidence.
 
 - Marked v0.19 multi-instrument routing as implemented.
 - Marked v0.17 recovery and state integrity as implemented.

@@ -30,6 +30,23 @@ python scripts/source_ratio.py
 ```
 
 The benchmark executable exits nonzero if allocation or deallocation occurs
-between its post-warm-up counters. Known gaps in session fixture and allocation
-coverage are listed in [Performance evidence](docs/PERFORMANCE.md#session-and-recovery-window).
+between its workload counters. Repaired session fixtures and historical invalid
+results are described in [Performance evidence](docs/PERFORMANCE.md#session-and-recovery-window).
 Desktop timings are not production latency evidence.
+
+## Linux safety and fault evidence
+
+Install nightly Rust with `miri` and `rust-src`, cargo-fuzz, Clang and its
+compiler-rt sanitizer runtime before running the safety capture. The capture
+fails explicitly for a missing tool or a failed check:
+
+```console
+bash scripts/linux/run_safety.sh --output target/safety-evidence --fuzz-seconds 60
+cargo build --release -p hft-soak
+python3 scripts/soak/run_linux.py --output target/soak-2h --seconds 7200 --steps 1000000
+```
+
+See [Soak](docs/SOAK.md) for elapsed-time and memory requirements, and
+[Operations](docs/OPERATIONS.md) for configuration, checkpoint, backup and
+restore commands. WSL is suitable for these development checks; dedicated
+Linux latency qualification requires controlled native hardware.

@@ -79,7 +79,8 @@ impl RunResult {
             && (self.scenarios.routed.steps != self.steps
                 || self.scenarios.recovery.steps != self.steps
                 || self.scenarios.recovery.commands != self.steps
-                || self.scenarios.session.steps != self.steps.div_ceil(64))
+                || self.scenarios.session.steps != self.steps.div_ceil(64)
+                || self.scenarios.combined.rounds != self.steps.div_ceil(4096))
         {
             return Err(ResultError::ScenarioStepsMismatch);
         }
@@ -152,6 +153,8 @@ impl RunResult {
 }
 
 impl ScenarioResults {
+    // One flat schema writer keeps field order visible for review.
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn push_json(&self, output: &mut String) {
         macro_rules! counters {
             ($name:ident, $($field:ident),+ $(,)?) => {{
@@ -251,6 +254,25 @@ impl ScenarioResults {
             command_queue_retries,
             event_queue_refusals,
             event_queue_retries
+        );
+        output.push(',');
+        counters!(
+            combined,
+            rounds,
+            commands,
+            event_pressure,
+            journal_pressure,
+            session_refusals,
+            reconnects,
+            heartbeat_timeouts,
+            malformed_frames,
+            unknown_routes,
+            recovery_checks,
+            shutdown_races,
+            write_failures,
+            flush_failures,
+            abandoned_workers,
+            fingerprint
         );
         output.push('}');
     }

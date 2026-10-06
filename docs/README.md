@@ -10,6 +10,7 @@ production qualification are still in progress.
 | --- | --- |
 | [Architecture](ARCHITECTURE.md) | Entry points, ownership, data layout, and execution order |
 | [Engine API](ENGINE.md) | Builder, admission, queue pressure, shutdown, and restart |
+| [Configuration](CONFIGURATION.md) | Canonical replay configuration, report bounds and committed bundles |
 | [Protocol](PROTOCOL.md) | Message layouts, order policies, sequencing, and ownership |
 | [Operations](OPERATIONS.md) | Persistence progress, failure handling, and recovery limits |
 
@@ -26,10 +27,12 @@ Use [Quick Start](../QUICKSTART.md) for build and test commands. The
 | [Safety](SAFETY.md) | Unsafe boundaries, invariants, and configured verification |
 | [Review](REVIEW.md) | Review order, evidence to inspect, and open review work |
 | [Roadmap](ROADMAP.md) | Implemented milestones and remaining release criteria |
+| [Roadmap implementation](ROADMAP_PROGRESS_2026-10-06.md) | Current integration, Linux checks and qualification evidence |
 | [Engineering lessons](LEARNINGS.md) | Implementation decisions and mistakes found by tests |
 | [Diagram sources](diagrams/README.md) | Editable Mermaid files and the rendering command |
 | [Evidence archives](evidence/README.md) | Raw benchmark bundles and provenance |
 
 No dedicated Linux latency result or completed multi-hour qualification is
 published. Events acknowledge application, not durable storage. The routed
-matching path and journaled engine are separate entry points.
+matching path and journaled engine remain separate entry points; the new engine
+facades explicitly join session and routed admission to journals.

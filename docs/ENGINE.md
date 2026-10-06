@@ -2,8 +2,9 @@
 
 `hft-engine` owns one instrument's gateway, event producer, and journal writer.
 Its public API prevents direct mutation of the gateway or writer. Persistence
-and event consumption run separately. Router `MatchingShard` and session
-ownership are not part of this engine.
+and event consumption run separately. `RoutedEngine` composes a fixed array of
+these engines; `SessionEngine` owns transport admission across the routes.
+The original router `MatchingShard` remains a separate queue-based entry point.
 
 ## Build and process commands
 
@@ -53,8 +54,11 @@ admission. Fatal failures have no in-place resume.
 
 Restore checks the gateway capacity shape and expected instrument. Snapshot v1
 does not store or check `REPORTS`, so tail replay must use the original report
-bound. A persisted configuration manifest with mismatch rejection remains open
-work. Restore does not republish historical events.
+bound. `restore_configured` checks a canonical `EngineConfig` sidecar against
+an independently supplied expected configuration, including `REPORTS`, account
+risk definitions and supported formats. These checks precede tail replay.
+Legacy `restore` retains its caller-assured report-bound contract. Restore does
+not republish historical events.
 
 The lifecycle example processes one command, closes admission, flushes a journal
 file, and publishes a snapshot. Run it with an output directory that does not
@@ -75,7 +79,31 @@ with no crate-specific features or new third-party dependencies. Wire records,
 64-byte journal records, and snapshot v1 bytes are unchanged. In-memory Rust
 layouts are not serialization formats.
 
-Router and session ownership, configuration manifests, snapshot selection and
-retention, upgrade and rollback checks, combined fault soak, and independent API
-review remain open. The retained [engine overhead measurements](PERFORMANCE.md#engine-boundary)
+`RoutedEngine::try_new` validates each engine against its instrument route.
+Application remains synchronous and per-instrument sequences are independent.
+The event and persistence consumers can run on separate threads. No mutable
+gateway, journal writer or child engine is exposed by the facades.
+
+`SessionEngine` checks a caller-supplied transport sequence separately from the
+command's instrument sequence. Session state, deadlines and sequence commit only
+after successful journaled application. Queue pressure permits an unchanged
+retry. Business rejection consumes both sequences. Any observed failed shard
+closes admission across the session; persistence can still race an in-flight
+command. Explicit session failure and terminal timeout also close producers.
+Restart requires fresh storage and explicit logon with the authoritative
+transport resume sequence; engine snapshots do not persist a venue session.
+
+The [configuration format](CONFIGURATION.md) specifies persisted bytes and
+bundle integrity. `EngineConfig` version 1 is canonical decimal UTF-8 with ascending accounts and
+a final newline. Its header binds wire, journal and snapshot versions; capacity
+fields include the report bound. Compatible upgrade and rollback require equal
+configuration and supported formats. Wire, snapshot v1 and journal bytes are
+unchanged. Rust APIs remain pre-v1 and are not a stable ABI.
+
+`RecoveryBundle` publishes configuration, snapshot, tail and an integrity marker
+at a new directory. Readers reject incomplete or altered bundles. The marker
+provides SHA-256 integrity, not authentication. Use trusted expected configuration
+and immutable authoritative input. Automatic generation selection and retention,
+durable event delivery and independent API review remain open. The retained
+[engine overhead measurements](PERFORMANCE.md#engine-boundary)
 cover desktop execution. Linux production latency remains unqualified.

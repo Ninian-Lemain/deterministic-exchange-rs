@@ -38,9 +38,14 @@ outside the matching call. Written and durable progress are separate.
 An event reports application, not durability. Observed persistence failure
 closes engine admission, although failure can race an in-flight command.
 
-The engine does not own the router or session state machine. Those connections
-remain integration work. See [ENGINE.md](ENGINE.md) for construction, failure,
-and shutdown contracts.
+`RoutedEngine` now owns a fixed array of journaled engines and validates their
+instrument routes. It applies synchronously and keeps sequence domains separate.
+`SessionEngine` owns transport admission over that array. It stages session
+state and commits it only after successful journaled application; overload
+leaves both sequences and the deadline unchanged. Any observed failed shard
+stops the shared session, including commands aimed at another instrument.
+The queue-based router remains available as the separate original composition.
+See [ENGINE.md](ENGINE.md) for construction, failure and shutdown contracts.
 
 ## Ownership
 
@@ -52,6 +57,8 @@ and shutdown contracts.
 | Event engine | Gateway and one event producer |
 | Gateway | One instrument's risk state, book, command sequence, and order ID watermark |
 | Engine facade | Event engine, journal writer, and persistence status reader |
+| Routed engine | Fixed route table and one journaled engine per instrument |
+| Session engine | Staged transport session state and routed journaled admission |
 | Engine storage | Fixed event and journal queues for one engine lifetime |
 | Persistence worker | Journal consumer, batch buffer, sink, and flush progress |
 

@@ -41,6 +41,9 @@ cpu_in_list() {
 }
 
 [[ "$(uname -s)" == "Linux" ]] || fail "Linux is required"
+if grep -qi microsoft /proc/sys/kernel/osrelease; then
+    fail "WSL runs are development evidence, not dedicated Linux qualification"
+fi
 if [[ -f /.dockerenv ]] || grep -qaE '(docker|containerd|kubepods|lxc)' /proc/1/cgroup; then
     fail "container runs are tooling checks, not dedicated qualification"
 fi

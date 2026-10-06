@@ -12,6 +12,7 @@ pub mod liquidity_workloads;
 pub mod record;
 pub mod recovery_workloads;
 pub mod router_workloads;
+pub mod service_workloads;
 pub mod session_workloads;
 pub mod tif_workloads;
 
@@ -135,6 +136,7 @@ pub fn run_suite(config: SuiteConfig) -> std::vec::Vec<std::string::String> {
     event_workloads::event_benchmarks(config.tif_samples, &mut records);
     router_workloads::router_benchmarks(config.tif_samples, &mut records);
     engine_workloads::engine_benchmarks(config.tif_samples, &mut records);
+    service_workloads::service_benchmarks(config.tif_samples, &mut records);
     batched_workloads::batched_benchmarks(config, &mut records);
     records.iter().map(BenchRecord::to_json_line).collect()
 }

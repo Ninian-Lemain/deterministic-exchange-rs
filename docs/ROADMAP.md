@@ -4,19 +4,22 @@ The workspace version is 0.19.0. Matching, risk, sessions, journaling, recovery,
 events, and instrument routing are implemented as library components.
 Dedicated Linux qualification and v0.20 fault qualification remain open.
 The repository is not ready for a production deployment.
+The [current implementation report](ROADMAP_PROGRESS_2026-10-06.md) records
+integration changes, Linux verification and outstanding qualification evidence.
 
 ## Current work
 
 | Area | Status | Remaining work |
 | --- | --- | --- |
 | v0.13 Dedicated Linux qualification | Waiting on hardware | Qualified host, environment manifest, raw latency and hardware counters |
-| v0.20 Fault injection and soak | In progress | Completed multi-hour runs and combined service fault coverage |
-| Pre-v1 engine API | In progress | Router and session ownership, persisted configuration, operations workflows, independent review |
+| v0.20 Fault injection and soak | Qualification in progress | Combined service faults implemented; sustained run and memory evidence must pass |
+| Pre-v1 engine API | Software integrated | Dedicated Linux boundary measurement and independent review |
 
 The [engine facade](ENGINE.md) now joins admission, bounded events, and journal
-status for one instrument. Its tests cover both queue pressure paths, worker
-failure, shutdown, snapshot restart, and separate workers. The router still
-uses its own `MatchingShard`, without this facade or a journal.
+status for one instrument. `RoutedEngine` owns fixed routes over journaled
+engines. `SessionEngine` owns transport admission across those routes and stages
+session updates until command application succeeds. The original queue-based
+router still offers its separate `MatchingShard` composition.
 
 ## Implemented milestones
 
@@ -49,7 +52,9 @@ The implementations have limits that remain part of their contracts:
 - Identity lookup is expected O(1) at bounded load. Collisions still require
   probing.
 - Snapshot v1 stores the gateway capacity shape, but not the report bound.
-  Tail replay must use the original `REPORTS` value.
+  Configured restore now binds `REPORTS` through a canonical configuration
+  sidecar and checks account risk definitions before replay. Legacy restore
+  still requires the caller to supply the original report bound.
 - Event publication acknowledges application, not durable persistence.
 - Each instrument has its own sequence and event order. There is no merged
   cross-shard event order or dynamic shard reassignment.
@@ -67,7 +72,7 @@ pins execution, collects counters, and hashes output. It rejects container
 runs as qualification evidence. Passing its checks is a prerequisite, not a
 substitute for reviewing the host and workload.
 
-Windows and Docker Desktop can validate code and tooling. They do not meet
+Windows, WSL 2 and Docker Desktop can validate code and tooling. They do not meet
 this hardware requirement. Later implementation milestones do not depend on
 v0.13, but v1 requires its evidence.
 
@@ -77,8 +82,11 @@ Requires v0.11 and v0.14 through v0.19.
 
 The [soak runner](SOAK.md) covers routed churn, recurring queue pressure,
 session faults, exhaustion, and repeated snapshot recovery. Each seed runs
-twice and must produce matching state, events, and counters. Journal faults
-currently use a separate in-memory fixture.
+twice and must produce matching state, events, and counters. Its combined
+scenario now exercises the owned session and routed journaled engines with
+event and journal saturation, reconnects, worker failure and abandonment,
+configured restart, and concurrent producer closure. Fault sinks are in-memory;
+the operational tests separately verify file checkpoint and backup publication.
 
 Completion requires retained seeds and completed multi-hour runs covering:
 
@@ -94,25 +102,25 @@ qualification is currently recorded.
 
 ## Pre-v1 stabilization
 
-The initial facade, builder, lifecycle example, MSRV checks, and
+The facade, routed and session ownership, configuration sidecar, checkpoint
+bundles, operational CLI, lifecycle example, MSRV checks, and
 [desktop overhead comparison](PERFORMANCE.md#engine-boundary) are present.
-Session benchmark fixtures also need repair before their timings or allocation
-fields can be used as evidence. The current gaps are listed in
-[Performance](PERFORMANCE.md#session-and-recovery-window).
+Session benchmark fixtures now validate actual results, sustained window
+refill and sampled allocation boundaries. Historical invalid cells remain
+identified in [Performance](PERFORMANCE.md#session-and-recovery-window).
 
 The following work remains:
 
-1. Finish the public engine boundary for routing and session admission.
-   Public mutation must not bypass sequence, risk, or capacity checks.
-2. Persist and validate configuration needed for replay, including the report
-   bound. Define API and format compatibility rules.
-3. Add the operational harness for configuration validation, health, drain,
-   shutdown, backup/restore, upgrade, and rollback. Keep storage and process
-   control outside matching.
-4. Measure the completed boundary on dedicated Linux. Resolve unexplained
+1. Measure the completed boundary on dedicated Linux. Resolve unexplained
    regressions and verify allocation behavior on each declared hot path.
-5. Obtain independent API, unsafe-boundary, recovery-format, and operations
+2. Retain successful elapsed multi-hour fault evidence and examine memory use.
+3. Obtain independent API, unsafe-boundary, recovery-format, and operations
    review before a v1 release candidate.
+
+Operational health currently checks an explicitly selected bundle offline.
+The lifecycle command demonstrates admission closure, event drain, flush and
+checkpoint publication. Process supervision, automatic generation selection,
+durable event delivery and certified external protocols remain deployment work.
 
 ## v1 entry criteria
 

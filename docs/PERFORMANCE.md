@@ -55,8 +55,8 @@ component cells record individual operations with `Instant`. Per-sample timer
 cost is included.
 
 Most workloads warm their fixtures before sampling. Destructive workloads use
-untimed repair steps where they need a constant state. The session fixture
-exceptions are described [below](#session-and-recovery-window). In the full suite,
+untimed repair steps where they need a constant state. The repaired session
+fixtures are described [below](#session-and-recovery-window). In the full suite,
 the gateway pair cell skips 1,000 rest/fill iterations, or 2,000 messages, after
 an initial warmup pair. The seeded gateway mix skips 1,000 commands.
 
@@ -370,21 +370,33 @@ These checks support the memory-ordering argument. They are not latency tests.
 ## Session and Recovery Window
 
 The session cells time active admission through the gateway and duplicate
-rejection before the gateway. Windows desktop smoke means were 144 ns and
-41 ns. Both records report zero allocation deltas, but the current counter
-checks start after sampling and cover statistics processing. They do not
-verify allocation behavior during admission or rejection.
+rejection before the gateway. Historical Windows smoke means of 144 ns and
+41 ns used invalid fixture boundaries: results were discarded and allocation
+checks ran after sampling. Those historical timings and zero fields remain
+excluded from performance evidence.
 
-The admission and rejection cells discard operation results and do not check a
-final state digest. Their timings are not evidence that every sampled command
-took the intended path.
+The repaired fixture alternates valid rest/fill commands and reverses account
+roles to keep positions bounded. It checks every admission or duplicate
+refusal, report payload and quantity, sequence progress, final account state
+and reservations. Checks and hash folding run outside the timer, while allocator
+gates span the sample loop, including fixture verification. Checksums now encode
+observed outcomes and state rather than unverified expected work.
 
-The retransmission cell starts with 64 retained frames. It confirms sequence
-numbers 32 through 47 cyclically, then times refill and replay. After the first
-16 samples, confirmation stops freeing slots and sampling measures replay
-without refill. Its allocation assertion compares two counter reads taken
-after sampling, not a before-and-after delta. This cell does not establish
-sustained refill performance, allocation behavior, or durable journal recovery.
+The retransmission cell holds 64 frames, confirms an advancing 32-frame prefix
+before every sample, then times gap refusal, 32 actual refills, full-window
+refusal and replay of all 64 payloads. Untimed checks verify ordered sequences
+and bytes. The previous fixture stopped refilling after its initial samples;
+that historical timing is invalid. Current allocation gates cover the workload.
+This cell measures in-memory retransmission, not durable journal recovery.
+
+Four `engine/routed_journaled_admission` cells now exercise two instruments
+through routed and session facades, using both frames and normalized commands.
+They alternate resting new orders and owner cancels, check every event and
+journal record, and compare final checksums and snapshots across all four paths.
+The timer covers facade admission and publication; result, event and persistence
+checks run outside it. Allocation gates also cover untimed consumption,
+fixed-memory persistence and shutdown; snapshot encoding runs after those gates.
+These are component measurements without network or disk-latency claims.
 
 ## Journal
 
@@ -507,7 +519,7 @@ buffer changed from 3,592 to 3,080 bytes on this target, a 512-byte reduction.
 
 A verified zero-allocation result means the allocation and deallocation
 counters stayed unchanged around the named operation after fixture setup and
-warmup. A zero field without that coverage, as in the session cells, is
+warmup. A zero field without that coverage, as in historical session cells, is
 insufficient. Process startup, benchmark setup, persistence, and other library
 APIs may still allocate.
 
@@ -545,13 +557,13 @@ performance evidence.
 ## Known Limitations
 
 - No qualified Linux host result exists.
-- No hardware counter data is published.
+- WSL hardware counters are development profiles; dedicated counters remain unqualified.
 - No network benchmark is published.
 - `Instant` resolution is close to many component timings.
 - The Windows host is shared and unisolated.
 - Journal filesystem write and flush latency is not measured.
-- Session allocation checks do not cover sampling. Admission and rejection
-  results are unchecked, and the retransmission fixture stops refilling.
+- Historical session timings used unchecked outcomes and incorrect allocation
+  boundaries. Repaired fixtures have different checksums and workload semantics.
 - Means from different historical harness versions are not always comparable.
 - Maximum latency on the desktop often reflects scheduler interference.
 

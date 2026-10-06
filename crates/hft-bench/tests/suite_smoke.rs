@@ -38,6 +38,27 @@ fn reduced_suite_checks_hot_path_and_recovery_allocations() {
         }
     }
     assert_eq!(recovery_cells, 3);
+    let service: Vec<_> = lines
+        .iter()
+        .filter(|line| line.contains("\"scenario\":\"routed_journaled_admission\""))
+        .collect();
+    assert_eq!(service.len(), 4);
+    for path in ["routed", "session"] {
+        for input in ["command", "frame"] {
+            let matching: Vec<_> = service
+                .iter()
+                .filter(|line| {
+                    string_field(line, "path") == path && string_field(line, "input") == input
+                })
+                .collect();
+            assert_eq!(matching.len(), 1, "missing {path}/{input}");
+            assert_eq!(numeric_field(matching[0], "shards"), 2);
+            assert_eq!(
+                string_field(matching[0], "checksum"),
+                string_field(service[0], "checksum")
+            );
+        }
+    }
     validate_batched_cells(&lines);
 }
 

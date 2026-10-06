@@ -102,6 +102,8 @@ fn runner_rejects_invalid_public_configs_before_starting_scenarios() {
 fn cli_rejects_invalid_or_conflicting_inputs() {
     for args in [
         vec!["--steps", "0"],
+        vec!["--duration-seconds", "0"],
+        vec!["--duration-seconds", "86401"],
         vec!["--steps", "18446744073709551615"],
         vec!["--seed", "1234"],
         vec!["--unknown"],
@@ -112,4 +114,31 @@ fn cli_rejects_invalid_or_conflicting_inputs() {
         assert!(!result.stderr.is_empty());
         assert!(!String::from_utf8_lossy(&result.stdout).contains("\"status\":\"passed\""));
     }
+}
+
+#[test]
+fn sustained_mode_completes_work_and_repeats_deterministically() {
+    if hft_spsc::IS_LOOM_BUILD {
+        return;
+    }
+    let started = std::time::Instant::now();
+    let output = cli(&[
+        "--seed",
+        "0000000000000001",
+        "--steps",
+        "65",
+        "--duration-seconds",
+        "1",
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(started.elapsed() >= std::time::Duration::from_secs(1));
+    let stdout = String::from_utf8(output.stdout).expect("JSON results");
+    let records: Vec<_> = stdout.lines().collect();
+    assert!(records.len() > 1);
+    assert!(records.iter().all(|line| *line == records[0]));
+    assert!(records[0].contains("\"combined\":{\"rounds\":1,"));
 }

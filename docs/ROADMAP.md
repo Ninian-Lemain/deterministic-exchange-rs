@@ -107,6 +107,9 @@ faults and bounded memory. See the [results and raw evidence](ROADMAP_PROGRESS_2
 The facade, routed and session ownership, configuration sidecar, checkpoint
 bundles, operational CLI, lifecycle example, MSRV checks, and
 [desktop overhead comparison](PERFORMANCE.md#engine-boundary) are present.
+The [current Linux development benchmark](LINUX_PERFORMANCE_2026-10-07.md)
+adds ten pinned runs and allocation evidence for the completed service boundary;
+WSL does not satisfy dedicated host qualification.
 Session benchmark fixtures now validate actual results, sustained window
 refill and sampled allocation boundaries. Historical invalid cells remain
 identified in [Performance](PERFORMANCE.md#session-and-recovery-window).

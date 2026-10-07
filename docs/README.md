@@ -22,6 +22,7 @@ Use [Quick Start](../QUICKSTART.md) for build and test commands. The
 | Document | What it covers |
 | --- | --- |
 | [Performance](PERFORMANCE.md) | Workloads, measurement boundaries, results, and known benchmark gaps |
+| [Current Linux benchmarks](LINUX_PERFORMANCE_2026-10-07.md) | Ten pinned WSL runs, all-cell summaries, latency ranges and interpretation |
 | [Layout](LAYOUT.md) | Storage changes and their performance tradeoffs |
 | [Soak](SOAK.md) | Seeded fault workloads, capture commands, and qualification status |
 | [Safety](SAFETY.md) | Unsafe boundaries, invariants, and configured verification |

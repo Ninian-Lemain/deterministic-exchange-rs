@@ -4,6 +4,8 @@
 
 ### Added
 
+- Added current Linux development performance report with ten pinned runs,
+  full 140-cell summaries, allocation checks and profiling evidence.
 - Added journaled routed and session engine admission with staged retry behavior.
 - Added replay configuration including report bounds and verified checkpoint
   bundles, backup, restore and compatibility commands.

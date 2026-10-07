@@ -6,6 +6,7 @@ edits must not change their contents or silently replace an earlier run.
 
 | Archive | Recorded comparison |
 | --- | --- |
+| [linux-benchmark-2026-10-07.zip](linux-benchmark-2026-10-07.zip) / [CSV](linux-benchmark-2026-10-07.csv) | Ten pinned Linux development runs, 140 cells, allocator checks, counters and sampled profile; WSL scope |
 | [roadmap-2026-10-06.zip](roadmap-2026-10-06.zip) | Two completed sustained fault captures, memory series, Linux/Windows checks, safety, profiling and source provenance; WSL diagnostic scope |
 | [latency-2026-09-15.zip](latency-2026-09-15.zip) | Batched gateway measurements, single-maker fills, flat index access, and compiler tuning; includes identified invalid exploratory runs |
 | [layout-2026-09-10.zip](layout-2026-09-10.zip) | Resting-order and risk-index storage changes |

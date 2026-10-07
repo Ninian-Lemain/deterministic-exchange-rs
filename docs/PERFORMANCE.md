@@ -1,8 +1,26 @@
 # Performance Evidence
 
-All timings in this document come from Windows desktop smoke runs. No qualified
-Linux latency result has been recorded. The tables describe separate builds and
-workloads, not one measurement of the current checkout.
+Current Linux development results are recorded in the
+[October 7 Linux report](LINUX_PERFORMANCE_2026-10-07.md): ten pinned WSL 2 runs,
+140 benchmark cells, all 137 hot cells allocation-free. No dedicated Linux
+latency qualification has been recorded. Historical tables below describe
+separate Windows builds and workloads.
+
+## Current Linux development summary
+
+| Workload | Median of ten run means | Reported benchmark rate |
+| --- | ---: | ---: |
+| Batched frame parse, risk and rest/fill | 65 ns/message | 15.26 million messages/s |
+| Seeded mixed gateway | 99 ns/command | 10.10 million commands/s |
+| Single-instrument journaled engine | 154 ns/command | 6.49 million commands/s |
+| Session, routed frame, journal enqueue and events | 172 ns/command | 5.82 million commands/s |
+
+These are in-memory timed operation costs. Untimed repair and queue drains,
+network work and durable storage are excluded; the rates do not establish
+sustained service throughput. The session/frame cell's median per-run p99 was
+291 ns, but its worst observed sample was 29.205 us. WSL and the shared Windows
+host prevent a production tail guarantee. See the Linux report for all ranges,
+batch percentile interpretation, profiling and raw evidence.
 
 The [layout measurements](LAYOUT.md) cover book, risk, and route-table storage
 changes and their paired desktop runs.

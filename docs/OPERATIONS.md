@@ -1,5 +1,9 @@
 # Operations
 
+The [release and recovery procedures](RELEASE_PROCEDURES.md) give the current
+build, install, trusted-configuration rehearsal, drain, backup, restore,
+upgrade, rollback and incident steps, including application responsibilities.
+
 The intended Linux deployment assigns one writer to each instrument. Configure
 sockets, memory, queues, CPU affinity, NUMA placement, logging, metrics, and
 shutdown outside the matching loop. The router sends normalized, fixed-size

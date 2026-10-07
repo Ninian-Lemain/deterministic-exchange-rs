@@ -621,6 +621,15 @@ The checked qualification tooling is under `scripts/linux`:
 ```text
 scripts/linux/capture_environment.sh results/environment.txt
 scripts/linux/check_qualification.sh --cpu 4
-scripts/linux/run_qualification.sh --cpu 4 --output results
+scripts/linux/run_qualification.sh --cpu 4 --output results --runs 10
 docker build -f scripts/linux/Dockerfile -t hft-linux-tooling .
 ```
+
+The qualification runner retains one excluded `warmup.jsonl`, repeated plain
+`run-NNN.jsonl` outputs and a whole-command `timings.csv`. The separate
+`benchmark.jsonl` and `perf-record.stdout` executions are instrumented and must
+not be mixed into the plain timing set. Source revision, worktree changes,
+source-file hashes and the resolved executable hash identify the capture.
+Custom commands must additionally retain their external inputs and interpreter
+children. A successful orchestration is a candidate capture for review, not
+automatic production certification. WSL and containers remain rejected.

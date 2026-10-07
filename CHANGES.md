@@ -35,6 +35,9 @@
 
 ### Changed
 
+- Fixed Linux qualification script execution permissions and added repeated
+  plain timings with source and executable provenance.
+- Documented verified release, recovery and incident procedures.
 - Fixed session arithmetic errors mutating state before refusal.
 - Repaired session benchmark outcomes, sampled allocation checks and sustained
   retransmission refill. Historical invalid timings remain excluded.

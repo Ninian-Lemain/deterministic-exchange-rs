@@ -13,6 +13,7 @@ production qualification are still in progress.
 | [Configuration](CONFIGURATION.md) | Canonical replay configuration, report bounds and committed bundles |
 | [Protocol](PROTOCOL.md) | Message layouts, order policies, sequencing, and ownership |
 | [Operations](OPERATIONS.md) | Persistence progress, failure handling, and recovery limits |
+| [Release procedures](RELEASE_PROCEDURES.md) | Install, validation, drain, backup/restore, upgrade/rollback and incident steps |
 
 Use [Quick Start](../QUICKSTART.md) for build and test commands. The
 [homepage diagrams](../README.md#workflow-diagrams) provide a short overview.

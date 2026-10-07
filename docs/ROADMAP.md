@@ -139,6 +139,13 @@ durable event delivery and certified external protocols remain deployment work.
   and incident procedures for any reference service.
 - Documented unsupported venue, regulatory, hardware, and deployment requirements.
 
+The [release procedures](RELEASE_PROCEDURES.md) document the existing offline
+CLI and embedding APIs with a verified configuration/checkpoint/backup/restore
+rehearsal. They identify required application controls rather than implying
+that a running exchange service or automatic rollback exists. The native
+qualification runner now retains repeated plain timings, source provenance
+and executable identity separately from instrumented profiling.
+
 ## Later work
 
 Linux UDP batching is experimental and follows dedicated qualification.
